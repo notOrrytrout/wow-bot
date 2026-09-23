@@ -110,7 +110,9 @@ Configured-account chat commands such as `.bot on`, `.bot off`, `.bot status`, `
 
 When running from a source checkout, `cargo run -p wow-bot-supervisor` resolves the worker from the current workspace. If `wow-bot-worker` has not been built yet, the supervisor builds that package automatically and continues. Packaged builds expect `wow-bot-worker` beside the supervisor executable. `--worker-bin <path>` remains available as an override.
 
-## Generated runtime data
+## Project details and generated runtime data
+
+See [Project details](docs/PROJECT_DETAILS.md) for the runtime design and current limits. Use [Testing](docs/TESTING.md) for live checks before treating a gameplay path as verified.
 
 After the AzerothCore data root is validated, the supervisor reads the external `dbc/`, `maps/`, `vmaps/`, and `mmaps/` directories and writes a derived asset manifest to:
 

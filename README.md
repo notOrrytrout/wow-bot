@@ -10,6 +10,7 @@ This project is under development. The source includes quest discovery, acceptan
 
 Full class combat rotations, general quest-item use, group and raid automation, and battleground behavior are not complete. Learned gameplay memory does not currently persist across worker restarts.
 
+See [Project details](docs/PROJECT_DETAILS.md) for the runtime design, implemented paths, and known gaps.
 
 ## Requirements
 
@@ -17,6 +18,7 @@ Full class combat rotations, general quest-item use, group and raid automation, 
 - Running AzerothCore `authserver` and `worldserver` services.
 - An AzerothCore runtime-data directory with non-empty `dbc/`, `maps/`, `vmaps/`, and `mmaps/` directories.
 - A WoW account and character on the configured server.
+- For headless play on a Warden-enabled AzerothCore server, a local WoW 3.3.5a `Wow.exe` image for supported memory checks.
 
 Cargo fetches the Tentacli Git revision specified in `Cargo.toml` and the other build dependencies.
 
@@ -53,7 +55,7 @@ In a configured account's chat session through the proxy, use:
 | `.log status` | Show trace status and its path. |
 | `.log stop` | Stop the trace. |
 
-For the initial quest smoke test, put the character near an available quest giver, then use `.bot on` and `.bot quest`. See [TESTING.md](TESTING.md) for expected events and live test procedures.
+For the initial quest smoke test, put the character near an available quest giver, then use `.bot on` and `.bot quest`. See [Testing](docs/TESTING.md) for expected events and live test procedures.
 
 ## Runtime files
 
@@ -87,6 +89,7 @@ The AzerothCore data directory is a separate, read-only input.
 | `crates/wow-tentacli-adapter/` | Tentacli packet and object integration. |
 | `crates/wow-infra/` | Configuration, logging, and supporting services. |
 | `tools/world-knowledge-gen/` | World-knowledge generation tool. |
+| `docs/` | Project details and live test procedures. |
 | `openspec/` | Specifications and change proposals. |
 
 ## Development checks
@@ -95,6 +98,7 @@ The AzerothCore data directory is a separate, read-only input.
 cargo check --workspace --all-targets
 cargo test --workspace
 cargo clippy --workspace --all-targets
+tools/check-binrw-future-compat.sh
 ```
 
-A successful build does not prove that all gameplay features work. Use the live checks in [TESTING.md](TESTING.md) to assess feature completion.
+A successful build does not prove that all gameplay features work. Use the live checks in [Testing](docs/TESTING.md) and review the limits in [Project details](docs/PROJECT_DETAILS.md).

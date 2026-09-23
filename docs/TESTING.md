@@ -1,6 +1,6 @@
 # Local verification
 
-This source tree was generated in an environment without a Rust toolchain, so Cargo compilation was not available during the implementation pass.
+Run the checks below after source or dependency changes. A successful build does not prove gameplay behavior against a live AzerothCore server.
 
 Run these commands from the repository root:
 
@@ -8,9 +8,10 @@ Run these commands from the repository root:
 cargo check --workspace --all-targets
 cargo test --workspace
 cargo clippy --workspace --all-targets
+tools/check-binrw-future-compat.sh
 ```
 
-For the first compile pass, preserve the exact Tentacli Git revision in the workspace manifest. If Cargo reports an API mismatch in `wow-tentacli-adapter`, compare it against the supplied Tentacli 15.3.1 snapshot before changing the architectural interfaces.
+The workspace pins Tentacli 15.3.2 in `Cargo.toml`. If Cargo reports an adapter API mismatch after a dependency change, compare the adapter with that pinned revision before changing the runtime interfaces.
 
 The most important regression areas are:
 
