@@ -51,7 +51,7 @@ impl ActionValidator {
                 if target.as_ref().is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity)) { return reject("unknown_entity", "item target is not authoritative", true); }
             }
             GameplayCommand::UseItemInstance { item, item_guid, backpack_slot, target, .. } => {
-                let matches = snapshot.state.inventory.instances.get(item).is_some_and(|instance| instance.guid == *item_guid && instance.backpack_slot == *backpack_slot && instance.count > 0);
+                let matches = snapshot.state.inventory.instances.get(item_guid).is_some_and(|instance| instance.item == *item && instance.backpack_slot == *backpack_slot && instance.count > 0);
                 if !matches { return reject("stale_item_instance", "item slot/GUID is no longer authoritative", true); }
                 if target.as_ref().is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity)) { return reject("unknown_entity", "item target is not authoritative", true); }
             }
@@ -192,6 +192,35 @@ mod tests {
             action,
         );
         assert!(matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "stale_state"));
+    }
+
+    #[test]
+    fn item_instance_validation_accepts_each_observed_stack() {
+        use wow_state::inventory::InventoryItemInstance;
+        let mut state = AuthoritativeState::default();
+        state.revision = base_stamp().state;
+        state.session.in_world = true;
+        for (guid, slot) in [(10, 3), (11, 1)] {
+            state.inventory.instances.insert(EntityId(guid), InventoryItemInstance {
+                item: 99, guid: EntityId(guid), backpack_slot: slot, count: 1,
+            });
+        }
+        let snapshot = Snapshot::from_state(&state);
+        let validate = |guid, slot| ActionValidator::validate(
+            &snapshot,
+            ValidationContext { current: base_stamp(), stage: ActivationStage::Act, permissions: PermissionSet::ALL },
+            ProposedAction {
+                id: ActionId(1), task: TaskId(1), origin: PlanOrigin::Operator,
+                stamp: base_stamp(),
+                command: GameplayCommand::UseItemInstance {
+                    item: 99, item_guid: EntityId(guid), backpack_slot: slot,
+                    spell: 0, target: None, cast_count: 0,
+                },
+            },
+        );
+        assert!(matches!(validate(10, 3), ValidationOutcome::Sendable(_)));
+        assert!(matches!(validate(11, 1), ValidationOutcome::Sendable(_)));
+        assert!(matches!(validate(12, 1), ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "stale_item_instance"));
     }
 
 

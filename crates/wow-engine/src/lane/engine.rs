@@ -613,7 +613,7 @@ impl LaneEngine {
                 }
                 ObjectiveResolution::GroundedScriptedItemUse { objective, target, item, spell, cast_count } => {
                     self.set_work(QuestWorkKey::InteractObjective { quest, objective, target });
-                    let Some(instance) = self.state.authoritative.inventory.instances.get(&item).cloned() else {
+                    let Some(instance) = self.state.authoritative.inventory.usable_instance(item).cloned() else {
                         self.waiting(format!("quest {quest} needs usable item {item} for scripted objective, but no authoritative backpack slot/GUID is known"));
                         return true;
                     };

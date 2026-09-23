@@ -26,7 +26,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             delta.touched_entities.push(entity); delta.changed.extend(["entities".into(), "inventory".into()]);
         }
         ProtocolObservation::InventoryCount { item, count } => { if count == 0 { state.inventory.items.remove(&item); } else { state.inventory.items.insert(item, count); } delta.changed.push("inventory".into()); }
-        ProtocolObservation::InventoryInstances { items } => { state.inventory.instances = items.into_iter().map(|instance| (instance.item, instance)).collect(); delta.changed.push("inventory".into()); }
+        ProtocolObservation::InventoryInstances { items } => { state.inventory.instances = items.into_iter().map(|instance| (instance.guid, instance)).collect(); delta.changed.push("inventory".into()); }
         ProtocolObservation::InventoryFreeSlots { count } => { state.inventory.free_slots = count; delta.changed.push("inventory".into()); }
         ProtocolObservation::EquippedRangedItem { item } => { state.inventory.equipped_ranged_item = item; state.inventory.equipment_authoritative = true; delta.changed.push("inventory".into()); }
         ProtocolObservation::Money { copper } => { state.inventory.money = copper; delta.changed.push("inventory".into()); }
@@ -96,7 +96,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::EntityState;
+    use crate::{entities::EntityState, inventory::InventoryItemInstance};
     use wow_domain::{EntityId, Vec3, WorldPosition};
 
     #[test]
@@ -130,6 +130,15 @@ mod tests {
         assert!(state.quests.active.is_empty());
     }
 
+    #[test]
+    fn inventory_snapshot_retains_each_stack_of_the_same_item() {
+        let mut state = AuthoritativeState::default();
+        let first = InventoryItemInstance { item: 99, guid: EntityId(10), backpack_slot: 3, count: 2 };
+        let second = InventoryItemInstance { item: 99, guid: EntityId(11), backpack_slot: 1, count: 5 };
+        reduce(&mut state, ProtocolObservation::InventoryInstances { items: vec![first, second.clone()] });
+        assert_eq!(state.inventory.instances.len(), 2);
+        assert_eq!(state.inventory.usable_instance(99), Some(&second));
+    }
     #[test]
     fn removing_entity_clears_dependent_service_state(){
         let mut s=AuthoritativeState::default();let id=EntityId(7);s.entities.0.insert(id,EntityState{id,..Default::default()});s.inventory.vendor=Some(id);s.inventory.current_loot=Some(id);s.inventory.trade.partner=Some(id);s.inventory.trade.open=true;

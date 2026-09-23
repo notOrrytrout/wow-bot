@@ -45,7 +45,7 @@ pub struct MailboxState { pub generation: u64, pub mails: BTreeMap<u32, MailEntr
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InventoryState {
     pub items: BTreeMap<u32, u32>,
-    pub instances: BTreeMap<u32, InventoryItemInstance>,
+    pub instances: BTreeMap<EntityId, InventoryItemInstance>,
     pub free_slots: u16,
     pub equipped_ranged_item: Option<u32>,
     pub equipment_authoritative: bool,
@@ -62,4 +62,10 @@ pub struct InventoryState {
 
 impl InventoryState {
     pub fn has(&self, item: u32, count: u32) -> bool { self.items.get(&item).copied().unwrap_or(0) >= count }
+
+    pub fn usable_instance(&self, item: u32) -> Option<&InventoryItemInstance> {
+        self.instances.values()
+            .filter(|instance| instance.item == item && instance.count > 0)
+            .min_by_key(|instance| (instance.backpack_slot, instance.guid))
+    }
 }
