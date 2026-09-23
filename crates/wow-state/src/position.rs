@@ -1,0 +1,1 @@
+use serde::{Deserialize,Serialize}; use wow_domain::WorldPosition; #[derive(Clone,Debug,Default,Serialize,Deserialize)] pub struct PositionState{pub player:Option<WorldPosition>,pub moving:bool,pub flags:u32,pub client_time:u32}

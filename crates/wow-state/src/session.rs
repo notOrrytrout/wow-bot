@@ -1,0 +1,1 @@
+use serde::{Deserialize,Serialize}; #[derive(Clone,Debug,Default,Serialize,Deserialize)] pub struct SessionState{pub authenticated:bool,pub in_world:bool,pub character_guid:Option<u64>,pub realm:Option<String>}

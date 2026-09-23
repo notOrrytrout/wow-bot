@@ -1,0 +1,4 @@
+use wow_domain::EntityId;use wow_state::Snapshot;
+#[derive(Clone,Debug)]pub struct TradeIntent{pub generation:u64,pub partner:EntityId,pub give_items:Vec<(u32,u32)>,pub give_money:u64}
+pub fn valid(state:&Snapshot,intent:&TradeIntent,asset_mutation_allowed:bool)->bool{if !asset_mutation_allowed{return false}let t=&state.state.inventory.trade;t.open&&t.generation==intent.generation&&t.partner==Some(intent.partner)&&intent.give_items.iter().all(|(i,c)|state.state.inventory.has(*i,*c))&&state.state.inventory.money>=intent.give_money}
+pub fn clear_gift_acceptable(state:&Snapshot,generation:u64,partner:EntityId)->bool{let t=&state.state.inventory.trade;t.open&&t.generation==generation&&t.partner==Some(partner)&&t.our_items.is_empty()&&t.our_money==0&&(!t.their_items.is_empty()||t.their_money>0)}

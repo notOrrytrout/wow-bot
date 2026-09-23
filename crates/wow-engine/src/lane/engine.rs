@@ -1,0 +1,1134 @@
+use crate::action::finalize;
+use super::{LaneMessage, LaneState};
+use std::{collections::{BTreeMap, BTreeSet}, time::{Duration, Instant}};
+use tokio::sync::mpsc;
+use wow_control_proto::WorkerToProxy;
+use wow_domain::*;
+use wow_policy::questing::{objectives::{resolve as resolve_objective, resolve_with_exclusions, ObjectiveResolution}, tasks::{QuestWorkId, QuestWorkKey, QuestWorkRuntime}};
+use wow_state::{reduce, ProtocolObservation, Snapshot};
+
+#[derive(Clone, Debug)]
+struct PendingMovement {
+    destination: Vec3,
+    acceptable_range: f32,
+    resume: Option<GameplayCommand>,
+    resume_pending: Option<PendingQuestAction>,
+    resume_origin: PlanOrigin,
+    work: QuestWorkRuntime,
+    last_step: Option<Instant>,
+    purpose: MovementPurpose,
+    started_at: Instant,
+    last_progress_at: Instant,
+    last_progress_position: Option<Vec3>,
+    last_progress_log: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MovementPurpose {
+    SearchArea,
+    ApproachGroundedTarget,
+    SurvivalApproach,
+}
+
+#[derive(Clone, Debug)]
+enum PendingQuestAction {
+    Combat { target: EntityId, started: Instant, cycle: Duration },
+    CorpseLoot { target: EntityId, baseline_generation: u64, started: Instant },
+    Loot { item: u32, target: EntityId, baseline_count: u32, baseline_generation: u64, started: Instant },
+    Interact { target: EntityId, started: Instant },
+    ControlActivation { target: EntityId, started: Instant },
+    QuestCredit { quest: u32, objective: usize, baseline: u32, target: EntityId, started: Instant, label: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchOutcome {
+    Sent,
+    DeferredMovement,
+    DeferredSpatial,
+    Rejected,
+    TransportClosed,
+}
+
+pub struct LaneEngine {
+    pub state: LaneState,
+    rx: mpsc::Receiver<LaneMessage>,
+    proxy: mpsc::Sender<WorkerToProxy>,
+    next_action: u64,
+    next_task: u64,
+    next_work: u64,
+    last_quest_step: Option<Instant>,
+    pending_accept: Option<(u32, EntityId, Instant)>,
+    pending_turn_in: Option<(u32, Instant, &'static str)>,
+    pending_movement: Option<PendingMovement>,
+    pending_quest_action: Option<PendingQuestAction>,
+    current_work: Option<QuestWorkRuntime>,
+    last_wait_reason: Option<String>,
+    last_dispatch: DispatchOutcome,
+    movement_controller: Option<wow_navigation::MovementController>,
+    credited_quest_targets: BTreeSet<(u32, usize, EntityId)>,
+    los_blocked: BTreeSet<EntityId>,
+    los_attempts: BTreeMap<EntityId, u8>,
+    server_range_recovery: BTreeMap<EntityId, (crate::action::spatial::ServerRangeCorrection, u8)>,
+    maintenance_retry_after: BTreeMap<(u32, EntityId), Instant>,
+    last_maintenance_tick: Option<Instant>,
+    last_maintenance_status: Option<String>,
+    post_combat_loot: Option<EntityId>,
+    last_recovery_action: Option<Instant>,
+    last_survival_action: Option<(EntityId, Instant)>,
+}
+
+impl LaneEngine {
+    pub fn new(state: LaneState, rx: mpsc::Receiver<LaneMessage>, proxy: mpsc::Sender<WorkerToProxy>) -> Self {
+        Self {
+            state,
+            rx,
+            proxy,
+            next_action: 1,
+            next_task: 1,
+            next_work: 1,
+            last_quest_step: None,
+            pending_accept: None,
+            pending_turn_in: None,
+            pending_movement: None,
+            pending_quest_action: None,
+            current_work: None,
+            last_wait_reason: None,
+            last_dispatch: DispatchOutcome::Rejected,
+            movement_controller: None,
+            credited_quest_targets: BTreeSet::new(),
+            los_blocked: BTreeSet::new(),
+            los_attempts: BTreeMap::new(),
+            server_range_recovery: BTreeMap::new(),
+            maintenance_retry_after: BTreeMap::new(),
+            last_maintenance_tick: None,
+            last_maintenance_status: None,
+            post_combat_loot: None,
+            last_recovery_action: None,
+            last_survival_action: None,
+        }
+    }
+
+    pub fn with_movement_controller(mut self, controller: wow_navigation::MovementController) -> Self {
+        self.movement_controller = Some(controller);
+        self
+    }
+
+    pub async fn run(mut self) {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    if !self.tick_mission().await { break; }
+                }
+                msg = self.rx.recv() => {
+                    let Some(msg) = msg else { break; };
+                    if !self.handle(msg).await { break; }
+                }
+            }
+        }
+    }
+
+    async fn handle(&mut self, msg: LaneMessage) -> bool {
+        match msg {
+            LaneMessage::Observation(o) => {
+                if let ProtocolObservation::CastFailed { spell, reason, target } = &o {
+                    if let Some(target) = target {
+                        self.maintenance_retry_after.insert((*spell, *target), wow_policy::maintenance::retry_deadline(Instant::now()));
+                        match *reason {
+                            47 => {
+                                self.los_blocked.insert(*target);
+                                let attempts = self.los_attempts.entry(*target).or_default();
+                                *attempts = attempts.saturating_add(1);
+                                tracing::info!(lane=?self.state.lane, spell, ?target, attempts=*attempts, "authoritative line-of-sight failure armed shared reposition recovery");
+                            }
+                            97 => {
+                                let attempts = self.server_range_recovery.get(target).map(|(_, n)| n.saturating_add(1)).unwrap_or(1);
+                                self.server_range_recovery.insert(*target, (crate::action::spatial::ServerRangeCorrection::MoveCloser, attempts));
+                                tracing::info!(lane=?self.state.lane, spell, ?target, attempts, "authoritative out-of-range failure armed shared range recovery");
+                            }
+                            128 => {
+                                let attempts = self.server_range_recovery.get(target).map(|(_, n)| n.saturating_add(1)).unwrap_or(1);
+                                self.server_range_recovery.insert(*target, (crate::action::spatial::ServerRangeCorrection::MoveFarther, attempts));
+                                tracing::info!(lane=?self.state.lane, spell, ?target, attempts, "authoritative too-close failure armed shared range recovery");
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(*reason, 47 | 97 | 128) {
+                        // The semantic action did not happen. Do not wait for quest credit
+                        // or interaction evidence that can never arrive.
+                        self.pending_quest_action = None;
+                        self.last_quest_step = None;
+                    }
+                }
+                if let ProtocolObservation::QuestGiverStatus { giver, status } = &o {
+                    if self.pending_accept.is_some_and(|(_, pending_giver, _)| pending_giver == *giver)
+                        && !quest_status_available(*status)
+                    {
+                        tracing::info!(lane=?self.state.lane, ?giver, status, "server quest-giver status changed after accept attempt");
+                        self.pending_accept = None;
+                    }
+                }
+                if let ProtocolObservation::QuestProgress { quest, .. } = &o {
+                    if self.pending_accept.is_some_and(|(pending_quest, _, _)| pending_quest == *quest) {
+                        tracing::info!(lane=?self.state.lane, quest, "quest acceptance confirmed by authoritative quest journal");
+                        self.pending_accept = None;
+                    }
+                }
+                if let ProtocolObservation::QuestTurnInDialog { quest, .. } | ProtocolObservation::QuestRemoved { quest } = &o {
+                    if self.pending_turn_in.is_some_and(|(pending_quest, _, _)| pending_quest == *quest) {
+                        tracing::info!(lane=?self.state.lane, quest, "quest turn-in step confirmed by authoritative server state");
+                        self.pending_turn_in = None;
+                    }
+                }
+                let delta = reduce(&mut self.state.authoritative, o);
+                if !delta.changed.is_empty() {
+                    tracing::debug!(lane=?self.state.lane, revision=?delta.revision, changed=?delta.changed, "authoritative state updated");
+                }
+            }
+            LaneMessage::ReplaceMission(m) => {
+                self.state.mission = m;
+                self.state.mission_revision = self.state.mission_revision.next();
+                self.last_quest_step = None;
+                self.pending_accept = None;
+                self.pending_turn_in = None;
+                self.pending_movement = None;
+                self.pending_quest_action = None;
+                self.current_work = None;
+                self.credited_quest_targets.clear();
+                self.los_blocked.clear();
+                self.los_attempts.clear();
+                self.server_range_recovery.clear();
+                self.last_wait_reason = None;
+                tracing::info!(lane=?self.state.lane, mission=?self.state.mission.intent, revision=?self.state.mission_revision, "mission installed in lane engine");
+            }
+            LaneMessage::SetPause(p) => self.state.pause = p,
+            LaneMessage::UpdatePause { set, clear } => {
+                self.state.pause.insert(set);
+                self.state.pause.remove(clear);
+            }
+            LaneMessage::SetActivation(stage) => {
+                if self.state.activation != stage {
+                    self.state.activation = stage;
+                    self.state.permission_revision = self.state.permission_revision.next();
+                }
+            }
+            LaneMessage::Ownership { generation, movement, bot_allowed } => {
+                self.state.ownership = generation;
+                self.state.movement_epoch = movement;
+                if bot_allowed {
+                    self.state.pause.remove(PauseReasons::PLAYER_CONTROL)
+                } else {
+                    self.state.pause.insert(PauseReasons::PLAYER_CONTROL)
+                }
+            }
+            LaneMessage::MovementFence(epoch) => {
+                if self.state.movement_epoch != epoch {
+                    self.state.movement_epoch = epoch;
+                    self.pending_movement = None;
+                    self.pending_quest_action = None;
+                }
+            }
+            LaneMessage::Propose(a) => {
+                if !self.submit(a).await { return false; }
+            }
+            LaneMessage::Shutdown => return false,
+        }
+        true
+    }
+
+    async fn tick_mission(&mut self) -> bool {
+        if !self.state.runnable() {
+            self.waiting(format!("lane paused by {:?}", self.state.pause));
+            return true;
+        }
+        if self.state.activation != ActivationStage::Act {
+            self.waiting(format!("activation stage is {:?}", self.state.activation));
+            return true;
+        }
+        if !self.state.authoritative.session.in_world {
+            self.waiting("configured world session is not yet authoritative".to_owned());
+            return true;
+        }
+        if self.player_is_dead() { return self.tick_death_recovery().await; }
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        if let Some(attacker) = wow_policy::combat::engagement::survival_attacker(&snapshot) {
+            if self.pending_movement.as_ref().is_some_and(|movement| movement.purpose == MovementPurpose::SurvivalApproach) {
+                return self.tick_movement().await;
+            }
+            if self.pending_movement.is_some() {
+                tracing::info!(lane=?self.state.lane, ?attacker, "survival attacker preempted voluntary movement");
+                let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
+                self.pending_movement = None;
+                self.current_work = None;
+            }
+            self.pending_quest_action = None;
+            return self.tick_survival(attacker).await;
+        }
+        if self.pending_movement.as_ref().is_some_and(|movement| movement.purpose == MovementPurpose::SurvivalApproach) {
+            tracing::info!(lane=?self.state.lane, "survival approach ended because no authoritative attacker remains");
+            let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
+            self.pending_movement = None;
+            self.current_work = None;
+        }
+        if self.pending_movement.is_some() {
+            return self.tick_movement().await;
+        }
+        if self.maintenance_eligible() { if let Some(result) = self.tick_maintenance().await { return result; } }
+        match self.state.mission.intent.clone() {
+            MissionIntent::Idle => true,
+            MissionIntent::Quest => self.tick_quest().await,
+            other => {
+                self.waiting(format!("mission scheduler for {other:?} is not implemented yet"));
+                true
+            }
+        }
+    }
+
+    async fn tick_survival(&mut self, target: EntityId) -> bool {
+        if self.last_survival_action.is_some_and(|(previous, at)| previous == target && at.elapsed() < Duration::from_millis(2750)) {
+            return true;
+        }
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        let command = match wow_policy::combat::selector::select(&snapshot, target) {
+            wow_policy::combat::selector::CombatDecision::Cast { spell, target } => {
+                tracing::info!(lane=?self.state.lane, spell, ?target, "survival combat selected caster spell for authoritative attacker");
+                GameplayCommand::Cast { spell, target: Some(target) }
+            }
+            wow_policy::combat::selector::CombatDecision::Wand { target } => {
+                tracing::info!(lane=?self.state.lane, ?target, spell=5019_u32, "survival combat selected wand for authoritative attacker");
+                GameplayCommand::Cast { spell: 5019, target: Some(target) }
+            }
+            wow_policy::combat::selector::CombatDecision::Melee { target } => {
+                tracing::info!(lane=?self.state.lane, ?target, "survival combat selected melee for authoritative attacker");
+                GameplayCommand::Attack(target)
+            }
+            wow_policy::combat::selector::CombatDecision::Deferred { reason } => {
+                self.waiting(format!("survival combat against {target} deferred: {reason}"));
+                return true;
+            }
+        };
+        self.last_survival_action = Some((target, Instant::now()));
+        self.propose_recovery(command).await
+    }
+
+    fn player_is_dead(&self) -> bool {
+        let Some(player)=self.state.authoritative.session.character_guid.map(EntityId) else { return false; };
+        self.state.authoritative.entities.0.get(&player).and_then(|entity|entity.health).is_some_and(|(health,_)|health==0)
+    }
+
+    async fn tick_death_recovery(&mut self) -> bool {
+        let now=Instant::now();
+        if self.last_recovery_action.is_some_and(|at|at.elapsed()<Duration::from_secs(1)){return true;}
+        self.last_recovery_action=Some(now);
+        self.pending_quest_action=None;
+        self.post_combat_loot=None;
+        let Some(player_guid)=self.state.authoritative.session.character_guid.map(EntityId) else { self.waiting("death recovery waiting for player GUID".into()); return true; };
+        let Some(player_pos)=self.state.authoritative.control.active_position(self.state.authoritative.position.player) else { self.waiting("death recovery waiting for authoritative position".into()); return true; };
+        let wall=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let Some(corpse)=self.state.authoritative.life.corpse else {
+            tracing::info!(lane=?self.state.lane,"death recovery releasing spirit and querying corpse");
+            let _=self.propose_recovery(GameplayCommand::ReleaseSpirit).await;
+            return self.propose_recovery(GameplayCommand::QueryCorpse).await;
+        };
+        if corpse.map!=player_pos.map {
+            self.waiting(format!("death recovery corpse is on map {} while ghost is on map {}; instance/entrance recovery is not yet grounded",corpse.map,player_pos.map));
+            return true;
+        }
+        let distance=player_pos.point.distance(corpse.point);
+        if distance>4.5 {
+            let mode=wow_navigation::LocomotionMode::from_server_flags(self.state.authoritative.control.mover.is_some(),self.state.authoritative.control.movement_flags);
+            let Some(controller)=self.movement_controller.as_ref() else { self.waiting("death recovery requires navigation controller".into()); return true; };
+            match controller.next_step(player_pos,corpse.point,4.0,mode) {
+                Ok(Some(step))=>{tracing::info!(lane=?self.state.lane,remaining=step.remaining,"death recovery moving ghost toward corpse");return self.propose_recovery(GameplayCommand::MoveTo(step.next)).await;}
+                Ok(None)=>{}
+                Err(error)=>{self.waiting(format!("death recovery navigation failed: {error:?}"));return true;}
+            }
+        }
+        if wall<self.state.authoritative.life.reclaim_ready_at_ms { self.waiting("death recovery waiting for corpse reclaim timer".into()); return true; }
+        tracing::info!(lane=?self.state.lane,?player_guid,"death recovery reclaiming corpse");
+        self.propose_recovery(GameplayCommand::ReclaimCorpse{player:player_guid}).await
+    }
+
+    async fn propose_recovery(&mut self,command:GameplayCommand)->bool{
+        let action=ProposedAction{id:ActionId(self.next_action),task:TaskId(self.next_task),origin:PlanOrigin::Recovery,stamp:self.state.stamp(),command};
+        self.next_action=self.next_action.wrapping_add(1).max(1); self.next_task=self.next_task.wrapping_add(1).max(1); self.submit(action).await
+    }
+
+    fn maintenance_eligible(&self) -> bool {
+        if self.pending_quest_action.is_some() || self.pending_accept.is_some() || self.pending_turn_in.is_some() { return false; }
+        if self.state.authoritative.control.mover.is_some() || self.state.authoritative.position.moving { return false; }
+        if self.last_quest_step.is_some_and(|at| at.elapsed() < Duration::from_secs(2)) { return false; }
+        self.last_maintenance_tick.is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
+    }
+
+    async fn tick_maintenance(&mut self) -> Option<bool> {
+        self.last_maintenance_tick = Some(Instant::now());
+        let now = Instant::now();
+        self.maintenance_retry_after.retain(|_, deadline| *deadline > now);
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        match wow_policy::maintenance::decide_next(&snapshot, &self.maintenance_retry_after, now, true) {
+            wow_policy::maintenance::MaintenanceDecision::Cast { family, spell, target } => {
+                let status=format!("cast:{family}:{spell}:{}",target.0);
+                if self.last_maintenance_status.as_deref()!=Some(&status) {
+                    tracing::info!(lane=?self.state.lane, %family, spell, ?target, "buff maintenance selected missing authoritative aura family");
+                    self.last_maintenance_status=Some(status);
+                }
+                self.maintenance_retry_after.insert((spell,target), wow_policy::maintenance::retry_deadline(now));
+                Some(self.propose_command(GameplayCommand::MaintainBuff { spell, target }, false).await)
+            }
+            wow_policy::maintenance::MaintenanceDecision::Deferred { family, reason } => {
+                let status=format!("deferred:{family}:{reason}");
+                if self.last_maintenance_status.as_deref()!=Some(&status) {
+                    tracing::info!(lane=?self.state.lane, %family, %reason, "buff maintenance deferred");
+                    self.last_maintenance_status=Some(status);
+                }
+                None
+            }
+            wow_policy::maintenance::MaintenanceDecision::Satisfied => {
+                if self.last_maintenance_status.as_deref()!=Some("satisfied") {
+                    tracing::info!(lane=?self.state.lane, "buff maintenance satisfied for all authoritative families");
+                    self.last_maintenance_status=Some("satisfied".into());
+                }
+                None
+            },
+        }
+    }
+
+    fn queue_movement(
+        &mut self,
+        destination: Vec3,
+        acceptable_range: f32,
+        resume: Option<GameplayCommand>,
+        resume_pending: Option<PendingQuestAction>,
+        resume_origin: PlanOrigin,
+        work: QuestWorkRuntime,
+        purpose: MovementPurpose,
+    ) {
+        let now = Instant::now();
+        self.pending_movement = Some(PendingMovement {
+            destination,
+            acceptable_range,
+            resume,
+            resume_pending,
+            resume_origin,
+            work,
+            last_step: None,
+            purpose,
+            started_at: now,
+            last_progress_at: now,
+            last_progress_position: None,
+            last_progress_log: None,
+        });
+    }
+
+    async fn tick_movement(&mut self) -> bool {
+        let Some(mut movement) = self.pending_movement.take() else { return true };
+        if should_supersede_search_movement(movement.purpose, self.quest_movement_has_live_target(&movement)) {
+            tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, "live authoritative quest target superseded search-area movement");
+            let _ = self.propose_command(GameplayCommand::StopMovement, false).await;
+            self.current_work = None;
+            return self.tick_quest().await;
+        }
+        if movement.last_step.is_some_and(|at| at.elapsed() < Duration::from_millis(225)) {
+            self.pending_movement = Some(movement);
+            return true;
+        }
+        let Some(player) = self.state.authoritative.control.active_position(self.state.authoritative.position.player) else {
+            self.waiting(format!("quest work {:?} is waiting for canonical active-mover position", movement.work.key));
+            self.pending_movement = Some(movement);
+            return true;
+        };
+        let controlled_mover = self.state.authoritative.control.mover.is_some();
+        let movement_flags = if controlled_mover { self.state.authoritative.control.movement_flags } else { self.state.authoritative.position.flags };
+        let locomotion = wow_navigation::LocomotionMode::from_server_flags(controlled_mover, movement_flags);
+        let distance = match locomotion {
+            wow_navigation::LocomotionMode::Ground => (movement.destination.x - player.point.x).hypot(movement.destination.y - player.point.y),
+            wow_navigation::LocomotionMode::Flight => player.point.distance(movement.destination),
+        };
+
+        if movement.started_at.elapsed() >= Duration::from_secs(90) {
+            tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, "movement operation timed out");
+            if movement.purpose == MovementPurpose::SurvivalApproach { let _ = self.propose_recovery(GameplayCommand::StopMovement).await; }
+            else { let _ = self.propose_command(GameplayCommand::StopMovement, false).await; }
+            self.current_work = None;
+            self.waiting(format!("movement for {:?} timed out; waiting for authoritative state before retry", movement.work.key));
+            return true;
+        }
+
+        match movement.last_progress_position {
+            Some(previous) if previous.distance(player.point) >= 0.35 => {
+                movement.last_progress_position = Some(player.point);
+                movement.last_progress_at = Instant::now();
+            }
+            None => {
+                movement.last_progress_position = Some(player.point);
+                movement.last_progress_at = Instant::now();
+            }
+            _ => {}
+        }
+        if movement.last_progress_at.elapsed() >= Duration::from_secs(5) {
+            tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, "movement made no authoritative progress; stopping owned movement for deterministic retry");
+            if movement.purpose == MovementPurpose::SurvivalApproach { let _ = self.propose_recovery(GameplayCommand::StopMovement).await; }
+            else { let _ = self.propose_command(GameplayCommand::StopMovement, false).await; }
+            self.current_work = None;
+            self.waiting(format!("movement for {:?} stalled; scheduler will re-ground before retry", movement.work.key));
+            return true;
+        }
+        if movement.last_progress_log.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
+            tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, mover=?self.state.authoritative.control.mover, "movement operation progress");
+            movement.last_progress_log = Some(Instant::now());
+        }
+        if distance <= movement.acceptable_range {
+            tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, remaining=distance, purpose=?movement.purpose, "owned movement work reached interaction envelope");
+            if movement.purpose == MovementPurpose::SurvivalApproach { let _ = self.propose_recovery(GameplayCommand::StopMovement).await; }
+            else { let _ = self.propose_command(GameplayCommand::StopMovement, false).await; }
+            self.current_work = None;
+            if let Some(resume) = movement.resume.take() {
+                let work_key = movement.work.key.clone();
+                tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, command=?resume, work=?work_key, "resuming quest action after movement");
+                if movement.resume_origin == PlanOrigin::Recovery {
+                    self.last_survival_action = Some((crate::action::spatial::profile(&resume).map(|profile| profile.target).unwrap_or(EntityId(0)), Instant::now()));
+                    return self.propose_recovery(resume).await;
+                }
+                if let Some(pending) = movement.resume_pending.take() {
+                    return self.dispatch_quest_semantic(resume, pending).await;
+                }
+                return self.dispatch_resumed_quest_action(resume, &work_key).await;
+            }
+            return true;
+        }
+        let step_result = match &self.movement_controller {
+            Some(controller) => controller.next_step(player, movement.destination, movement.acceptable_range, locomotion),
+            None => Err(wow_navigation::NavigationError::MissingNavigationData),
+        };
+        let next = match step_result {
+            Ok(Some(step)) => step.next,
+            Ok(None) => { self.pending_movement = Some(movement); return true; },
+            Err(error) => {
+                self.waiting(format!("movement step rejected: {error:?}"));
+                self.pending_movement = Some(movement);
+                return true;
+            }
+        };
+        movement.last_step = Some(Instant::now());
+        tracing::debug!(lane=?self.state.lane, work_id=?movement.work.id, ?locomotion, remaining=distance, next_x=next.x, next_y=next.y, next_z=next.z, "quest movement progress");
+        let survival = movement.purpose == MovementPurpose::SurvivalApproach;
+        self.pending_movement = Some(movement);
+        if survival { self.propose_recovery(GameplayCommand::MoveTo(next)).await }
+        else { self.propose_command(GameplayCommand::MoveTo(next), false).await }
+    }
+
+    fn quest_movement_has_live_target(&self, movement: &PendingMovement) -> bool {
+        let quest = match &movement.work.key {
+            QuestWorkKey::TravelToObjective { quest, .. } | QuestWorkKey::CollectItem { quest, .. } => *quest,
+            _ => return false,
+        };
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        matches!(
+            resolve_objective(&snapshot, quest),
+            ObjectiveResolution::GroundedCreature { .. }
+                | ObjectiveResolution::GroundedGameObject { .. }
+                | ObjectiveResolution::GroundedItemCreature { .. }
+                | ObjectiveResolution::GroundedItemGameObject { .. }
+                | ObjectiveResolution::GroundedControlledSpell { .. }
+                | ObjectiveResolution::GroundedScriptedItemUse { .. }
+                | ObjectiveResolution::GroundedQuestTool { .. }
+        )
+    }
+
+    async fn tick_quest(&mut self) -> bool {
+        if self.pending_quest_action_blocks() {
+            return true;
+        }
+        if let Some(target) = self.post_combat_loot.take() {
+            if self.state.authoritative.entities.0.get(&target).is_some_and(|entity| entity.health.is_some_and(|(current, _)| current == 0)) {
+                let baseline_generation = self.state.authoritative.inventory.bot_loot_generation;
+                tracing::info!(lane=?self.state.lane, ?target, baseline_generation, "post-combat corpse loot selected before next quest target");
+                return self.dispatch_quest_semantic(
+                    GameplayCommand::Loot(target),
+                    PendingQuestAction::CorpseLoot { target, baseline_generation, started: Instant::now() },
+                ).await;
+            }
+        }
+        if self.last_quest_step.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return true;
+        }
+        if let Some((quest, giver, at)) = self.pending_accept {
+            if at.elapsed() < Duration::from_secs(10) {
+                self.waiting(format!("awaiting server confirmation for quest {quest} from giver {giver}"));
+                return true;
+            }
+            tracing::warn!(lane=?self.state.lane, quest, ?giver, "quest accept confirmation timed out; allowing bounded retry");
+            self.pending_accept = None;
+        }
+        if let Some((quest, at, step)) = self.pending_turn_in {
+            if at.elapsed() < Duration::from_secs(10) {
+                self.waiting(format!("awaiting authoritative server confirmation for quest {quest} turn-in step {step}"));
+                return true;
+            }
+            tracing::warn!(lane=?self.state.lane, quest, step, "quest turn-in confirmation timed out; allowing bounded retry");
+            self.pending_turn_in = None;
+        }
+
+        let offer = self.state.authoritative.quests.offers.iter().next().map(|(&quest, offer)| (quest, offer.giver));
+        if let Some((quest, giver)) = offer {
+            self.set_work(QuestWorkKey::AcquireQuest { quest: Some(quest) });
+            tracing::info!(lane=?self.state.lane, quest, ?giver, "quest scheduler accepting authoritative quest offer");
+            self.pending_accept = Some((quest, giver, Instant::now()));
+            return self.propose_command(GameplayCommand::AcceptQuest { quest, giver }, true).await;
+        }
+
+        let incomplete_quest = self.state.authoritative.quests.active.iter()
+            .find(|(_, progress)| !progress.complete)
+            .map(|(&quest, _)| quest);
+        if let Some(quest) = incomplete_quest {
+            if !self.state.authoritative.quests.definitions.contains_key(&quest) {
+                self.set_work(QuestWorkKey::QueryDefinition { quest });
+                tracing::info!(lane=?self.state.lane, quest, "quest scheduler requesting authoritative quest definition");
+                return self.propose_command(GameplayCommand::QueryQuest { quest }, true).await;
+            }
+            let snapshot = Snapshot::from_state(&self.state.authoritative);
+            let excluded: BTreeSet<(usize, EntityId)> = self.credited_quest_targets.iter()
+                .filter_map(|(credited_quest, objective, target)| (*credited_quest == quest).then_some((*objective, *target)))
+                .collect();
+            match resolve_with_exclusions(&snapshot, quest, &excluded) {
+                ObjectiveResolution::WaitingForDefinition => {
+                    self.waiting(format!("quest {quest} is waiting for authoritative definition"));
+                    return true;
+                }
+                ObjectiveResolution::GroundedCreature { objective, target } => {
+                    self.set_work(QuestWorkKey::CombatObjective { quest, objective, target });
+                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, "quest scheduler grounded creature objective from live object state");
+                    return self.dispatch_combat_target(target).await;
+                }
+                ObjectiveResolution::GroundedGameObject { objective, target } => {
+                    self.set_work(QuestWorkKey::InteractObjective { quest, objective, target });
+                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, "quest scheduler grounded game-object objective from live object state");
+                    return self.dispatch_quest_semantic(GameplayCommand::UseGameObject(target), PendingQuestAction::Interact { target, started: Instant::now() }).await;
+                }
+                ObjectiveResolution::GroundedScriptedItemUse { objective, target, item, spell, cast_count } => {
+                    self.set_work(QuestWorkKey::InteractObjective { quest, objective, target });
+                    let Some(instance) = self.state.authoritative.inventory.instances.get(&item).cloned() else {
+                        self.waiting(format!("quest {quest} needs usable item {item} for scripted objective, but no authoritative backpack slot/GUID is known"));
+                        return true;
+                    };
+                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, item, spell, slot=instance.backpack_slot, "quest scheduler using scripted targeted quest item");
+                    let baseline = self.state.authoritative.quests.active.get(&quest).and_then(|p| p.objectives.get(objective)).copied().unwrap_or_default();
+                    return self.dispatch_quest_semantic(
+                        GameplayCommand::UseItemInstance { item, item_guid: instance.guid, backpack_slot: instance.backpack_slot, spell, target: Some(target), cast_count },
+                        PendingQuestAction::QuestCredit { quest, objective, baseline, target, started: Instant::now(), label: "scripted item use" },
+                    ).await;
+                }
+                ObjectiveResolution::GroundedControlledSpell { objective, target, spell } => {
+                    self.set_work(QuestWorkKey::InteractObjective { quest, objective, target });
+                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, spell, mover=?self.state.authoritative.control.mover, "quest scheduler using observed controlled-unit ability for objective");
+                    let baseline = self.state.authoritative.quests.active.get(&quest).and_then(|p| p.objectives.get(objective)).copied().unwrap_or_default();
+                    return self.dispatch_quest_semantic(
+                        GameplayCommand::VehicleCast { spell, target: Some(target) },
+                        PendingQuestAction::QuestCredit { quest, objective, baseline, target, started: Instant::now(), label: "controlled quest ability" },
+                    ).await;
+                }
+                ObjectiveResolution::GroundedQuestTool { target, activation_spell } => {
+                    self.set_work(QuestWorkKey::InteractObjective { quest, objective: usize::MAX, target });
+                    tracing::info!(lane=?self.state.lane, quest, ?target, ?activation_spell, "quest scheduler activating live quest-bound control object");
+                    let command = activation_spell
+                        .map(|spell| GameplayCommand::CastGameObject { spell, target, report_use: true })
+                        .unwrap_or(GameplayCommand::UseGameObject(target));
+                    let pending = if activation_spell.is_some() {
+                        PendingQuestAction::ControlActivation { target, started: Instant::now() }
+                    } else {
+                        PendingQuestAction::Interact { target, started: Instant::now() }
+                    };
+                    return self.dispatch_quest_semantic(command, pending).await;
+                }
+                ObjectiveResolution::QuestToolSearch { destination } => {
+                    let work = self.set_work(QuestWorkKey::TravelToObjective { quest, objective: usize::MAX, destination });
+                    if self.state.authoritative.position.player.is_some_and(|player| player.point.distance(destination) <= 12.0) {
+                        self.waiting(format!("quest {quest} reached quest-control search area; waiting for live authoritative control object"));
+                        return true;
+                    }
+                    tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "quest scheduler traveling to quest-bound control object search area");
+                    self.queue_movement(destination, 12.0, None, None, PlanOrigin::SystemPolicy, work, MovementPurpose::SearchArea);
+                    return true;
+                }
+                ObjectiveResolution::GroundedItemCreature { item, target, dead } => {
+                    self.set_work(QuestWorkKey::CollectItem { quest, item });
+                    if dead {
+                        tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler looting grounded quest-item source");
+                        let baseline_count = self.state.authoritative.inventory.items.get(&item).copied().unwrap_or_default();
+                        return self.dispatch_quest_semantic(
+                            GameplayCommand::Loot(target),
+                            PendingQuestAction::Loot { item, target, baseline_count, baseline_generation: self.state.authoritative.inventory.bot_loot_generation, started: Instant::now() },
+                        ).await;
+                    }
+                    tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler engaging grounded quest-item source through shared combat selector");
+                    return self.dispatch_combat_target(target).await;
+                }
+                ObjectiveResolution::GroundedItemGameObject { item, target } => {
+                    self.set_work(QuestWorkKey::CollectItem { quest, item });
+                    tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler using grounded game-object quest-item source");
+                    return self.dispatch_quest_semantic(GameplayCommand::UseGameObject(target), PendingQuestAction::Interact { target, started: Instant::now() }).await;
+                }
+                ObjectiveResolution::SearchArea { objective, destination, source } => {
+                    let work = self.set_work(QuestWorkKey::TravelToObjective { quest, objective, destination });
+                    if self.state.authoritative.position.player.is_some_and(|player| player.point.distance(destination) <= 18.0) {
+                        self.waiting(format!("quest {quest} reached {source} search area for objective {objective}; waiting for live authoritative target observation"));
+                        return true;
+                    }
+                    tracing::info!(lane=?self.state.lane, quest, objective, work_id=?work.id, %source, x=destination.x, y=destination.y, "quest scheduler starting bounded objective-area travel");
+                    self.queue_movement(destination, 18.0, None, None, PlanOrigin::SystemPolicy, work, MovementPurpose::SearchArea);
+                    return true;
+                }
+                ObjectiveResolution::ItemCollection { item, required, current, destination } => {
+                    let work = self.set_work(QuestWorkKey::CollectItem { quest, item });
+                    if let Some(destination) = destination {
+                        if self.state.authoritative.position.player.is_some_and(|player| player.point.distance(destination) <= 18.0) {
+                            self.waiting(format!("quest {quest} reached item {item} loot-source search area at {current}/{required}; waiting for live authoritative source observation"));
+                            return true;
+                        }
+                        tracing::info!(lane=?self.state.lane, quest, item, current, required, work_id=?work.id, x=destination.x, y=destination.y, "quest item objective using AzerothCore loot-source search hint");
+                        self.queue_movement(destination, 18.0, None, None, PlanOrigin::SystemPolicy, work, MovementPurpose::SearchArea);
+                    } else {
+                        self.waiting(format!("quest {quest} needs item {item}: {current}/{required}; no grounded or static loot-source hint is available"));
+                    }
+                    return true;
+                }
+                ObjectiveResolution::NoSupportedObjective => {
+                    self.waiting(format!("quest {quest} has no remaining supported objective in the authoritative definition"));
+                    return true;
+                }
+            }
+        }
+
+        let complete_quest = self.state.authoritative.quests.active.iter()
+            .find(|(_, progress)| progress.complete)
+            .map(|(&quest, _)| quest);
+        if let Some(quest) = complete_quest {
+            self.set_work(QuestWorkKey::TurnIn { quest });
+            if let Some(dialog) = self.state.authoritative.quests.turn_in.get(&quest).cloned() {
+                match dialog.stage {
+                    wow_state::quests::QuestTurnInStage::RequestItems { can_complete: true } => {
+                        tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, "quest turn-in requesting reward after required-items confirmation");
+                        self.pending_turn_in = Some((quest, Instant::now(), "request-reward"));
+                        return self.propose_command(GameplayCommand::RequestQuestReward { quest, giver: dialog.giver }, true).await;
+                    }
+                    wow_state::quests::QuestTurnInStage::RequestItems { can_complete: false } => {
+                        self.waiting(format!("quest {quest} turn-in dialog reports required items or money are still incomplete"));
+                        return true;
+                    }
+                    wow_state::quests::QuestTurnInStage::OfferReward { reward_choices } => {
+                        tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, reward_choices, "quest turn-in choosing first authoritative reward option");
+                        self.pending_turn_in = Some((quest, Instant::now(), "choose-reward"));
+                        return self.propose_command(GameplayCommand::ChooseQuestReward { quest, giver: dialog.giver, reward: 0 }, true).await;
+                    }
+                }
+            }
+            let reward_giver = self.state.authoritative.quests.giver_status.iter()
+                .find(|(_, status)| quest_status_reward(**status))
+                .map(|(&giver, &status)| (giver, status));
+            if let Some((giver, status)) = reward_giver {
+                tracing::info!(lane=?self.state.lane, quest, ?giver, status, "quest scheduler opening authoritative turn-in giver");
+                self.pending_turn_in = Some((quest, Instant::now(), "complete-quest"));
+                return self.propose_command(GameplayCommand::TurnInQuest { quest, giver }, true).await;
+            }
+            if let Some(player) = self.state.authoritative.position.player {
+                if let Some(destination) = wow_policy::questing::static_hints::nearest_turn_in(quest, player.map, player.point) {
+                    let work = self.current_work.clone().expect("turn-in work exists");
+                    tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "completed quest using AzerothCore turn-in search hint");
+                    self.queue_movement(destination, 18.0, Some(GameplayCommand::QueryQuestGivers), None, PlanOrigin::SystemPolicy, work, MovementPurpose::SearchArea);
+                    return true;
+                }
+            }
+            tracing::debug!(lane=?self.state.lane, quest, "completed quest has no observed reward giver; refreshing quest-giver statuses");
+            return self.propose_command(GameplayCommand::QueryQuestGivers, true).await;
+        }
+
+        let available_giver = self.state.authoritative.quests.giver_status.iter()
+            .find(|(_, status)| quest_status_available(**status))
+            .map(|(&giver, &status)| (giver, status));
+        if let Some((giver, status)) = available_giver {
+            self.set_work(QuestWorkKey::AcquireQuest { quest: None });
+            tracing::info!(lane=?self.state.lane, ?giver, status, "quest scheduler opening authoritative quest giver");
+            return self.propose_command(GameplayCommand::Interact(giver), true).await;
+        }
+
+        self.set_work(QuestWorkKey::AcquireQuest { quest: None });
+        tracing::debug!(lane=?self.state.lane, "quest scheduler requesting quest-giver statuses");
+        self.propose_command(GameplayCommand::QueryQuestGivers, true).await
+    }
+
+    fn set_work(&mut self, key: QuestWorkKey) -> QuestWorkRuntime {
+        if let Some(work) = &self.current_work {
+            if work.key == key { return work.clone(); }
+        }
+        let work = QuestWorkRuntime { id: QuestWorkId(self.next_work), key };
+        self.next_work = self.next_work.wrapping_add(1).max(1);
+        tracing::info!(lane=?self.state.lane, work_id=?work.id, key=?work.key, "quest semantic work selected");
+        self.current_work = Some(work.clone());
+        work
+    }
+
+    fn pending_quest_action_blocks(&mut self) -> bool {
+        let Some(pending) = self.pending_quest_action.clone() else { return false; };
+        match pending {
+            PendingQuestAction::Combat { target, started, cycle } => {
+                let dead_or_gone = self.state.authoritative.entities.0.get(&target)
+                    .is_none_or(|entity| entity.health.is_some_and(|(current, _)| current == 0));
+                if dead_or_gone {
+                    let corpse_present = self.state.authoritative.entities.0.get(&target)
+                        .is_some_and(|entity| entity.health.is_some_and(|(current, _)| current == 0));
+                    tracing::info!(lane=?self.state.lane, ?target, corpse_present, "authoritative combat completion observed");
+                    if corpse_present { self.post_combat_loot = Some(target); }
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if started.elapsed() < cycle {
+                    self.waiting(format!("combat action against {target} is in progress; waiting for authoritative death/despawn or next combat cycle"));
+                    return true;
+                }
+                tracing::debug!(lane=?self.state.lane, ?target, cycle_ms=cycle.as_millis(), "combat cycle elapsed; re-running shared combat selector");
+                self.pending_quest_action = None;
+                false
+            }
+            PendingQuestAction::CorpseLoot { target, baseline_generation, started } => {
+                let generation = self.state.authoritative.inventory.bot_loot_generation;
+                if self.state.authoritative.inventory.current_loot == Some(target)
+                    && matches!(self.state.authoritative.inventory.current_loot_owner, Some(wow_state::LootOwnership::Player))
+                {
+                    tracing::info!(lane=?self.state.lane, ?target, "pending bot corpse loot was superseded by player loot; cancelling without bot-success credit");
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if generation > baseline_generation && self.state.authoritative.inventory.current_loot.is_none() {
+                    tracing::info!(lane=?self.state.lane, ?target, baseline_generation, generation, "authoritative bot-owned post-combat loot transaction completed");
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if !self.state.authoritative.entities.0.contains_key(&target) && generation > baseline_generation {
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if started.elapsed() < Duration::from_secs(6) {
+                    self.waiting(format!("post-combat loot on {target} is awaiting authoritative loot transaction"));
+                    return true;
+                }
+                tracing::warn!(lane=?self.state.lane, ?target, baseline_generation, generation, "post-combat loot timed out; allowing quest scheduler to continue");
+                self.pending_quest_action = None;
+                false
+            }
+            PendingQuestAction::Loot { item, target, baseline_count, baseline_generation, started } => {
+                let current = self.state.authoritative.inventory.items.get(&item).copied().unwrap_or_default();
+                let generation = self.state.authoritative.inventory.bot_loot_generation;
+                let player_superseded = self.state.authoritative.inventory.current_loot == Some(target)
+                    && matches!(self.state.authoritative.inventory.current_loot_owner, Some(wow_state::LootOwnership::Player));
+                let transaction_completed = generation > baseline_generation && self.state.authoritative.inventory.current_loot.is_none();
+                let gone = !self.state.authoritative.entities.0.contains_key(&target);
+                if player_superseded {
+                    tracing::info!(lane=?self.state.lane, item, ?target, "pending bot loot was superseded by player loot; cancelling without bot-success credit");
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if current > baseline_count || gone || transaction_completed {
+                    tracing::info!(lane=?self.state.lane, item, ?target, baseline_count, current, baseline_generation, generation, transaction_completed, gone, "authoritative loot progress observed");
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if started.elapsed() < Duration::from_secs(6) {
+                    self.waiting(format!("loot action for item {item} on {target} is in progress; waiting for inventory/despawn evidence"));
+                    return true;
+                }
+                tracing::warn!(lane=?self.state.lane, item, ?target, "loot action timed out without authoritative inventory progress; allowing bounded retry");
+                self.pending_quest_action = None;
+                false
+            }
+            PendingQuestAction::Interact { target, started } => {
+                if !self.state.authoritative.entities.0.contains_key(&target) {
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if started.elapsed() < Duration::from_secs(3) {
+                    self.waiting(format!("interaction with {target} is awaiting authoritative state change"));
+                    return true;
+                }
+                self.pending_quest_action = None;
+                false
+            }
+            PendingQuestAction::ControlActivation { target, started } => {
+                if self.state.authoritative.control.mover.is_some() {
+                    tracing::info!(lane=?self.state.lane, ?target, mover=?self.state.authoritative.control.mover, "authoritative controlled mover appeared after quest-tool activation");
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if started.elapsed() < Duration::from_secs(12) {
+                    self.waiting(format!("quest control activation on {target} is waiting for authoritative controlled mover"));
+                    return true;
+                }
+                tracing::warn!(lane=?self.state.lane, ?target, "quest control activation timed out; allowing bounded retry");
+                self.pending_quest_action = None;
+                false
+            }
+            PendingQuestAction::QuestCredit { quest, objective, baseline, target, started, label } => {
+                let current = self.state.authoritative.quests.active.get(&quest)
+                    .and_then(|progress| progress.objectives.get(objective)).copied().unwrap_or(baseline);
+                if current > baseline {
+                    tracing::info!(lane=?self.state.lane, quest, objective, baseline, current, ?target, %label, "authoritative quest credit observed");
+                    self.credited_quest_targets.insert((quest, objective, target));
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if started.elapsed() < Duration::from_secs(12) {
+                    self.waiting(format!("{label} on {target} is awaiting authoritative quest credit for quest {quest} objective {objective}"));
+                    return true;
+                }
+                tracing::warn!(lane=?self.state.lane, quest, objective, baseline, current, ?target, %label, "quest-credit action timed out; allowing bounded retry");
+                self.pending_quest_action = None;
+                false
+            }
+        }
+    }
+
+    async fn dispatch_combat_target(&mut self, target: EntityId) -> bool {
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        match wow_policy::combat::selector::select(&snapshot, target) {
+            wow_policy::combat::selector::CombatDecision::Cast { spell, target } => {
+                tracing::info!(lane=?self.state.lane, spell, ?target, "shared combat selector chose caster spell");
+                self.dispatch_quest_semantic(GameplayCommand::Cast { spell, target: Some(target) }, PendingQuestAction::Combat { target, started: Instant::now(), cycle: Duration::from_secs(3) }).await
+            }
+            wow_policy::combat::selector::CombatDecision::Wand { target } => {
+                tracing::info!(lane=?self.state.lane, ?target, spell=5019_u32, "shared combat selector chose wand shoot because caster is OOM");
+                self.dispatch_quest_semantic(GameplayCommand::Cast { spell: 5019, target: Some(target) }, PendingQuestAction::Combat { target, started: Instant::now(), cycle: Duration::from_secs(12) }).await
+            }
+            wow_policy::combat::selector::CombatDecision::Melee { target } => {
+                tracing::info!(lane=?self.state.lane, ?target, "shared combat selector chose melee fallback");
+                self.dispatch_quest_semantic(GameplayCommand::Attack(target), PendingQuestAction::Combat { target, started: Instant::now(), cycle: Duration::from_secs(12) }).await
+            }
+            wow_policy::combat::selector::CombatDecision::Deferred { reason } => {
+                self.waiting(format!("combat against {target} deferred: {reason}"));
+                true
+            }
+        }
+    }
+
+    async fn dispatch_resumed_quest_action(&mut self, command: GameplayCommand, work: &QuestWorkKey) -> bool {
+        let pending = match command.clone() {
+            GameplayCommand::Attack(target) => Some(PendingQuestAction::Combat { target, started: Instant::now(), cycle: Duration::from_secs(12) }),
+            GameplayCommand::Cast { target: Some(target), .. } if matches!(work, QuestWorkKey::CombatObjective { .. } | QuestWorkKey::CollectItem { .. }) => Some(PendingQuestAction::Combat { target, started: Instant::now(), cycle: Duration::from_secs(3) }),
+            GameplayCommand::Loot(target) => {
+                let item = match work { QuestWorkKey::CollectItem { item, .. } => *item, _ => 0 };
+                let baseline_count = self.state.authoritative.inventory.items.get(&item).copied().unwrap_or_default();
+                Some(PendingQuestAction::Loot { item, target, baseline_count, baseline_generation: self.state.authoritative.inventory.bot_loot_generation, started: Instant::now() })
+            }
+            GameplayCommand::UseGameObject(target) | GameplayCommand::Interact(target) => Some(PendingQuestAction::Interact { target, started: Instant::now() }),
+            GameplayCommand::CastGameObject { target, report_use: true, .. } => Some(PendingQuestAction::ControlActivation { target, started: Instant::now() }),
+            GameplayCommand::CastGameObject { target, .. } => Some(PendingQuestAction::Interact { target, started: Instant::now() }),
+            GameplayCommand::UseItemInstance { target: Some(target), .. } => {
+                match work {
+                    QuestWorkKey::InteractObjective { quest, objective, .. } if *objective != usize::MAX => {
+                        let baseline = self.state.authoritative.quests.active.get(quest)
+                            .and_then(|p| p.objectives.get(*objective)).copied().unwrap_or_default();
+                        Some(PendingQuestAction::QuestCredit { quest: *quest, objective: *objective, baseline, target, started: Instant::now(), label: "scripted item use" })
+                    }
+                    _ => Some(PendingQuestAction::Interact { target, started: Instant::now() }),
+                }
+            }
+            GameplayCommand::VehicleCast { target: Some(target), .. } => {
+                match work {
+                    QuestWorkKey::InteractObjective { quest, objective, .. } if *objective != usize::MAX => {
+                        let baseline = self.state.authoritative.quests.active.get(quest)
+                            .and_then(|p| p.objectives.get(*objective)).copied().unwrap_or_default();
+                        Some(PendingQuestAction::QuestCredit { quest: *quest, objective: *objective, baseline, target, started: Instant::now(), label: "controlled quest ability" })
+                    }
+                    _ => Some(PendingQuestAction::Interact { target, started: Instant::now() }),
+                }
+            },
+            _ => None,
+        };
+        if let Some(pending) = pending {
+            self.dispatch_quest_semantic(command, pending).await
+        } else {
+            self.propose_command(command, true).await
+        }
+    }
+
+    async fn dispatch_quest_semantic(&mut self, command: GameplayCommand, pending: PendingQuestAction) -> bool {
+        self.last_dispatch = DispatchOutcome::Rejected;
+        if !self.propose_command(command, true).await { return false; }
+        match self.last_dispatch {
+            DispatchOutcome::Sent => self.pending_quest_action = Some(pending),
+            DispatchOutcome::DeferredMovement => {
+                if let Some(movement) = self.pending_movement.as_mut() {
+                    movement.resume_pending = Some(pending);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    async fn propose_command(&mut self, command: GameplayCommand, quest_step: bool) -> bool {
+        let action = ProposedAction {
+            id: ActionId(self.next_action),
+            task: TaskId(self.next_task),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: self.state.stamp(),
+            command,
+        };
+        self.next_action = self.next_action.wrapping_add(1).max(1);
+        self.next_task = self.next_task.wrapping_add(1).max(1);
+        if quest_step { self.last_quest_step = Some(Instant::now()); }
+        self.submit(action).await
+    }
+
+    fn defer_spatial_movement(
+        &mut self,
+        destination: Vec3,
+        acceptable_range: f32,
+        resume: GameplayCommand,
+        origin: PlanOrigin,
+        label: &'static str,
+    ) {
+        let work = self.current_work.clone().unwrap_or_else(|| self.set_work(QuestWorkKey::TravelToObjective { quest: 0, objective: 0, destination }));
+        tracing::info!(lane=?self.state.lane, work_id=?work.id, ?destination, acceptable_range, resume=?resume, %label, "shared spatial precondition handed off to owned movement");
+        let purpose = if origin == PlanOrigin::Recovery { MovementPurpose::SurvivalApproach } else { MovementPurpose::ApproachGroundedTarget };
+        self.queue_movement(destination, acceptable_range, Some(resume), None, origin, work, purpose);
+        self.last_dispatch = DispatchOutcome::DeferredMovement;
+    }
+
+    async fn submit(&mut self, action: ProposedAction) -> bool {
+        if !self.state.runnable() { self.last_dispatch = DispatchOutcome::Rejected; return true; }
+        let original_command = action.command.clone();
+        let action_origin = action.origin;
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+
+        if let Some(profile) = crate::action::spatial::profile(&original_command) {
+            if let Some((correction, attempts)) = self.server_range_recovery.get(&profile.target).copied() {
+                let Some(mover) = crate::action::spatial::active_mover(&snapshot) else {
+                    self.waiting("server range recovery is waiting for authoritative mover position".to_owned());
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                let Some(target_position) = crate::action::spatial::target_position(&snapshot, profile.target) else {
+                    self.waiting(format!("server range recovery is waiting for target {:?} position", profile.target));
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                let attempt = attempts.saturating_sub(1);
+                let Some(destination) = crate::action::spatial::server_range_reposition(mover, target_position, correction, attempt) else {
+                    self.waiting(format!("server range recovery cannot derive a safe reposition for {:?}", profile.target));
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                self.server_range_recovery.remove(&profile.target);
+                self.defer_spatial_movement(destination, 0.75, original_command, action_origin, "server range recovery");
+                return true;
+            }
+        }
+
+        // Normal deterministic range comes before LOS and facing.
+        let normal_range_blocked = crate::action::spatial::movement_requirement(&snapshot, &original_command).is_some();
+        if !normal_range_blocked {
+            if let Some(requirement) = crate::action::spatial::line_of_sight_requirement(&original_command, |target| {
+                if self.los_blocked.contains(&target) { crate::action::spatial::LineOfSightStatus::Blocked }
+                else { crate::action::spatial::LineOfSightStatus::Unknown }
+            }) {
+                let Some(mover) = crate::action::spatial::active_mover(&snapshot) else {
+                    self.waiting("line-of-sight recovery is waiting for authoritative mover position".to_owned());
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                let Some(target_position) = crate::action::spatial::target_position(&snapshot, requirement.target) else {
+                    self.waiting(format!("line-of-sight recovery is waiting for target {:?} position", requirement.target));
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                let attempt = self.los_attempts.get(&requirement.target).copied().unwrap_or(1).saturating_sub(1);
+                let Some(destination) = crate::action::spatial::line_of_sight_reposition(mover, target_position, attempt) else {
+                    self.waiting(format!("line-of-sight recovery cannot derive a safe reposition for {:?}", requirement.target));
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                self.los_blocked.remove(&requirement.target);
+                self.defer_spatial_movement(destination, 0.75, original_command, action_origin, "line-of-sight recovery");
+                return true;
+            }
+        }
+        match finalize(&snapshot, self.state.stamp(), self.state.activation, self.state.mission.permissions, action) {
+            ValidationOutcome::Sendable(action) => {
+                tracing::info!(lane=?self.state.lane, action=?action.id(), command=?action.command(), "validated gameplay action queued for proxy");
+                let sent = self.proxy.send(WorkerToProxy::Action(action)).await.is_ok();
+                self.last_dispatch = if sent { DispatchOutcome::Sent } else { DispatchOutcome::TransportClosed };
+                sent
+            }
+            ValidationOutcome::NeedsMovement(requirement) => {
+                self.defer_spatial_movement(requirement.destination, requirement.acceptable_range, original_command, action_origin, "range precondition");
+                true
+            }
+            ValidationOutcome::NeedsFacing(requirement) => {
+                let face = ProposedAction {
+                    id: ActionId(self.next_action),
+                    task: TaskId(self.next_task),
+                    origin: action_origin,
+                    stamp: self.state.stamp(),
+                    command: GameplayCommand::FaceDirection { orientation: requirement.orientation },
+                };
+                self.next_action = self.next_action.wrapping_add(1).max(1);
+                self.next_task = self.next_task.wrapping_add(1).max(1);
+                match finalize(&snapshot, self.state.stamp(), self.state.activation, self.state.mission.permissions, face) {
+                    ValidationOutcome::Sendable(face) => {
+                        tracing::info!(lane=?self.state.lane, orientation=requirement.orientation, tolerance=requirement.tolerance, resume=?original_command, "shared facing precondition queued before targeted action");
+                        let sent = self.proxy.send(WorkerToProxy::Action(face)).await.is_ok();
+                        self.last_dispatch = if sent { DispatchOutcome::DeferredSpatial } else { DispatchOutcome::TransportClosed };
+                        sent
+                    }
+                    other => {
+                        tracing::warn!(lane=?self.state.lane, ?other, "shared facing precondition failed validation");
+                        self.last_dispatch = DispatchOutcome::Rejected;
+                        true
+                    }
+                }
+            }
+            ValidationOutcome::NeedsLineOfSight(requirement) => {
+                self.los_blocked.insert(requirement.target);
+                self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                true
+            }
+            ValidationOutcome::Rejected(failure) => {
+                tracing::warn!(lane=?self.state.lane, code=%failure.code, message=%failure.message, retryable=failure.retryable, "gameplay action rejected by final validator");
+                self.last_dispatch = DispatchOutcome::Rejected;
+                true
+            }
+        }
+    }
+
+    fn waiting(&mut self, reason: String) {
+        if self.last_wait_reason.as_deref() != Some(reason.as_str()) {
+            tracing::info!(lane=?self.state.lane, reason=%reason, "mission scheduler waiting");
+            self.last_wait_reason = Some(reason);
+        }
+    }
+}
+
+fn quest_status_available(status: u8) -> bool { matches!(status, 2 | 4 | 7 | 8) }
+fn quest_status_reward(status: u8) -> bool { matches!(status, 3 | 6 | 9 | 10) }
+fn should_supersede_search_movement(purpose: MovementPurpose, live_target_available: bool) -> bool {
+    purpose == MovementPurpose::SearchArea && live_target_available
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{quest_status_available, quest_status_reward, should_supersede_search_movement, MovementPurpose};
+
+    #[test] fn dialog_states_match_azerothcore_335a(){
+        for status in [2,4,7,8] { assert!(quest_status_available(status)); }
+        for status in [3,6,9,10] { assert!(quest_status_reward(status)); }
+    }
+
+    #[test]
+    fn live_target_only_supersedes_static_search_movement() {
+        assert!(should_supersede_search_movement(MovementPurpose::SearchArea, true));
+        assert!(!should_supersede_search_movement(MovementPurpose::ApproachGroundedTarget, true));
+        assert!(!should_supersede_search_movement(MovementPurpose::SearchArea, false));
+    }
+}

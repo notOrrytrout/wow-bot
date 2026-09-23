@@ -1,0 +1,6 @@
+/target/
+**/*.rs.bk
+.DS_Store
+
+# Runtime-owned configuration, credentials, logs, generated files, cache, and state.
+wow-bot-data/

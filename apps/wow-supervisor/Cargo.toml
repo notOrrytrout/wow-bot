@@ -1,0 +1,22 @@
+[package]
+name = "wow-bot-supervisor"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wow-infra.workspace = true
+wow-domain.workspace = true
+wow-control-proto.workspace = true
+wow-proxy.workspace = true
+wow-supervisor.workspace = true
+
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rfd.workspace = true
+rpassword.workspace = true
+local-ip-address.workspace = true
+[lints]
+workspace = true

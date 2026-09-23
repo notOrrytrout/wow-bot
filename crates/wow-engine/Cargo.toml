@@ -1,0 +1,18 @@
+[package]
+name = "wow-engine"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wow-control-proto.workspace = true
+wow-domain.workspace = true
+wow-navigation.workspace = true
+wow-policy.workspace = true
+wow-state.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+[lints]
+workspace = true

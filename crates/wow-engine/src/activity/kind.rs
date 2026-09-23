@@ -1,0 +1,1 @@
+#[derive(Clone,Copy,Debug,Eq,PartialEq,Ord,PartialOrd)]pub enum ActivityKind{Idle,Maintenance,Fishing,Gathering,Questing,Movement,Loot,Combat,Recovery}impl ActivityKind{pub fn priority(self)->u8{match self{Self::Idle=>0,Self::Maintenance=>10,Self::Fishing=>20,Self::Gathering=>30,Self::Questing=>40,Self::Movement=>50,Self::Loot=>60,Self::Combat=>80,Self::Recovery=>100}}}

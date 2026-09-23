@@ -1,0 +1,65 @@
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use wow_domain::EntityId;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ItemStack { pub item: u32, pub count: u32 }
+
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryItemInstance {
+    pub item: u32,
+    pub guid: EntityId,
+    pub backpack_slot: u8,
+    pub count: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TradeState {
+    pub generation: u64,
+    pub partner: Option<EntityId>,
+    pub our_items: BTreeMap<u32, u32>,
+    pub their_items: BTreeMap<u32, u32>,
+    pub our_money: u64,
+    pub their_money: u64,
+    pub open: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AuctionListing {
+    pub listing_id: u64,
+    pub item: u32,
+    pub count: u32,
+    pub buyout: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AuctionState { pub query_generation: u64, pub listings: BTreeMap<u64, AuctionListing> }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MailEntry { pub mail_id: u32, pub money: u64, pub attachments: BTreeMap<u32, u32> }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MailboxState { pub generation: u64, pub mails: BTreeMap<u32, MailEntry> }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InventoryState {
+    pub items: BTreeMap<u32, u32>,
+    pub instances: BTreeMap<u32, InventoryItemInstance>,
+    pub free_slots: u16,
+    pub equipped_ranged_item: Option<u32>,
+    pub equipment_authoritative: bool,
+    pub money: u64,
+    pub loot_generation: u64,
+    pub bot_loot_generation: u64,
+    pub current_loot: Option<EntityId>,
+    pub current_loot_owner: Option<crate::observation::LootOwnership>,
+    pub vendor: Option<EntityId>,
+    pub trade: TradeState,
+    pub auction: AuctionState,
+    pub mailbox: MailboxState,
+}
+
+impl InventoryState {
+    pub fn has(&self, item: u32, count: u32) -> bool { self.items.get(&item).copied().unwrap_or(0) >= count }
+}

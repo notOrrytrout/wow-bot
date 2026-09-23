@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/wow-domain",
+    "crates/wow-state",
+    "crates/wow-tentacli-adapter",
+    "crates/wow-policy",
+    "crates/wow-navigation",
+    "crates/wow-engine",
+    "crates/wow-proxy",
+    "crates/wow-control-proto",
+    "crates/wow-supervisor",
+    "crates/wow-infra",
+    "apps/wow-supervisor",
+    "apps/wow-worker",
+    "tools/world-knowledge-gen",
+]
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+bitflags = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rfd = "0.17.2"
+rpassword = "7"
+local-ip-address = "0.6.13"
+wow-domain = { path = "crates/wow-domain" }
+wow-state = { path = "crates/wow-state" }
+wow-tentacli-adapter = { path = "crates/wow-tentacli-adapter" }
+wow-policy = { path = "crates/wow-policy" }
+wow-navigation = { path = "crates/wow-navigation" }
+wow-engine = { path = "crates/wow-engine" }
+wow-proxy = { path = "crates/wow-proxy" }
+wow-control-proto = { path = "crates/wow-control-proto" }
+wow-supervisor = { path = "crates/wow-supervisor" }
+wow-infra = { path = "crates/wow-infra" }
+
+# Exact Tentacli reference selected by the architecture spec.
+tentacli = { git = "https://github.com/tench-rt/tentacli", rev = "354a9888855d2159029943e8095c79539ff9796d", default-features = false, features = ["wow-wotlk"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

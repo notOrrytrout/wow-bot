@@ -1,0 +1,1 @@
+use wow_domain::EntityId;#[derive(Clone,Debug)]pub struct QuestSource{pub entity:EntityId,pub quest:u32,pub observed_actionable:bool}pub fn choose(sources:&[QuestSource])->Option<&QuestSource>{sources.iter().find(|s|s.observed_actionable)}
