@@ -10,12 +10,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io::Write as _,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -87,6 +87,41 @@ struct AccountRuntime {
     mission_counter: Arc<AtomicU64>,
     headless_enabled: watch::Sender<bool>,
     headless_active: Arc<std::sync::atomic::AtomicBool>,
+    player_worlds: Arc<Mutex<PlayerWorlds>>,
+}
+
+#[derive(Default)]
+struct PlayerWorlds {
+    next_id: u64,
+    active: HashSet<u64>,
+}
+
+struct PlayerWorldHandoff {
+    connection: u64,
+    worlds: Arc<Mutex<PlayerWorlds>>,
+    headless_enabled: watch::Sender<bool>,
+}
+
+impl PlayerWorldHandoff {
+    fn begin(worlds: Arc<Mutex<PlayerWorlds>>, headless_enabled: watch::Sender<bool>) -> Self {
+        let mut state = worlds.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.next_id = state.next_id.checked_add(1).expect("player connection IDs exhausted");
+        let connection = state.next_id;
+        state.active.insert(connection);
+        let _ = headless_enabled.send(false);
+        drop(state);
+        Self { connection, worlds, headless_enabled }
+    }
+}
+
+impl Drop for PlayerWorldHandoff {
+    fn drop(&mut self) {
+        let mut state = self.worlds.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active.remove(&self.connection);
+        if state.active.is_empty() {
+            let _ = self.headless_enabled.send(true);
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -193,7 +228,7 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
         });
         let bus = command_bus.clone();
         tokio::spawn(async move { while let Some(command) = command_rx.recv().await { let _ = bus.send(command); } });
-        accounts.insert(lane.config.account_name.to_uppercase(), AccountRuntime { config: lane.config, session_tx, command_bus, supervisor_tx: supervisor_for_runtime, mission_counter: Arc::new(AtomicU64::new(1)), headless_enabled, headless_active });
+        accounts.insert(lane.config.account_name.to_uppercase(), AccountRuntime { config: lane.config, session_tx, command_bus, supervisor_tx: supervisor_for_runtime, mission_counter: Arc::new(AtomicU64::new(1)), headless_enabled, headless_active, player_worlds: Arc::new(Mutex::new(PlayerWorlds::default())) });
     }
     let action_logs = ActionLogManager::new(config.log_dir.clone());
     let shared = SharedRuntime { config: Arc::new(config), accounts: Arc::new(accounts), auth: AuthRegistry::default(), action_logs };
@@ -353,7 +388,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     let auth = world_expect_client_message::<CMSG_AUTH_SESSION, _>(&mut downstream).await?;
     let account_name = auth.username.to_uppercase();
     let account = shared.accounts.get(&account_name).with_context(|| format!("world account {account_name} is not configured"))?.clone();
-    let _ = account.headless_enabled.send(false);
+    let handoff = PlayerWorldHandoff::begin(account.player_worlds.clone(), account.headless_enabled.clone());
     wait_for_headless_state(&account, false, Duration::from_secs(6)).await?;
     let downstream_key = shared.auth.get(&account_name).await.context("no fresh downstream login session key for configured world connection")?;
     let normalized = NormalizedString::new(&account_name)?;
@@ -375,7 +410,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     let (mut up_enc, mut up_dec) = up_crypto.split();
     let mut warden = WardenBridge::new(&upstream_login.session_key, &downstream_key);
 
-    let connection = connection_id(&downstream);
+    let connection = handoff.connection;
     let mut commands = account.command_bus.subscribe();
     account.session_tx.send(SessionMessage::PlayerAttached { connection }).await.ok();
     account.session_tx.send(SessionMessage::UpstreamConnected(true)).await.ok();
@@ -690,10 +725,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
             }
         }
     };
-    account.session_tx.send(SessionMessage::WorldAuthoritative(false)).await.ok();
-    account.session_tx.send(SessionMessage::UpstreamConnected(false)).await.ok();
     account.session_tx.send(SessionMessage::PlayerDetached { connection }).await.ok();
-    let _ = account.headless_enabled.send(true);
     result
 }
 
@@ -1522,9 +1554,6 @@ async fn handle_log_command(logs: &ActionLogManager, account: &str, command: cra
     }
 }
 
-fn connection_id(stream: &TcpStream) -> u64 {
-    stream.peer_addr().ok().map(|a| match a { SocketAddr::V4(v)=>u64::from(v.port()), SocketAddr::V6(v)=>u64::from(v.port()) }).unwrap_or(1)
-}
 fn port_of(bind: &str) -> Result<u16> { Ok(bind.parse::<SocketAddr>()?.port()) }
 fn advertised(host: &str, port: u16) -> String { if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") } }
 
@@ -1588,6 +1617,38 @@ mod runtime_chat_tests {
             assert!(is_player_movement_opcode(opcode));
             assert!(is_explicit_player_movement_intent(opcode), "opcode {opcode:#x} must count as explicit intent");
         }
+    }
+}
+
+#[cfg(test)]
+mod player_world_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn headless_waits_for_final_overlapping_player_connection() {
+        let worlds = Arc::new(Mutex::new(PlayerWorlds::default()));
+        let (enabled, receiver) = watch::channel(true);
+        let first = PlayerWorldHandoff::begin(worlds.clone(), enabled.clone());
+        let second = PlayerWorldHandoff::begin(worlds.clone(), enabled);
+        assert_ne!(first.connection, second.connection);
+        assert!(!*receiver.borrow());
+
+        drop(first);
+        assert!(!*receiver.borrow());
+
+        drop(second);
+        assert!(*receiver.borrow());
+    }
+
+    #[test]
+    fn failed_player_setup_restores_headless_when_no_player_remains() {
+        let worlds = Arc::new(Mutex::new(PlayerWorlds::default()));
+        let (enabled, receiver) = watch::channel(true);
+        {
+            let _handoff = PlayerWorldHandoff::begin(worlds, enabled);
+            assert!(!*receiver.borrow());
+        }
+        assert!(*receiver.borrow());
     }
 }
 

@@ -66,6 +66,9 @@ impl ConfiguredSessionActor {
             SessionMessage::PlayerDetached { connection } => {
                 let final_connection = self.state.player.detach(connection);
                 if final_connection {
+                    self.state.upstream_connected = false;
+                    self.state.world_authoritative = false;
+                    let _ = self.worker_tx.send(ProxyToWorker::SessionState { connected: false, in_world: false }).await;
                     if self.state.worker_running {
                         self.state.ownership.player_logout_reclaiming(true);
                         self.publish_ownership().await;
@@ -250,5 +253,43 @@ impl ConfiguredSessionActor {
                 bot_allowed: owner.bot_allowed(),
             }))
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wow_domain::{AccountId, LaneId, WorkerGeneration};
+
+    #[tokio::test]
+    async fn older_player_disconnect_preserves_newer_world_session() {
+        let (_, rx) = mpsc::channel(8);
+        let (worker_tx, _worker_rx) = mpsc::channel(8);
+        let (upstream_tx, _upstream_rx) = mpsc::channel(8);
+        let (supervisor_tx, _supervisor_rx) = mpsc::channel(8);
+        let mut actor = ConfiguredSessionActor {
+            state: ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO),
+            rx,
+            worker_tx,
+            upstream_tx,
+            supervisor_tx,
+        };
+        actor.handle(SessionMessage::PlayerAttached { connection: 1 }).await;
+        actor.handle(SessionMessage::PlayerAttached { connection: 2 }).await;
+        actor.handle(SessionMessage::UpstreamConnected(true)).await;
+        actor.handle(SessionMessage::WorldAuthoritative(true)).await;
+
+        actor.handle(SessionMessage::PlayerDetached { connection: 1 }).await;
+        assert_eq!(actor.state.player.count(), 1);
+        assert!(actor.state.upstream_connected);
+        assert!(actor.state.world_authoritative);
+
+        actor.handle(SessionMessage::BotOn).await;
+        assert!(actor.state.ownership.snapshot().bot_allowed());
+
+        actor.handle(SessionMessage::PlayerDetached { connection: 2 }).await;
+        assert_eq!(actor.state.player.count(), 0);
+        assert!(!actor.state.upstream_connected);
+        assert!(!actor.state.world_authoritative);
     }
 }
