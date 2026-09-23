@@ -5,7 +5,12 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
     match observation {
         ProtocolObservation::Authenticated { realm } => { state.session.authenticated = true; state.session.realm = realm; delta.changed.push("session".into()); }
         ProtocolObservation::EnteredWorld { character_guid, position } => { state.session.in_world = true; state.session.character_guid = Some(character_guid); state.position.player = position; delta.changed.extend(["session".into(), "position".into()]); }
-        ProtocolObservation::LeftWorld => { state.session.in_world = false; state.position.moving = false; state.control = Default::default(); state.auras = Default::default(); delta.changed.extend(["session".into(), "control".into(), "auras".into()]); }
+        ProtocolObservation::LeftWorld => {
+            let revision = state.revision;
+            *state = AuthoritativeState::default();
+            state.revision = revision;
+            delta.changed.extend(["session", "position", "entities", "inventory", "life", "quests", "professions", "group", "capabilities", "control", "auras", "desync"].map(str::to_owned));
+        }
         ProtocolObservation::PlayerPosition { position, moving, flags, client_time } => { state.position.player = Some(position); state.position.moving = moving; state.position.flags = flags; state.position.client_time = client_time; delta.changed.push("position".into()); }
         ProtocolObservation::ControlledMover { mover, position, flags } => { state.control.mover = mover; state.control.mover_position = position; state.control.movement_flags = flags; if mover.is_none() { state.control.abilities.clear(); } delta.changed.push("control".into()); }
         ProtocolObservation::ControlledAbilities { mover, spells } => { if state.control.mover == Some(mover) { state.control.abilities = spells.into_iter().collect(); delta.changed.push("control".into()); } }
@@ -92,7 +97,39 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
 mod tests {
     use super::*;
     use crate::entities::EntityState;
-    use wow_domain::EntityId;
+    use wow_domain::{EntityId, Vec3, WorldPosition};
+
+    #[test]
+    fn leaving_world_removes_session_evidence_before_reentry() {
+        let mut state = AuthoritativeState::default();
+        let old_position = WorldPosition { map: 1, point: Vec3::new(1.0, 2.0, 3.0), orientation: 0.0 };
+        reduce(&mut state, ProtocolObservation::Authenticated { realm: Some("old".into()) });
+        reduce(&mut state, ProtocolObservation::EnteredWorld { character_guid: 7, position: Some(old_position) });
+        reduce(&mut state, ProtocolObservation::EntityUpsert { entity: EntityState { id: EntityId(9), ..Default::default() } });
+        reduce(&mut state, ProtocolObservation::QuestProgress { quest: 42, objectives: vec![1], complete: false });
+        reduce(&mut state, ProtocolObservation::InventoryCount { item: 99, count: 2 });
+        reduce(&mut state, ProtocolObservation::SpellKnown { spell: 123 });
+        let before = state.revision;
+
+        reduce(&mut state, ProtocolObservation::LeftWorld);
+        assert_eq!(state.revision, before.next());
+        assert!(!state.session.in_world);
+        assert!(!state.session.authenticated);
+        assert_eq!(state.session.character_guid, None);
+        assert_eq!(state.position.player, None);
+        assert!(state.entities.0.is_empty());
+        assert!(state.quests.active.is_empty());
+        assert!(state.inventory.items.is_empty());
+        assert!(state.capabilities.spells.is_empty());
+
+        reduce(&mut state, ProtocolObservation::EnteredWorld { character_guid: 8, position: None });
+        assert!(state.session.in_world);
+        assert_eq!(state.session.character_guid, Some(8));
+        assert_eq!(state.position.player, None);
+        assert!(state.entities.0.is_empty());
+        assert!(state.quests.active.is_empty());
+    }
+
     #[test]
     fn removing_entity_clears_dependent_service_state(){
         let mut s=AuthoritativeState::default();let id=EntityId(7);s.entities.0.insert(id,EntityState{id,..Default::default()});s.inventory.vendor=Some(id);s.inventory.current_loot=Some(id);s.inventory.trade.partner=Some(id);s.inventory.trade.open=true;

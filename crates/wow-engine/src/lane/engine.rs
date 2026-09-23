@@ -132,6 +132,9 @@ impl LaneEngine {
     async fn handle(&mut self, msg: LaneMessage) -> bool {
         match msg {
             LaneMessage::Observation(o) => {
+                if matches!(o, ProtocolObservation::LeftWorld) {
+                    self.reset_session_work();
+                }
                 if let ProtocolObservation::CastFailed { spell, reason, target } = &o {
                     if let Some(target) = target {
                         self.maintenance_retry_after.insert((*spell, *target), wow_policy::maintenance::retry_deadline(Instant::now()));
@@ -1108,6 +1111,27 @@ impl LaneEngine {
             self.last_wait_reason = Some(reason);
         }
     }
+
+    fn reset_session_work(&mut self) {
+        self.last_quest_step = None;
+        self.pending_accept = None;
+        self.pending_turn_in = None;
+        self.pending_movement = None;
+        self.pending_quest_action = None;
+        self.current_work = None;
+        self.last_wait_reason = None;
+        self.last_dispatch = DispatchOutcome::Rejected;
+        self.credited_quest_targets.clear();
+        self.los_blocked.clear();
+        self.los_attempts.clear();
+        self.server_range_recovery.clear();
+        self.maintenance_retry_after.clear();
+        self.last_maintenance_tick = None;
+        self.last_maintenance_status = None;
+        self.post_combat_loot = None;
+        self.last_recovery_action = None;
+        self.last_survival_action = None;
+    }
 }
 
 fn quest_status_available(status: u8) -> bool { matches!(status, 2 | 4 | 7 | 8) }
@@ -1118,7 +1142,44 @@ fn should_supersede_search_movement(purpose: MovementPurpose, live_target_availa
 
 #[cfg(test)]
 mod tests {
-    use super::{quest_status_available, quest_status_reward, should_supersede_search_movement, MovementPurpose};
+    use super::*;
+    use crate::activity::ActivityArbiter;
+
+    #[tokio::test]
+    async fn world_exit_discards_pending_work_and_keeps_mission() {
+        let (_lane_tx, lane_rx) = mpsc::channel(1);
+        let (proxy_tx, _proxy_rx) = mpsc::channel(1);
+        let mission = Mission::quest(MissionId(9));
+        let state = LaneState {
+            lane: LaneId(1), worker: WorkerGeneration(1), ownership: OwnershipGeneration::ZERO,
+            movement_epoch: MovementEpoch::ZERO, mission, mission_revision: MissionRevision::ZERO,
+            permission_revision: PermissionRevision::ZERO, pause: PauseReasons::empty(),
+            activation: ActivationStage::Act, authoritative: Default::default(),
+            activity: ActivityArbiter::default(),
+        };
+        let mut engine = LaneEngine::new(state, lane_rx, proxy_tx);
+        let destination = Vec3::new(10.0, 0.0, 0.0);
+        let work = QuestWorkRuntime { id: QuestWorkId(1), key: QuestWorkKey::TravelToObjective { quest: 42, objective: 0, destination } };
+        engine.current_work = Some(work.clone());
+        engine.queue_movement(destination, 4.0, Some(GameplayCommand::Interact(EntityId(8))), None, PlanOrigin::SystemPolicy, work, MovementPurpose::ApproachGroundedTarget);
+        engine.pending_quest_action = Some(PendingQuestAction::Interact { target: EntityId(8), started: Instant::now() });
+        engine.pending_accept = Some((42, EntityId(8), Instant::now()));
+        engine.credited_quest_targets.insert((42, 0, EntityId(8)));
+        engine.los_blocked.insert(EntityId(8));
+
+        assert!(engine.handle(LaneMessage::Observation(ProtocolObservation::LeftWorld)).await);
+        assert!(engine.pending_movement.is_none());
+        assert!(engine.pending_quest_action.is_none());
+        assert!(engine.pending_accept.is_none());
+        assert!(engine.current_work.is_none());
+        assert!(engine.credited_quest_targets.is_empty());
+        assert!(engine.los_blocked.is_empty());
+        assert!(matches!(engine.state.mission.intent, MissionIntent::Quest));
+
+        assert!(engine.handle(LaneMessage::Observation(ProtocolObservation::EnteredWorld { character_guid: 7, position: None })).await);
+        assert!(engine.pending_movement.is_none());
+        assert!(engine.current_work.is_none());
+    }
 
     #[test] fn dialog_states_match_azerothcore_335a(){
         for status in [2,4,7,8] { assert!(quest_status_available(status)); }
