@@ -45,7 +45,10 @@ wow-supervisor = { path = "crates/wow-supervisor" }
 wow-infra = { path = "crates/wow-infra" }
 
 # Exact Tentacli reference selected by the architecture spec.
-tentacli = { git = "https://github.com/tench-rt/tentacli", rev = "354a9888855d2159029943e8095c79539ff9796d", default-features = false, features = ["wow-wotlk"] }
+tentacli = { git = "https://github.com/tench-rt/tentacli", rev = "b36d1e384e0a99557c8814112d32c7545b20e95b", default-features = false, features = ["wow-wotlk"] }
+
+[patch.crates-io]
+binrw = { path = "vendor/binrw-compat" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

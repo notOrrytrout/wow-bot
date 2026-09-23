@@ -1,0 +1,15 @@
+[package]
+name = "binrw"
+version = "0.14.2"
+edition = "2021"
+license = "MIT"
+description = "Compatibility bridge from binrw 0.14 to warning-free binrw 0.15"
+publish = false
+
+[features]
+default = ["std", "verbose-backtrace"]
+std = ["binrw-upstream/std"]
+verbose-backtrace = ["binrw-upstream/verbose-backtrace"]
+
+[dependencies]
+binrw-upstream = { package = "binrw", version = "0.15.2", default-features = false }
