@@ -76,6 +76,8 @@ pub struct ProxyConfig {
     pub max_pre_auth_connections: usize,
     #[serde(default = "default_max_per_ip")]
     pub max_pre_auth_connections_per_ip: usize,
+    #[serde(default)]
+    pub warden_client_image: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,6 +103,7 @@ impl Default for ProxyConfig {
             advertise_host: default_advertise_host(),
             max_pre_auth_connections: default_max_total(),
             max_pre_auth_connections_per_ip: default_max_per_ip(),
+            warden_client_image: None,
         }
     }
 }

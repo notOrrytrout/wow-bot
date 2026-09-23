@@ -23,6 +23,15 @@ The most important regression areas are:
 - action audit entries produce one terminal result per action;
 - protected paths and remote-memory configuration fail closed.
 
+## Headless Warden live check
+
+Set `proxy.warden_client_image` to a local WoW 3.3.5a `Wow.exe`. Enable Warden
+on AzerothCore and start a headless account. The log must show `module
+requested`, `module verified`, `hash verified`, `module initialized`, and
+`checks answered`. Keep the account connected through several server check
+rounds and confirm that the server does not kick it. An unknown module or
+check must end the session with a clear error.
+
 ## Quest end-to-end smoke test
 
 For the first autonomous quest test, place the configured character close enough to interact with an available quest giver, then run:

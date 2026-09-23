@@ -37,6 +37,12 @@ On first run, setup:
 
 Later runs reuse the saved setup.
 
+For headless accounts on an AzerothCore server with Warden enabled, set
+`proxy.warden_client_image` in `wow-bot-data/config.json` to the local WoW
+3.3.5a `Wow.exe` path. The headless proxy uses this image to answer memory
+checks. It verifies the server's Warden module and answers its check rounds.
+An unknown module or check stops the headless session with an error.
+
 ## Headless or advanced setup
 
 Provide the AzerothCore data directory directly:

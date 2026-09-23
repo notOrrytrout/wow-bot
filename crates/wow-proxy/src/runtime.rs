@@ -6,7 +6,7 @@ use crate::{
     configured_session::{ConfiguredSessionActor, SessionMessage, state::ConfiguredSessionState},
     framing::{ClientFrame, client_edge::{read_client_frame, write_client_frame}, upstream_edge::{read_server_frame, write_server_frame}},
     transparent_session::relay::relay as transparent_relay,
-    warden::relay::WardenBridge,
+    warden::{client::WardenClient, relay::WardenBridge},
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -58,6 +58,7 @@ pub struct ProxyRuntimeConfig {
     pub max_pre_auth_connections: usize,
     pub max_pre_auth_connections_per_ip: usize,
     pub log_dir: PathBuf,
+    pub warden_client_image: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -767,6 +768,10 @@ async fn run_headless_world_session(
     }.tokio_write_unencrypted_client(&mut upstream).await?;
     let (mut enc, mut dec) = crypto.split();
     let (mut reader, mut writer) = upstream.into_split();
+    let mut warden = WardenClient::new(
+        &upstream_login.session_key,
+        shared.config.warden_client_image.as_deref(),
+    )?;
     let mut commands = account.command_bus.subscribe();
     let mut object_observer = ObjectObservationRuntime::new().context("initialize headless Tentacli object observer")?;
     let mut player_guid = None;
@@ -844,7 +849,17 @@ async fn run_headless_world_session(
                     continue;
                 }
                 if opcode == u32::from(SMSG_WARDEN_DATA::OPCODE) {
-                    bail!("headless Warden challenge is not yet supported; refusing to fabricate a Warden client");
+                    let reply = warden.handle(&frame.body).context("headless Warden exchange failed")?;
+                    if let Some(body) = reply.body {
+                        write_client_frame(&mut writer, &mut enc, &ClientFrame {
+                            opcode: CMSG_WARDEN_DATA::OPCODE,
+                            body,
+                        }).await?;
+                    }
+                    if reply.event != "module chunk" {
+                        tracing::info!(account=%account.config.account_name, event=reply.event, "headless Warden exchange advanced");
+                    }
+                    continue;
                 }
                 if opcode == 0x0160 {
                     if let Some((guid, gold, slots)) = parse_loot_response(&frame.body) {

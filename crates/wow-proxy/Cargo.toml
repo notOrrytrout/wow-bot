@@ -15,6 +15,7 @@ serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 sha1 = "0.10"
+md-5 = "0.10"
 wow_srp = { version = "0.7", features = ["srp-default-math", "wrath-header"] }
 wow_login_messages = { version = "0.5.0", features = ["tokio"] }
 wow_world_messages = { version = "0.3.0", features = ["wrath", "tokio", "encryption"] }

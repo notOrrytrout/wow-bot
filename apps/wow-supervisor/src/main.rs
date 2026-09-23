@@ -201,6 +201,7 @@ async fn main() -> Result<()> {
         realm_name: config.upstream.realm_name.clone(), handshake_timeout: Duration::from_millis(config.runtime.handshake_timeout_ms),
         max_pre_auth_connections: config.proxy.max_pre_auth_connections,
         max_pre_auth_connections_per_ip: config.proxy.max_pre_auth_connections_per_ip,
+        warden_client_image: config.proxy.warden_client_image.clone(),
         log_dir: app_paths.logs.clone(),
     };
     let proxy_task = tokio::spawn(wow_proxy::runtime::run(proxy, managed));

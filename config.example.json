@@ -25,6 +25,7 @@
     "world_bind": "0.0.0.0:8086",
     "transparent_world_bind": "0.0.0.0:8088",
     "advertise_host": "127.0.0.1",
+    "warden_client_image": "/path/to/Wow.exe",
     "max_pre_auth_connections": 128,
     "max_pre_auth_connections_per_ip": 8
   },
