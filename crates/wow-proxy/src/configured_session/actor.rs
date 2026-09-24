@@ -68,7 +68,13 @@ impl ConfiguredSessionActor {
                 if final_connection {
                     self.state.upstream_connected = false;
                     self.state.world_authoritative = false;
-                    let _ = self.worker_tx.send(ProxyToWorker::SessionState { connected: false, in_world: false }).await;
+                    let _ = self
+                        .worker_tx
+                        .send(ProxyToWorker::SessionState {
+                            connected: false,
+                            in_world: false,
+                        })
+                        .await;
                     if self.state.worker_running {
                         self.state.ownership.player_logout_reclaiming(true);
                         self.publish_ownership().await;
@@ -99,7 +105,8 @@ impl ConfiguredSessionActor {
             SessionMessage::BotOn => {
                 self.state.player.bot_on();
                 let ticket = self.state.ownership.begin(ControlMode::Bot);
-                let committed = self.state.upstream_connected && self.state.ownership.commit(ticket);
+                let committed =
+                    self.state.upstream_connected && self.state.ownership.commit(ticket);
                 if committed {
                     let _ = self.clear_player_pause().await;
                 }
@@ -139,17 +146,32 @@ impl ConfiguredSessionActor {
                 if !value {
                     self.state.world_authoritative = false;
                 }
-                let _ = self.worker_tx.send(ProxyToWorker::SessionState { connected: value, in_world: self.state.world_authoritative }).await;
+                let _ = self
+                    .worker_tx
+                    .send(ProxyToWorker::SessionState {
+                        connected: value,
+                        in_world: self.state.world_authoritative,
+                    })
+                    .await;
                 false
             }
             SessionMessage::WorldAuthoritative(value) => {
                 self.state.world_authoritative = value;
-                let _ = self.worker_tx.send(ProxyToWorker::SessionState { connected: self.state.upstream_connected, in_world: value }).await;
+                let _ = self
+                    .worker_tx
+                    .send(ProxyToWorker::SessionState {
+                        connected: self.state.upstream_connected,
+                        in_world: value,
+                    })
+                    .await;
                 tracing::info!(lane=?self.state.lane, connected=self.state.upstream_connected, in_world=value, "configured world authority state changed");
                 false
             }
             SessionMessage::Observation(observation) => {
-                let _ = self.worker_tx.send(ProxyToWorker::Observation(observation)).await;
+                let _ = self
+                    .worker_tx
+                    .send(ProxyToWorker::Observation(observation))
+                    .await;
                 false
             }
             SessionMessage::Shutdown => true,
@@ -160,21 +182,18 @@ impl ConfiguredSessionActor {
         match msg {
             WorkerToProxy::Action(action) => {
                 let id = action.id();
-                let result = match authorize(
-                    &action,
-                    self.state.worker,
-                    self.state.ownership.snapshot(),
-                ) {
-                    Ok(()) => match self.upstream_tx.send(action.into_command()).await {
-                        Ok(()) => ActionTransportResult::Accepted,
-                        Err(_) => ActionTransportResult::Rejected {
-                            reason: "upstream closed".into(),
+                let result =
+                    match authorize(&action, self.state.worker, self.state.ownership.snapshot()) {
+                        Ok(()) => match self.upstream_tx.send(action.into_command()).await {
+                            Ok(()) => ActionTransportResult::Accepted,
+                            Err(_) => ActionTransportResult::Rejected {
+                                reason: "upstream closed".into(),
+                            },
                         },
-                    },
-                    Err(error) => ActionTransportResult::Rejected {
-                        reason: format!("{error:?}"),
-                    },
-                };
+                        Err(error) => ActionTransportResult::Rejected {
+                            reason: format!("{error:?}"),
+                        },
+                    };
                 let _ = self
                     .worker_tx
                     .send(ProxyToWorker::ActionResult { action: id, result })
@@ -194,9 +213,7 @@ impl ConfiguredSessionActor {
             WorkerToProxy::ShutdownAck => true,
             WorkerToProxy::Ready => false,
             WorkerToProxy::Movement {
-                epoch,
-                destination,
-                ..
+                epoch, destination, ..
             } => {
                 let owner = self.state.ownership.snapshot();
                 if owner.permits(ClientKind::Bot)
@@ -274,12 +291,18 @@ mod tests {
             upstream_tx,
             supervisor_tx,
         };
-        actor.handle(SessionMessage::PlayerAttached { connection: 1 }).await;
-        actor.handle(SessionMessage::PlayerAttached { connection: 2 }).await;
+        actor
+            .handle(SessionMessage::PlayerAttached { connection: 1 })
+            .await;
+        actor
+            .handle(SessionMessage::PlayerAttached { connection: 2 })
+            .await;
         actor.handle(SessionMessage::UpstreamConnected(true)).await;
         actor.handle(SessionMessage::WorldAuthoritative(true)).await;
 
-        actor.handle(SessionMessage::PlayerDetached { connection: 1 }).await;
+        actor
+            .handle(SessionMessage::PlayerDetached { connection: 1 })
+            .await;
         assert_eq!(actor.state.player.count(), 1);
         assert!(actor.state.upstream_connected);
         assert!(actor.state.world_authoritative);
@@ -287,7 +310,9 @@ mod tests {
         actor.handle(SessionMessage::BotOn).await;
         assert!(actor.state.ownership.snapshot().bot_allowed());
 
-        actor.handle(SessionMessage::PlayerDetached { connection: 2 }).await;
+        actor
+            .handle(SessionMessage::PlayerDetached { connection: 2 })
+            .await;
         assert_eq!(actor.state.player.count(), 0);
         assert!(!actor.state.upstream_connected);
         assert!(!actor.state.world_authoritative);

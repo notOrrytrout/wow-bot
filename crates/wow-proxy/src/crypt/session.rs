@@ -1,1 +1,1 @@
-pub type SessionKey=[u8;40];
+pub type SessionKey = [u8; 40];

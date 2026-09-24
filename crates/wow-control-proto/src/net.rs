@@ -1,5 +1,5 @@
-use crate::codec::{decode, encode, CodecError, MAX_FRAME};
-use serde::{de::DeserializeOwned, Serialize};
+use crate::codec::{CodecError, MAX_FRAME, decode, encode};
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 

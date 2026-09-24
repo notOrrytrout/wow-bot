@@ -1,1 +1,2 @@
-pub mod fence;pub use fence::*;
+pub mod fence;
+pub use fence::*;

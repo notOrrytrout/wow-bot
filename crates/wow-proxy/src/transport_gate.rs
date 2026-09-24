@@ -2,14 +2,35 @@ use crate::ownership::{ClientKind, OwnershipSnapshot};
 use wow_domain::{GameplayCommand, SendableAction, WorkerGeneration};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GateRejection { StaleWorker, StaleOwnership, StaleMovement, SourceNotPermitted }
+pub enum GateRejection {
+    StaleWorker,
+    StaleOwnership,
+    StaleMovement,
+    SourceNotPermitted,
+}
 
-pub fn authorize(action: &SendableAction, current_worker: WorkerGeneration, owner: OwnershipSnapshot) -> Result<(), GateRejection> {
+pub fn authorize(
+    action: &SendableAction,
+    current_worker: WorkerGeneration,
+    owner: OwnershipSnapshot,
+) -> Result<(), GateRejection> {
     let stamp = action.stamp();
-    if stamp.worker != current_worker { return Err(GateRejection::StaleWorker); }
-    if stamp.ownership != owner.generation { return Err(GateRejection::StaleOwnership); }
-    if !owner.permits(ClientKind::Bot) { return Err(GateRejection::SourceNotPermitted); }
-    if matches!(action.command(), GameplayCommand::MoveTo(_) | GameplayCommand::FaceDirection { .. } | GameplayCommand::StopMovement) && stamp.movement != owner.movement_epoch {
+    if stamp.worker != current_worker {
+        return Err(GateRejection::StaleWorker);
+    }
+    if stamp.ownership != owner.generation {
+        return Err(GateRejection::StaleOwnership);
+    }
+    if !owner.permits(ClientKind::Bot) {
+        return Err(GateRejection::SourceNotPermitted);
+    }
+    if matches!(
+        action.command(),
+        GameplayCommand::MoveTo(_)
+            | GameplayCommand::FaceDirection { .. }
+            | GameplayCommand::StopMovement
+    ) && stamp.movement != owner.movement_epoch
+    {
         return Err(GateRejection::StaleMovement);
     }
     Ok(())
@@ -19,7 +40,10 @@ pub fn authorize(action: &SendableAction, current_worker: WorkerGeneration, owne
 mod tests {
     use super::*;
     use crate::ownership::{AccountOwnership, ControlMode};
-    use wow_domain::{ActionId, MovementEpoch, OwnershipGeneration, PlanOrigin, TaskId, ValidatedAction, ValidityStamp, Vec3};
+    use wow_domain::{
+        ActionId, MovementEpoch, OwnershipGeneration, PlanOrigin, TaskId, ValidatedAction,
+        ValidityStamp, Vec3,
+    };
 
     fn action(stamp: ValidityStamp, command: GameplayCommand) -> SendableAction {
         SendableAction::from_validated(ValidatedAction {
@@ -40,7 +64,14 @@ mod tests {
             movement: owner.movement_epoch,
             ..ValidityStamp::default()
         };
-        assert_eq!(authorize(&action(stamp, GameplayCommand::StopMovement), WorkerGeneration(1), owner), Err(GateRejection::StaleOwnership));
+        assert_eq!(
+            authorize(
+                &action(stamp, GameplayCommand::StopMovement),
+                WorkerGeneration(1),
+                owner
+            ),
+            Err(GateRejection::StaleOwnership)
+        );
     }
 
     #[test]
@@ -52,6 +83,20 @@ mod tests {
             movement: MovementEpoch(owner.movement_epoch.0.wrapping_add(1)),
             ..ValidityStamp::default()
         };
-        assert_eq!(authorize(&action(stamp, GameplayCommand::MoveTo(Vec3 { x: 1.0, y: 2.0, z: 3.0 })), WorkerGeneration(1), owner), Err(GateRejection::StaleMovement));
+        assert_eq!(
+            authorize(
+                &action(
+                    stamp,
+                    GameplayCommand::MoveTo(Vec3 {
+                        x: 1.0,
+                        y: 2.0,
+                        z: 3.0
+                    })
+                ),
+                WorkerGeneration(1),
+                owner
+            ),
+            Err(GateRejection::StaleMovement)
+        );
     }
 }

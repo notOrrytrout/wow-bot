@@ -4,7 +4,11 @@ use crate::{
         login::{ConfiguredCredential, UpstreamAuthConfig, upstream_login},
     },
     configured_session::{ConfiguredSessionActor, SessionMessage, state::ConfiguredSessionState},
-    framing::{ClientFrame, client_edge::{read_client_frame, write_client_frame}, upstream_edge::{read_server_frame, write_server_frame}},
+    framing::{
+        ClientFrame,
+        client_edge::{read_client_frame, write_client_frame},
+        upstream_edge::{read_server_frame, write_server_frame},
+    },
     transparent_session::relay::relay as transparent_relay,
     warden::{client::WardenClient, relay::WardenBridge},
 };
@@ -15,31 +19,38 @@ use std::{
     io::Write as _,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc, watch, RwLock},
+    sync::{RwLock, broadcast, mpsc, watch},
 };
 use wow_control_proto::{ProxyToWorker, SupervisorCommand, WorkerToProxy};
-use wow_domain::{AccountId, EntityId, GameplayCommand, LaneId, Mission, MissionId, Vec3, WorldPosition, WorkerGeneration};
-use wow_state::ProtocolObservation;
-use wow_tentacli_adapter::runtime::{login_verify_world, ObjectObservationRuntime};
+use wow_domain::{
+    AccountId, EntityId, GameplayCommand, LaneId, Mission, MissionId, Vec3, WorkerGeneration,
+    WorldPosition,
+};
+use wow_login_messages::Message as _;
 use wow_login_messages::{
     all::ProtocolVersion,
-    helper::{tokio_expect_client_message, tokio_expect_client_message_protocol, tokio_expect_server_message_protocol},
-    version_8::{
-        CMD_REALM_LIST_Client, CMD_REALM_LIST_Server, Realm, RealmCategory, RealmType,
+    helper::{
+        tokio_expect_client_message, tokio_expect_client_message_protocol,
+        tokio_expect_server_message_protocol,
     },
+    version_8::{CMD_REALM_LIST_Client, CMD_REALM_LIST_Server, Realm, RealmCategory, RealmType},
 };
 use wow_srp::{normalized_string::NormalizedString, wrath_header::ProofSeed};
-use wow_login_messages::Message as _;
+use wow_state::ProtocolObservation;
+use wow_tentacli_adapter::runtime::{ObjectObservationRuntime, login_verify_world};
 use wow_world_messages::Message as _;
 use wow_world_messages::wrath::{
-    ClientMessage as _, ServerMessage as _, CMSG_AUTH_SESSION, CMSG_WARDEN_DATA, SMSG_AUTH_CHALLENGE, SMSG_WARDEN_DATA,
-    tokio_expect_client_message as world_expect_client_message,
+    CMSG_AUTH_SESSION, CMSG_WARDEN_DATA, ClientMessage as _, SMSG_AUTH_CHALLENGE, SMSG_WARDEN_DATA,
+    ServerMessage as _, tokio_expect_client_message as world_expect_client_message,
     tokio_expect_server_message as world_expect_server_message,
 };
 
@@ -78,6 +89,14 @@ pub struct ManagedLane {
     pub supervisor_tx: mpsc::Sender<SupervisorCommand>,
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Clone)]
 struct AccountRuntime {
     config: ProxyAccountConfig,
@@ -104,19 +123,31 @@ struct PlayerWorldHandoff {
 
 impl PlayerWorldHandoff {
     fn begin(worlds: Arc<Mutex<PlayerWorlds>>, headless_enabled: watch::Sender<bool>) -> Self {
-        let mut state = worlds.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.next_id = state.next_id.checked_add(1).expect("player connection IDs exhausted");
+        let mut state = worlds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .expect("player connection IDs exhausted");
         let connection = state.next_id;
         state.active.insert(connection);
         let _ = headless_enabled.send(false);
         drop(state);
-        Self { connection, worlds, headless_enabled }
+        Self {
+            connection,
+            worlds,
+            headless_enabled,
+        }
     }
 }
 
 impl Drop for PlayerWorldHandoff {
     fn drop(&mut self) {
-        let mut state = self.worlds.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .worlds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.active.remove(&self.connection);
         if state.active.is_empty() {
             let _ = self.headless_enabled.send(true);
@@ -129,10 +160,13 @@ struct AuthRegistry {
     keys: Arc<RwLock<HashMap<String, [u8; 40]>>>,
 }
 impl AuthRegistry {
-    async fn put(&self, account: &str, key: [u8; 40]) { self.keys.write().await.insert(account.to_uppercase(), key); }
-    async fn get(&self, account: &str) -> Option<[u8; 40]> { self.keys.read().await.get(&account.to_uppercase()).copied() }
+    async fn put(&self, account: &str, key: [u8; 40]) {
+        self.keys.write().await.insert(account.to_uppercase(), key);
+    }
+    async fn get(&self, account: &str) -> Option<[u8; 40]> {
+        self.keys.read().await.get(&account.to_uppercase()).copied()
+    }
 }
-
 
 #[derive(Clone)]
 struct ActionLogManager {
@@ -147,18 +181,37 @@ struct ActionLogSession {
 
 impl ActionLogManager {
     fn new(dir: PathBuf) -> Self {
-        Self { dir, sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())) }
+        Self {
+            dir,
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
     }
 
     async fn start(&self, account: &str) -> Result<PathBuf> {
         std::fs::create_dir_all(&self.dir)?;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let safe = account.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let safe = account
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
         let path = self.dir.join(format!("action-{safe}-{stamp}.jsonl"));
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{{\"event\":\"start\",\"account\":{:?},\"unix_s\":{stamp}}}", account)?;
+        writeln!(
+            file,
+            "{{\"event\":\"start\",\"account\":{:?},\"unix_s\":{stamp}}}",
+            account
+        )?;
         file.flush()?;
-        self.sessions.lock().await.insert(account.to_uppercase(), ActionLogSession { path: path.clone(), file });
+        self.sessions.lock().await.insert(
+            account.to_uppercase(),
+            ActionLogSession {
+                path: path.clone(),
+                file,
+            },
+        );
         Ok(path)
     }
 
@@ -173,12 +226,18 @@ impl ActionLogManager {
     }
 
     async fn status(&self, account: &str) -> Option<PathBuf> {
-        self.sessions.lock().await.get(&account.to_uppercase()).map(|s| s.path.clone())
+        self.sessions
+            .lock()
+            .await
+            .get(&account.to_uppercase())
+            .map(|s| s.path.clone())
     }
 
     async fn mark(&self, account: &str, label: Option<&str>) -> Result<bool> {
         let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get_mut(&account.to_uppercase()) else { return Ok(false) };
+        let Some(session) = sessions.get_mut(&account.to_uppercase()) else {
+            return Ok(false);
+        };
         let label = label.unwrap_or("mark").replace('"', "'");
         writeln!(session.file, "{{\"event\":\"mark\",\"label\":{:?}}}", label)?;
         session.file.flush()?;
@@ -187,9 +246,20 @@ impl ActionLogManager {
 
     async fn packet(&self, account: &str, direction: &str, opcode: u32, body: &[u8]) {
         let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get_mut(&account.to_uppercase()) else { return };
-        let fingerprint = body.iter().fold(0xcbf29ce484222325_u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3));
-        let _ = writeln!(session.file, "{{\"event\":\"packet\",\"direction\":{:?},\"opcode\":{},\"body_len\":{},\"fingerprint\":{:?}}}", direction, opcode, body.len(), format!("{fingerprint:016X}"));
+        let Some(session) = sessions.get_mut(&account.to_uppercase()) else {
+            return;
+        };
+        let fingerprint = body.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+        let _ = writeln!(
+            session.file,
+            "{{\"event\":\"packet\",\"direction\":{:?},\"opcode\":{},\"body_len\":{},\"fingerprint\":{:?}}}",
+            direction,
+            opcode,
+            body.len(),
+            format!("{fingerprint:016X}")
+        );
         let _ = session.file.flush();
     }
 }
@@ -210,31 +280,60 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
         let (command_bus, _) = broadcast::channel(256);
         let (headless_enabled, _) = watch::channel(true);
         let headless_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let state = ConfiguredSessionState::new(lane.config.account, lane.config.lane, lane.config.worker);
+        let state =
+            ConfiguredSessionState::new(lane.config.account, lane.config.lane, lane.config.worker);
         let supervisor_for_runtime = lane.supervisor_tx.clone();
-        tokio::spawn(ConfiguredSessionActor {
-            state,
-            rx: session_rx,
-            worker_tx: lane.worker_tx,
-            upstream_tx: command_tx.clone(),
-            supervisor_tx: lane.supervisor_tx,
-        }.run());
+        tokio::spawn(
+            ConfiguredSessionActor {
+                state,
+                rx: session_rx,
+                worker_tx: lane.worker_tx,
+                upstream_tx: command_tx.clone(),
+                supervisor_tx: lane.supervisor_tx,
+            }
+            .run(),
+        );
         let session = session_tx.clone();
         tokio::spawn(async move {
             let mut worker_rx = lane.worker_rx;
             while let Some(message) = worker_rx.recv().await {
-                if session.send(SessionMessage::Worker(message)).await.is_err() { break; }
+                if session.send(SessionMessage::Worker(message)).await.is_err() {
+                    break;
+                }
             }
         });
         let bus = command_bus.clone();
-        tokio::spawn(async move { while let Some(command) = command_rx.recv().await { let _ = bus.send(command); } });
-        accounts.insert(lane.config.account_name.to_uppercase(), AccountRuntime { config: lane.config, session_tx, command_bus, supervisor_tx: supervisor_for_runtime, mission_counter: Arc::new(AtomicU64::new(1)), headless_enabled, headless_active, player_worlds: Arc::new(Mutex::new(PlayerWorlds::default())) });
+        tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                let _ = bus.send(command);
+            }
+        });
+        accounts.insert(
+            lane.config.account_name.to_uppercase(),
+            AccountRuntime {
+                config: lane.config,
+                session_tx,
+                command_bus,
+                supervisor_tx: supervisor_for_runtime,
+                mission_counter: Arc::new(AtomicU64::new(1)),
+                headless_enabled,
+                headless_active,
+                player_worlds: Arc::new(Mutex::new(PlayerWorlds::default())),
+            },
+        );
     }
     let action_logs = ActionLogManager::new(config.log_dir.clone());
-    let shared = SharedRuntime { config: Arc::new(config), accounts: Arc::new(accounts), auth: AuthRegistry::default(), action_logs };
+    let shared = SharedRuntime {
+        config: Arc::new(config),
+        accounts: Arc::new(accounts),
+        auth: AuthRegistry::default(),
+        action_logs,
+    };
     for account in shared.accounts.values().cloned() {
         let shared_for_headless = shared.clone();
-        tokio::spawn(async move { headless_session_manager(shared_for_headless, account).await; });
+        tokio::spawn(async move {
+            headless_session_manager(shared_for_headless, account).await;
+        });
     }
     let auth = tokio::spawn(serve_auth(shared.clone()));
     let world = tokio::spawn(serve_configured_world(shared.clone()));
@@ -245,7 +344,9 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
         r = transparent => r??,
         _ = tokio::signal::ctrl_c() => {}
     }
-    for account in shared.accounts.values() { let _ = account.session_tx.send(SessionMessage::Shutdown).await; }
+    for account in shared.accounts.values() {
+        let _ = account.session_tx.send(SessionMessage::Shutdown).await;
+    }
     Ok(())
 }
 
@@ -260,32 +361,51 @@ async fn serve_auth(shared: SharedRuntime) -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         let permit = match limiter.try_acquire(peer.ip()) {
             Ok(p) => p,
-            Err(reason) => { tracing::warn!(%peer, reason, "rejected pre-auth connection"); continue; }
+            Err(reason) => {
+                tracing::warn!(%peer, reason, "rejected pre-auth connection");
+                continue;
+            }
         };
         let shared = shared.clone();
         tokio::spawn(async move {
-            let result = tokio::time::timeout(shared.config.handshake_timeout, handle_auth(shared.clone(), stream)).await;
+            let result = tokio::time::timeout(
+                shared.config.handshake_timeout,
+                handle_auth(shared.clone(), stream),
+            )
+            .await;
             drop(permit);
             match result {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(%peer, error=%format_args!("{e:#}"), "auth connection failed"),
+                Ok(Err(e)) => {
+                    tracing::warn!(%peer, error=%format_args!("{e:#}"), "auth connection failed")
+                }
                 Err(_) => tracing::warn!(%peer, "auth handshake timed out"),
             }
         });
     }
 }
 
-struct StockChallenge { account: String, raw: Vec<u8> }
+struct StockChallenge {
+    account: String,
+    raw: Vec<u8>,
+}
 async fn read_stock_challenge(stream: &mut TcpStream) -> Result<StockChallenge> {
     let mut prefix = [0_u8; 4];
     stream.read_exact(&mut prefix).await?;
-    if prefix[0] != 0 || prefix[1] != 8 { bail!("expected WotLK 3.3.5a login challenge"); }
+    if prefix[0] != 0 || prefix[1] != 8 {
+        bail!("expected WotLK 3.3.5a login challenge");
+    }
     let size = usize::from(u16::from_le_bytes([prefix[2], prefix[3]]));
-    if !(30..=4096).contains(&size) { bail!("invalid login challenge length {size}"); }
-    let mut body = vec![0_u8; size]; stream.read_exact(&mut body).await?;
+    if !(30..=4096).contains(&size) {
+        bail!("invalid login challenge length {size}");
+    }
+    let mut body = vec![0_u8; size];
+    stream.read_exact(&mut body).await?;
     let n = usize::from(*body.get(29).context("missing account length")?);
-    let account = std::str::from_utf8(body.get(30..30+n).context("truncated account name")?)?.to_owned();
-    let mut raw = prefix.to_vec(); raw.extend_from_slice(&body);
+    let account =
+        std::str::from_utf8(body.get(30..30 + n).context("truncated account name")?)?.to_owned();
+    let mut raw = prefix.to_vec();
+    raw.extend_from_slice(&body);
     Ok(StockChallenge { account, raw })
 }
 
@@ -293,10 +413,16 @@ async fn handle_auth(shared: SharedRuntime, mut downstream: TcpStream) -> Result
     let challenge = read_stock_challenge(&mut downstream).await?;
     let key = challenge.account.to_uppercase();
     if let Some(account) = shared.accounts.get(&key) {
-        let upstream = upstream_login(&upstream_config(&shared, account), &account.config.password).await?;
-        let authenticated = crate::auth::login::terminate_configured_downstream(&mut downstream, &ConfiguredCredential {
-            account: account.config.account_name.clone(), password: account.config.password.clone()
-        }).await?;
+        let upstream =
+            upstream_login(&upstream_config(&shared, account), &account.config.password).await?;
+        let authenticated = crate::auth::login::terminate_configured_downstream(
+            &mut downstream,
+            &ConfiguredCredential {
+                account: account.config.account_name.clone(),
+                password: account.config.password.clone(),
+            },
+        )
+        .await?;
         shared.auth.put(&key, authenticated.session_key).await;
         serve_configured_realms(&shared, &mut downstream, &upstream.realm_name).await
     } else {
@@ -306,42 +432,99 @@ async fn handle_auth(shared: SharedRuntime, mut downstream: TcpStream) -> Result
 
 fn upstream_config(shared: &SharedRuntime, account: &AccountRuntime) -> UpstreamAuthConfig {
     UpstreamAuthConfig {
-        host: shared.config.upstream_auth_host.clone(), port: shared.config.upstream_auth_port,
-        realm_name: shared.config.realm_name.clone(), world_host: shared.config.upstream_world_host.clone(),
-        world_port: shared.config.upstream_world_port, account: account.config.account_name.clone(),
+        host: shared.config.upstream_auth_host.clone(),
+        port: shared.config.upstream_auth_port,
+        realm_name: shared.config.realm_name.clone(),
+        world_host: shared.config.upstream_world_host.clone(),
+        world_port: shared.config.upstream_world_port,
+        account: account.config.account_name.clone(),
     }
 }
 
-async fn serve_configured_realms(shared: &SharedRuntime, stream: &mut TcpStream, realm_name: &str) -> Result<()> {
-    let address = advertised(&shared.config.advertise_host, port_of(&shared.config.world_bind)?);
-    while tokio_expect_client_message::<CMD_REALM_LIST_Client, _>(&mut *stream).await.is_ok() {
-        CMD_REALM_LIST_Server { realms: vec![Realm {
-            realm_type: RealmType::PlayerVsEnvironment, locked: false, flag: Default::default(),
-            name: realm_name.to_owned(), address: address.clone(), population: Default::default(),
-            number_of_characters_on_realm: 1, category: RealmCategory::One, realm_id: 1,
-        }]}.tokio_write(&mut *stream).await?;
+async fn serve_configured_realms(
+    shared: &SharedRuntime,
+    stream: &mut TcpStream,
+    realm_name: &str,
+) -> Result<()> {
+    let address = advertised(
+        &shared.config.advertise_host,
+        port_of(&shared.config.world_bind)?,
+    );
+    while tokio_expect_client_message::<CMD_REALM_LIST_Client, _>(&mut *stream)
+        .await
+        .is_ok()
+    {
+        CMD_REALM_LIST_Server {
+            realms: vec![Realm {
+                realm_type: RealmType::PlayerVsEnvironment,
+                locked: false,
+                flag: Default::default(),
+                name: realm_name.to_owned(),
+                address: address.clone(),
+                population: Default::default(),
+                number_of_characters_on_realm: 1,
+                category: RealmCategory::One,
+                realm_id: 1,
+            }],
+        }
+        .tokio_write(&mut *stream)
+        .await?;
     }
     Ok(())
 }
 
-async fn transparent_auth(shared: SharedRuntime, challenge: StockChallenge, mut downstream: TcpStream) -> Result<()> {
-    let addr = advertised(&shared.config.upstream_auth_host, shared.config.upstream_auth_port);
+async fn transparent_auth(
+    shared: SharedRuntime,
+    challenge: StockChallenge,
+    mut downstream: TcpStream,
+) -> Result<()> {
+    let addr = advertised(
+        &shared.config.upstream_auth_host,
+        shared.config.upstream_auth_port,
+    );
     let mut upstream = TcpStream::connect(&addr).await?;
     upstream.write_all(&challenge.raw).await?;
     // Relay challenge and proof without deriving the unknown account session key.
-    let response = tokio_expect_server_message_protocol::<wow_login_messages::version_8::CMD_AUTH_LOGON_CHALLENGE_Server, _>(&mut upstream, ProtocolVersion::Eight).await?;
+    let response = tokio_expect_server_message_protocol::<
+        wow_login_messages::version_8::CMD_AUTH_LOGON_CHALLENGE_Server,
+        _,
+    >(&mut upstream, ProtocolVersion::Eight)
+    .await?;
     response.tokio_write(&mut downstream).await?;
-    let proof = tokio_expect_client_message_protocol::<wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Client, _>(&mut downstream, ProtocolVersion::Eight).await?;
+    let proof = tokio_expect_client_message_protocol::<
+        wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Client,
+        _,
+    >(&mut downstream, ProtocolVersion::Eight)
+    .await?;
     proof.tokio_write(&mut upstream).await?;
-    let response = tokio_expect_server_message_protocol::<wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Server, _>(&mut upstream, ProtocolVersion::Eight).await?;
+    let response = tokio_expect_server_message_protocol::<
+        wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Server,
+        _,
+    >(&mut upstream, ProtocolVersion::Eight)
+    .await?;
     response.tokio_write(&mut downstream).await?;
     loop {
-        let request = match tokio_expect_client_message_protocol::<CMD_REALM_LIST_Client, _>(&mut downstream, ProtocolVersion::Eight).await { Ok(v)=>v, Err(_)=>break };
+        let request = match tokio_expect_client_message_protocol::<CMD_REALM_LIST_Client, _>(
+            &mut downstream,
+            ProtocolVersion::Eight,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => break,
+        };
         request.tokio_write(&mut upstream).await?;
-        let mut realms = tokio_expect_server_message_protocol::<CMD_REALM_LIST_Server, _>(&mut upstream, ProtocolVersion::Eight).await?;
+        let mut realms = tokio_expect_server_message_protocol::<CMD_REALM_LIST_Server, _>(
+            &mut upstream,
+            ProtocolVersion::Eight,
+        )
+        .await?;
         for realm in &mut realms.realms {
             if realm.name.eq_ignore_ascii_case(&shared.config.realm_name) {
-                realm.address = advertised(&shared.config.advertise_host, port_of(&shared.config.transparent_world_bind)?);
+                realm.address = advertised(
+                    &shared.config.advertise_host,
+                    port_of(&shared.config.transparent_world_bind)?,
+                );
             }
         }
         realms.tokio_write(&mut downstream).await?;
@@ -354,14 +537,21 @@ async fn serve_transparent_world(shared: SharedRuntime) -> Result<()> {
     tracing::info!(bind=%shared.config.transparent_world_bind, "transparent world listener ready");
     loop {
         let (mut downstream, peer) = listener.accept().await?;
-        let addr = advertised(&shared.config.upstream_world_host, shared.config.upstream_world_port);
+        let addr = advertised(
+            &shared.config.upstream_world_host,
+            shared.config.upstream_world_port,
+        );
         tokio::spawn(async move {
             match TcpStream::connect(&addr).await {
                 Ok(mut upstream) => match transparent_relay(&mut downstream, &mut upstream).await {
-                    Ok((up, down)) => tracing::debug!(%peer, up, down, "transparent world relay ended"),
+                    Ok((up, down)) => {
+                        tracing::debug!(%peer, up, down, "transparent world relay ended")
+                    }
                     Err(e) => tracing::warn!(%peer, %e, "transparent world relay failed"),
                 },
-                Err(e) => tracing::warn!(%peer, %e, upstream=%addr, "transparent world connect failed"),
+                Err(e) => {
+                    tracing::warn!(%peer, %e, upstream=%addr, "transparent world connect failed")
+                }
             }
         });
     }
@@ -383,40 +573,90 @@ async fn serve_configured_world(shared: SharedRuntime) -> Result<()> {
 
 async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> Result<()> {
     let seed = ProofSeed::new();
-    SMSG_AUTH_CHALLENGE { unknown1: 1, server_seed: seed.seed(), seed: [0_u8; 32] }
-        .tokio_write_unencrypted_server(&mut downstream).await?;
+    SMSG_AUTH_CHALLENGE {
+        unknown1: 1,
+        server_seed: seed.seed(),
+        seed: [0_u8; 32],
+    }
+    .tokio_write_unencrypted_server(&mut downstream)
+    .await?;
     let auth = world_expect_client_message::<CMSG_AUTH_SESSION, _>(&mut downstream).await?;
     let account_name = auth.username.to_uppercase();
-    let account = shared.accounts.get(&account_name).with_context(|| format!("world account {account_name} is not configured"))?.clone();
-    let handoff = PlayerWorldHandoff::begin(account.player_worlds.clone(), account.headless_enabled.clone());
+    let account = shared
+        .accounts
+        .get(&account_name)
+        .with_context(|| format!("world account {account_name} is not configured"))?
+        .clone();
+    let handoff = PlayerWorldHandoff::begin(
+        account.player_worlds.clone(),
+        account.headless_enabled.clone(),
+    );
     wait_for_headless_state(&account, false, Duration::from_secs(6)).await?;
-    let downstream_key = shared.auth.get(&account_name).await.context("no fresh downstream login session key for configured world connection")?;
+    let downstream_key = shared
+        .auth
+        .get(&account_name)
+        .await
+        .context("no fresh downstream login session key for configured world connection")?;
     let normalized = NormalizedString::new(&account_name)?;
-    let downstream_crypto = seed.into_server_header_crypto(&normalized, downstream_key, auth.client_proof, auth.client_seed)?;
+    let downstream_crypto = seed.into_server_header_crypto(
+        &normalized,
+        downstream_key,
+        auth.client_proof,
+        auth.client_seed,
+    )?;
     let (mut down_enc, mut down_dec) = downstream_crypto.split();
 
-    let upstream_login = upstream_login(&upstream_config(&shared, &account), &account.config.password).await?;
+    let upstream_login = upstream_login(
+        &upstream_config(&shared, &account),
+        &account.config.password,
+    )
+    .await?;
     let addr = advertised(&upstream_login.world_host, upstream_login.world_port);
-    let mut upstream = TcpStream::connect(&addr).await.with_context(|| format!("connect upstream world {addr}"))?;
+    let mut upstream = TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("connect upstream world {addr}"))?;
     let challenge = world_expect_server_message::<SMSG_AUTH_CHALLENGE, _>(&mut upstream).await?;
     let up_seed = ProofSeed::new();
     let client_seed = up_seed.seed();
-    let (proof, up_crypto) = up_seed.into_client_header_crypto(&normalized, upstream_login.session_key, challenge.server_seed);
+    let (proof, up_crypto) = up_seed.into_client_header_crypto(
+        &normalized,
+        upstream_login.session_key,
+        challenge.server_seed,
+    );
     CMSG_AUTH_SESSION {
-        client_build: 12340, login_server_id: 0, username: account_name.clone(), login_server_type: 0,
-        client_seed, region_id: 0, battleground_id: 0, realm_id: upstream_login.realm_id,
-        dos_response: 0, client_proof: proof, addon_info: auth.addon_info,
-    }.tokio_write_unencrypted_client(&mut upstream).await?;
+        client_build: 12340,
+        login_server_id: 0,
+        username: account_name.clone(),
+        login_server_type: 0,
+        client_seed,
+        region_id: 0,
+        battleground_id: 0,
+        realm_id: upstream_login.realm_id,
+        dos_response: 0,
+        client_proof: proof,
+        addon_info: auth.addon_info,
+    }
+    .tokio_write_unencrypted_client(&mut upstream)
+    .await?;
     let (mut up_enc, mut up_dec) = up_crypto.split();
     let mut warden = WardenBridge::new(&upstream_login.session_key, &downstream_key);
 
     let connection = handoff.connection;
     let mut commands = account.command_bus.subscribe();
-    account.session_tx.send(SessionMessage::PlayerAttached { connection }).await.ok();
-    account.session_tx.send(SessionMessage::UpstreamConnected(true)).await.ok();
+    account
+        .session_tx
+        .send(SessionMessage::PlayerAttached { connection })
+        .await
+        .ok();
+    account
+        .session_tx
+        .send(SessionMessage::UpstreamConnected(true))
+        .await
+        .ok();
     tracing::info!(account=%account_name, upstream=%addr, "configured player world bridge attached");
 
-    let mut object_observer = ObjectObservationRuntime::new().context("initialize Tentacli object observer")?;
+    let mut object_observer =
+        ObjectObservationRuntime::new().context("initialize Tentacli object observer")?;
     let mut player_guid: Option<EntityId> = None;
     let mut canonical_position: Option<WorldPosition> = None;
     let mut controlled_mover: Option<EntityId> = None;
@@ -725,15 +965,24 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
             }
         }
     };
-    account.session_tx.send(SessionMessage::PlayerDetached { connection }).await.ok();
+    account
+        .session_tx
+        .send(SessionMessage::PlayerDetached { connection })
+        .await
+        .ok();
     result
 }
 
-
-async fn wait_for_headless_state(account: &AccountRuntime, expected: bool, timeout: Duration) -> Result<()> {
+async fn wait_for_headless_state(
+    account: &AccountRuntime,
+    expected: bool,
+    timeout: Duration,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if account.headless_active.load(Ordering::Acquire) == expected { return Ok(()); }
+        if account.headless_active.load(Ordering::Acquire) == expected {
+            return Ok(());
+        }
         if tokio::time::Instant::now() >= deadline {
             bail!("headless session did not reach active={expected} before handoff deadline");
         }
@@ -746,22 +995,37 @@ async fn headless_session_manager(shared: SharedRuntime, account: AccountRuntime
     let mut retry = Duration::from_secs(1);
     loop {
         while !*enabled.borrow_and_update() {
-            if enabled.changed().await.is_err() { return; }
+            if enabled.changed().await.is_err() {
+                return;
+            }
         }
         tracing::info!(account=%account.config.account_name, ?account.config.character, "headless autonomous session requested");
         account.headless_active.store(true, Ordering::Release);
-        let result = run_headless_world_session(shared.clone(), account.clone(), &mut enabled).await;
+        let session_started = tokio::time::Instant::now();
+        let result =
+            run_headless_world_session(shared.clone(), account.clone(), &mut enabled).await;
+        let connected_for = session_started.elapsed();
         account.headless_active.store(false, Ordering::Release);
-        let _ = account.session_tx.send(SessionMessage::WorldAuthoritative(false)).await;
-        let _ = account.session_tx.send(SessionMessage::UpstreamConnected(false)).await;
+        let _ = account
+            .session_tx
+            .send(SessionMessage::WorldAuthoritative(false))
+            .await;
+        let _ = account
+            .session_tx
+            .send(SessionMessage::UpstreamConnected(false))
+            .await;
         if !*enabled.borrow() {
             tracing::info!(account=%account.config.account_name, "headless autonomous session yielded to attended player");
             retry = Duration::from_secs(1);
             continue;
         }
         match result {
-            Ok(()) => tracing::info!(account=%account.config.account_name, "headless autonomous session ended; reconnect scheduled"),
-            Err(error) => tracing::warn!(account=%account.config.account_name, error=%format_args!("{error:#}"), "headless autonomous session failed; reconnect scheduled"),
+            Ok(()) => {
+                tracing::info!(account=%account.config.account_name, connected_for_ms=connected_for.as_millis(), retry_after_ms=retry.as_millis(), "headless autonomous session ended; reconnect scheduled")
+            }
+            Err(error) => {
+                tracing::warn!(account=%account.config.account_name, connected_for_ms=connected_for.as_millis(), retry_after_ms=retry.as_millis(), error=%format_args!("{error:#}"), "headless autonomous session failed; reconnect scheduled")
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(retry) => {},
@@ -776,15 +1040,27 @@ async fn run_headless_world_session(
     account: AccountRuntime,
     enabled: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    if !*enabled.borrow() { return Ok(()); }
-    let upstream_login = upstream_login(&upstream_config(&shared, &account), &account.config.password).await?;
+    if !*enabled.borrow() {
+        return Ok(());
+    }
+    let upstream_login = upstream_login(
+        &upstream_config(&shared, &account),
+        &account.config.password,
+    )
+    .await?;
     let addr = advertised(&upstream_login.world_host, upstream_login.world_port);
-    let mut upstream = TcpStream::connect(&addr).await.with_context(|| format!("connect headless upstream world {addr}"))?;
+    let mut upstream = TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("connect headless upstream world {addr}"))?;
     let challenge = world_expect_server_message::<SMSG_AUTH_CHALLENGE, _>(&mut upstream).await?;
     let normalized = NormalizedString::new(&account.config.account_name.to_uppercase())?;
     let seed = ProofSeed::new();
     let client_seed = seed.seed();
-    let (proof, crypto) = seed.into_client_header_crypto(&normalized, upstream_login.session_key, challenge.server_seed);
+    let (proof, crypto) = seed.into_client_header_crypto(
+        &normalized,
+        upstream_login.session_key,
+        challenge.server_seed,
+    );
     CMSG_AUTH_SESSION {
         client_build: 12340,
         login_server_id: 0,
@@ -797,7 +1073,9 @@ async fn run_headless_world_session(
         dos_response: 0,
         client_proof: proof,
         addon_info: Vec::new(),
-    }.tokio_write_unencrypted_client(&mut upstream).await?;
+    }
+    .tokio_write_unencrypted_client(&mut upstream)
+    .await?;
     let (mut enc, mut dec) = crypto.split();
     let (mut reader, mut writer) = upstream.into_split();
     let mut warden = WardenClient::new(
@@ -805,7 +1083,8 @@ async fn run_headless_world_session(
         shared.config.warden_client_image.as_deref(),
     )?;
     let mut commands = account.command_bus.subscribe();
-    let mut object_observer = ObjectObservationRuntime::new().context("initialize headless Tentacli object observer")?;
+    let mut object_observer =
+        ObjectObservationRuntime::new().context("initialize headless Tentacli object observer")?;
     let mut player_guid = None;
     let mut canonical_position = None;
     let mut canonical_flags = 0_u32;
@@ -817,8 +1096,26 @@ async fn run_headless_world_session(
     let mut last_bot_cast: Option<(u32, Option<EntityId>, std::time::Instant)> = None;
     let mut char_enum_requested = false;
     let mut player_login_requested = false;
+    let (server_tx, mut server_rx) = mpsc::channel(8);
+    let _server_reader = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            let result = read_server_frame(&mut reader, &mut dec).await;
+            let ended = result.is_err();
+            if server_tx.send(result).await.is_err() || ended {
+                break;
+            }
+        }
+    }));
+    let ping_interval = Duration::from_secs(30);
+    let mut next_ping = tokio::time::Instant::now() + ping_interval;
+    let mut ping_sequence = 1_u32;
+    let mut pending_ping: Option<(u32, tokio::time::Instant)> = None;
 
-    account.session_tx.send(SessionMessage::UpstreamConnected(true)).await.ok();
+    account
+        .session_tx
+        .send(SessionMessage::UpstreamConnected(true))
+        .await
+        .ok();
     tracing::info!(account=%account.config.account_name, upstream=%addr, "headless upstream world authenticated socket established");
 
     loop {
@@ -861,9 +1158,27 @@ async fn run_headless_world_session(
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            server = read_server_frame(&mut reader, &mut dec) => {
-                let frame = server?;
+            _ = tokio::time::sleep_until(next_ping) => {
+                let sequence = ping_sequence;
+                ping_sequence = ping_sequence.wrapping_add(1);
+                let frame = make_headless_ping(sequence, 0);
+                write_client_frame(&mut writer, &mut enc, &frame).await?;
+                pending_ping = Some((sequence, tokio::time::Instant::now()));
+                tracing::debug!(account=%account.config.account_name, sequence, opcode=frame.opcode, "headless client keepalive ping transmitted");
+                next_ping = tokio::time::Instant::now() + ping_interval;
+            }
+            server = server_rx.recv() => {
+                let frame = server.context("headless upstream reader ended")??;
                 let opcode = u32::from(frame.opcode);
+                if opcode == 0x01DD {
+                    if let Some(sequence) = parse_headless_pong(&frame.body) {
+                        if let Some((pending, sent_at)) = pending_ping.take().filter(|(pending, _)| *pending == sequence) {
+                            tracing::debug!(account=%account.config.account_name, sequence=pending, rtt_ms=sent_at.elapsed().as_millis(), "headless server keepalive pong received");
+                        } else {
+                            tracing::debug!(account=%account.config.account_name, sequence, "headless server pong did not match pending ping");
+                        }
+                    }
+                }
                 if opcode == 0x01EE && !char_enum_requested {
                     write_client_frame(&mut writer, &mut enc, &ClientFrame { opcode: 0x0037, body: Vec::new() }).await?;
                     char_enum_requested = true;
@@ -969,21 +1284,46 @@ fn select_wrath_character(body: &[u8], configured: Option<&str>) -> Option<(u64,
         let end = rest.iter().position(|byte| *byte == 0)?;
         let name = std::str::from_utf8(rest.get(..end)?).ok()?.to_owned();
         rest = rest.get(end + 1..)?;
-        if first.is_none() { first = Some((guid, name.clone())); }
-        if configured.is_some_and(|wanted| name.eq_ignore_ascii_case(wanted)) { return Some((guid, name)); }
+        if first.is_none() {
+            first = Some((guid, name.clone()));
+        }
+        if configured.is_some_and(|wanted| name.eq_ignore_ascii_case(wanted)) {
+            return Some((guid, name));
+        }
         rest = rest.get(FIXED_TAIL_AFTER_NAME..)?;
     }
-    if configured.is_none_or(|name| name.trim().is_empty()) { first } else { None }
+    if configured.is_none_or(|name| name.trim().is_empty()) {
+        first
+    } else {
+        None
+    }
 }
 
 fn bot_targeted_cast(command: &GameplayCommand) -> Option<(u32, Option<EntityId>)> {
     match command {
-        GameplayCommand::Cast { spell, target } | GameplayCommand::VehicleCast { spell, target } => Some((*spell, *target)),
+        GameplayCommand::Cast { spell, target }
+        | GameplayCommand::VehicleCast { spell, target } => Some((*spell, *target)),
         GameplayCommand::MaintainBuff { spell, target } => Some((*spell, Some(*target))),
         GameplayCommand::CastGameObject { spell, target, .. } => Some((*spell, Some(*target))),
-        GameplayCommand::UseItemInstance { spell, target, .. } if *spell != 0 => Some((*spell, *target)),
+        GameplayCommand::UseItemInstance { spell, target, .. } if *spell != 0 => {
+            Some((*spell, *target))
+        }
         _ => None,
     }
+}
+
+fn make_headless_ping(sequence: u32, latency_ms: u32) -> ClientFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&sequence.to_le_bytes());
+    body.extend_from_slice(&latency_ms.to_le_bytes());
+    ClientFrame {
+        opcode: 0x01DC,
+        body,
+    }
+}
+
+fn parse_headless_pong(body: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(body.get(..4)?.try_into().ok()?))
 }
 
 fn parse_cast_failed(body: &[u8]) -> Option<(u8, u32, u8)> {
@@ -1027,7 +1367,15 @@ async fn write_bot_notice<W: tokio::io::AsyncWrite + Unpin>(
     body.extend_from_slice(message.as_bytes());
     body.push(0);
     body.push(0);
-    write_server_frame(writer, encrypter, &crate::framing::ServerFrame { opcode: SMSG_MESSAGECHAT_OPCODE, body }).await
+    write_server_frame(
+        writer,
+        encrypter,
+        &crate::framing::ServerFrame {
+            opcode: SMSG_MESSAGECHAT_OPCODE,
+            body,
+        },
+    )
+    .await
 }
 
 fn encode_gameplay_command(
@@ -1053,10 +1401,34 @@ fn encode_gameplay_command(
     const CMSG_QUEST_QUERY: u32 = 0x005C;
     match command {
         GameplayCommand::Raw { opcode, body } => Ok(Some((ClientFrame { opcode, body }, None))),
-        GameplayCommand::QueryQuestGivers => Ok(Some((ClientFrame { opcode: CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY, body: Vec::new() }, None))),
-        GameplayCommand::QueryQuest { quest } => Ok(Some((ClientFrame { opcode: CMSG_QUEST_QUERY, body: quest.to_le_bytes().to_vec() }, None))),
-        GameplayCommand::Interact(entity) => Ok(Some((ClientFrame { opcode: CMSG_QUESTGIVER_HELLO, body: entity.0.to_le_bytes().to_vec() }, None))),
-        GameplayCommand::UseGameObject(entity) => Ok(Some((ClientFrame { opcode: CMSG_GAMEOBJ_USE, body: entity.0.to_le_bytes().to_vec() }, None))),
+        GameplayCommand::QueryQuestGivers => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY,
+                body: Vec::new(),
+            },
+            None,
+        ))),
+        GameplayCommand::QueryQuest { quest } => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_QUEST_QUERY,
+                body: quest.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
+        GameplayCommand::Interact(entity) => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_QUESTGIVER_HELLO,
+                body: entity.0.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
+        GameplayCommand::UseGameObject(entity) => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_GAMEOBJ_USE,
+                body: entity.0.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
         GameplayCommand::CastGameObject { spell, target, .. } => {
             const CMSG_CAST_SPELL: u32 = 0x012E;
             const TARGET_FLAG_GAMEOBJECT: u32 = 0x0000_0800;
@@ -1066,9 +1438,22 @@ fn encode_gameplay_command(
             body.push(0);
             body.extend_from_slice(&TARGET_FLAG_GAMEOBJECT.to_le_bytes());
             push_packed_guid(&mut body, target);
-            Ok(Some((ClientFrame { opcode: CMSG_CAST_SPELL, body }, None)))
-        },
-        GameplayCommand::UseItemInstance { item: _, item_guid, backpack_slot, spell, target, cast_count } => {
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_CAST_SPELL,
+                    body,
+                },
+                None,
+            )))
+        }
+        GameplayCommand::UseItemInstance {
+            item: _,
+            item_guid,
+            backpack_slot,
+            spell,
+            target,
+            cast_count,
+        } => {
             let mut body = Vec::with_capacity(32);
             body.push(0xff); // INVENTORY_SLOT_BAG_0
             body.push(backpack_slot);
@@ -1078,29 +1463,87 @@ fn encode_gameplay_command(
             body.extend_from_slice(&0_u32.to_le_bytes()); // glyph index
             body.push(0); // cast flags
             match target {
-                Some(target) => { body.extend_from_slice(&0x0000_0002_u32.to_le_bytes()); push_packed_guid(&mut body, target); }
+                Some(target) => {
+                    body.extend_from_slice(&0x0000_0002_u32.to_le_bytes());
+                    push_packed_guid(&mut body, target);
+                }
                 None => body.extend_from_slice(&0_u32.to_le_bytes()),
             }
-            Ok(Some((ClientFrame { opcode: CMSG_USE_ITEM, body }, None)))
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_USE_ITEM,
+                    body,
+                },
+                None,
+            )))
         }
-        GameplayCommand::Attack(entity) => Ok(Some((ClientFrame { opcode: CMSG_ATTACKSWING, body: entity.0.to_le_bytes().to_vec() }, None))),
-        GameplayCommand::Loot(entity) => Ok(Some((ClientFrame { opcode: CMSG_LOOT, body: entity.0.to_le_bytes().to_vec() }, None))),
+        GameplayCommand::Attack(entity) => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_ATTACKSWING,
+                body: entity.0.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
+        GameplayCommand::Loot(entity) => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_LOOT,
+                body: entity.0.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
         GameplayCommand::AcceptQuest { quest, giver } => {
             let mut body = Vec::with_capacity(16);
-            body.extend_from_slice(&giver.0.to_le_bytes()); body.extend_from_slice(&quest.to_le_bytes()); body.extend_from_slice(&0_u32.to_le_bytes());
-            Ok(Some((ClientFrame { opcode: CMSG_QUESTGIVER_ACCEPT_QUEST, body }, None)))
+            body.extend_from_slice(&giver.0.to_le_bytes());
+            body.extend_from_slice(&quest.to_le_bytes());
+            body.extend_from_slice(&0_u32.to_le_bytes());
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_QUESTGIVER_ACCEPT_QUEST,
+                    body,
+                },
+                None,
+            )))
         }
         GameplayCommand::TurnInQuest { quest, giver } => {
-            let mut body = Vec::with_capacity(12); body.extend_from_slice(&giver.0.to_le_bytes()); body.extend_from_slice(&quest.to_le_bytes());
-            Ok(Some((ClientFrame { opcode: CMSG_QUESTGIVER_COMPLETE_QUEST, body }, None)))
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&giver.0.to_le_bytes());
+            body.extend_from_slice(&quest.to_le_bytes());
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_QUESTGIVER_COMPLETE_QUEST,
+                    body,
+                },
+                None,
+            )))
         }
         GameplayCommand::RequestQuestReward { quest, giver } => {
-            let mut body = Vec::with_capacity(12); body.extend_from_slice(&giver.0.to_le_bytes()); body.extend_from_slice(&quest.to_le_bytes());
-            Ok(Some((ClientFrame { opcode: CMSG_QUESTGIVER_REQUEST_REWARD, body }, None)))
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&giver.0.to_le_bytes());
+            body.extend_from_slice(&quest.to_le_bytes());
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_QUESTGIVER_REQUEST_REWARD,
+                    body,
+                },
+                None,
+            )))
         }
-        GameplayCommand::ChooseQuestReward { quest, giver, reward } => {
-            let mut body = Vec::with_capacity(16); body.extend_from_slice(&giver.0.to_le_bytes()); body.extend_from_slice(&quest.to_le_bytes()); body.extend_from_slice(&reward.to_le_bytes());
-            Ok(Some((ClientFrame { opcode: CMSG_QUESTGIVER_CHOOSE_REWARD, body }, None)))
+        GameplayCommand::ChooseQuestReward {
+            quest,
+            giver,
+            reward,
+        } => {
+            let mut body = Vec::with_capacity(16);
+            body.extend_from_slice(&giver.0.to_le_bytes());
+            body.extend_from_slice(&quest.to_le_bytes());
+            body.extend_from_slice(&reward.to_le_bytes());
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_QUESTGIVER_CHOOSE_REWARD,
+                    body,
+                },
+                None,
+            )))
         }
         GameplayCommand::MaintainBuff { spell, target } => {
             const CMSG_CAST_SPELL: u32 = 0x012E;
@@ -1110,9 +1553,16 @@ fn encode_gameplay_command(
             body.push(0);
             body.extend_from_slice(&0x0000_0002_u32.to_le_bytes());
             push_packed_guid(&mut body, target);
-            Ok(Some((ClientFrame { opcode: CMSG_CAST_SPELL, body }, None)))
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_CAST_SPELL,
+                    body,
+                },
+                None,
+            )))
         }
-        GameplayCommand::Cast { spell, target } | GameplayCommand::VehicleCast { spell, target } => {
+        GameplayCommand::Cast { spell, target }
+        | GameplayCommand::VehicleCast { spell, target } => {
             const CMSG_CAST_SPELL: u32 = 0x012E;
             let mut body = Vec::with_capacity(24);
             body.push(0); // cast count
@@ -1125,42 +1575,119 @@ fn encode_gameplay_command(
                 }
                 None => body.extend_from_slice(&0_u32.to_le_bytes()),
             }
-            Ok(Some((ClientFrame { opcode: CMSG_CAST_SPELL, body }, None)))
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_CAST_SPELL,
+                    body,
+                },
+                None,
+            )))
         }
         GameplayCommand::FaceDirection { orientation } => {
-            let guid = player_guid.ok_or_else(|| "facing requested before player GUID is authoritative".to_owned())?;
-            let mut position = current.ok_or_else(|| "facing requested before canonical position is known".to_owned())?;
-            if !orientation.is_finite() { return Err("facing orientation is invalid".into()); }
+            let guid = player_guid
+                .ok_or_else(|| "facing requested before player GUID is authoritative".to_owned())?;
+            let mut position = current
+                .ok_or_else(|| "facing requested before canonical position is known".to_owned())?;
+            if !orientation.is_finite() {
+                return Err("facing orientation is invalid".into());
+            }
             position.orientation = orientation.rem_euclid(std::f32::consts::TAU);
             *movement_time = movement_time.wrapping_add(1).max(1);
             let flags = base_movement_flags & !0x0000_0001_u32;
-            let body = encode_simple_movement(guid, flags, *movement_time, position.point, position.orientation);
-            Ok(Some((ClientFrame { opcode: MSG_MOVE_SET_FACING, body }, Some((position, false, flags, *movement_time)))))
+            let body = encode_simple_movement(
+                guid,
+                flags,
+                *movement_time,
+                position.point,
+                position.orientation,
+            );
+            Ok(Some((
+                ClientFrame {
+                    opcode: MSG_MOVE_SET_FACING,
+                    body,
+                },
+                Some((position, false, flags, *movement_time)),
+            )))
         }
-        GameplayCommand::ReleaseSpirit => Ok(Some((ClientFrame { opcode: 0x015A, body: vec![0] }, None))),
-        GameplayCommand::QueryCorpse => Ok(Some((ClientFrame { opcode: 0x0216, body: Vec::new() }, None))),
-        GameplayCommand::ReclaimCorpse { player } => Ok(Some((ClientFrame { opcode: 0x01D2, body: player.0.to_le_bytes().to_vec() }, None))),
+        GameplayCommand::ReleaseSpirit => Ok(Some((
+            ClientFrame {
+                opcode: 0x015A,
+                body: vec![0],
+            },
+            None,
+        ))),
+        GameplayCommand::QueryCorpse => Ok(Some((
+            ClientFrame {
+                opcode: 0x0216,
+                body: Vec::new(),
+            },
+            None,
+        ))),
+        GameplayCommand::ReclaimCorpse { player } => Ok(Some((
+            ClientFrame {
+                opcode: 0x01D2,
+                body: player.0.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
         GameplayCommand::MoveTo(destination) => {
-            let guid = player_guid.ok_or_else(|| "movement requested before player GUID is authoritative".to_owned())?;
-            let mut position = current.ok_or_else(|| "movement requested before canonical position is known".to_owned())?;
-            if !destination.is_finite() { return Err("movement destination is invalid".into()); }
-            let dx = destination.x - position.point.x; let dy = destination.y - position.point.y;
-            if dx != 0.0 || dy != 0.0 { position.orientation = dy.atan2(dx); }
+            let guid = player_guid.ok_or_else(|| {
+                "movement requested before player GUID is authoritative".to_owned()
+            })?;
+            let mut position = current.ok_or_else(|| {
+                "movement requested before canonical position is known".to_owned()
+            })?;
+            if !destination.is_finite() {
+                return Err("movement destination is invalid".into());
+            }
+            let dx = destination.x - position.point.x;
+            let dy = destination.y - position.point.y;
+            if dx != 0.0 || dy != 0.0 {
+                position.orientation = dy.atan2(dx);
+            }
             position.point = destination;
             *movement_time = movement_time.wrapping_add(250).max(1);
             // Preserve server-authoritative capabilities such as flying/disable-gravity,
             // while setting forward movement for this step.
             let flags = base_movement_flags | 0x0000_0001_u32;
-            let body = encode_simple_movement(guid, flags, *movement_time, position.point, position.orientation);
-            Ok(Some((ClientFrame { opcode: MSG_MOVE_HEARTBEAT, body }, Some((position, true, flags, *movement_time)))))
+            let body = encode_simple_movement(
+                guid,
+                flags,
+                *movement_time,
+                position.point,
+                position.orientation,
+            );
+            Ok(Some((
+                ClientFrame {
+                    opcode: MSG_MOVE_HEARTBEAT,
+                    body,
+                },
+                Some((position, true, flags, *movement_time)),
+            )))
         }
         GameplayCommand::StopMovement => {
-            let guid = player_guid.ok_or_else(|| "stop movement requested before player GUID is authoritative".to_owned())?;
-            let position = current.ok_or_else(|| "stop movement requested before canonical position is known".to_owned())?;
+            let guid = player_guid.ok_or_else(|| {
+                "stop movement requested before player GUID is authoritative".to_owned()
+            })?;
+            let position = current.ok_or_else(|| {
+                "stop movement requested before canonical position is known".to_owned()
+            })?;
             *movement_time = movement_time.wrapping_add(1).max(1);
             let flags = base_movement_flags & !0x0000_0001_u32;
-            let body = encode_simple_movement(guid, flags, *movement_time, position.point, position.orientation);
-            Ok(Some((ClientFrame { opcode: MSG_MOVE_STOP, body }, Some((position, false, flags, *movement_time)))))
+            let body = encode_simple_movement(
+                guid,
+                flags,
+                *movement_time,
+                position.point,
+                position.orientation,
+            );
+            Ok(Some((
+                ClientFrame {
+                    opcode: MSG_MOVE_STOP,
+                    body,
+                },
+                Some((position, false, flags, *movement_time)),
+            )))
         }
         other => Err(format!("{other:?}")),
     }
@@ -1172,36 +1699,76 @@ fn push_packed_guid(body: &mut Vec<u8>, guid: EntityId) {
     let start = body.len();
     body.push(0);
     for (index, byte) in bytes.into_iter().enumerate() {
-        if byte != 0 { mask |= 1 << index; body.push(byte); }
+        if byte != 0 {
+            mask |= 1 << index;
+            body.push(byte);
+        }
     }
     body[start] = mask;
 }
 
-fn encode_simple_movement(guid: EntityId, flags: u32, client_time: u32, point: Vec3, orientation: f32) -> Vec<u8> {
+fn encode_simple_movement(
+    guid: EntityId,
+    flags: u32,
+    client_time: u32,
+    point: Vec3,
+    orientation: f32,
+) -> Vec<u8> {
     let bytes = guid.0.to_le_bytes();
-    let mut mask = 0_u8; let mut body = vec![0_u8];
-    for (index, byte) in bytes.into_iter().enumerate() { if byte != 0 { mask |= 1 << index; body.push(byte); } }
+    let mut mask = 0_u8;
+    let mut body = vec![0_u8];
+    for (index, byte) in bytes.into_iter().enumerate() {
+        if byte != 0 {
+            mask |= 1 << index;
+            body.push(byte);
+        }
+    }
     body[0] = mask;
     body.extend_from_slice(&flags.to_le_bytes());
     body.extend_from_slice(&0_u16.to_le_bytes());
     body.extend_from_slice(&client_time.to_le_bytes());
-    body.extend_from_slice(&point.x.to_le_bytes()); body.extend_from_slice(&point.y.to_le_bytes()); body.extend_from_slice(&point.z.to_le_bytes());
-    body.extend_from_slice(&orientation.to_le_bytes()); body.extend_from_slice(&0_u32.to_le_bytes());
+    body.extend_from_slice(&point.x.to_le_bytes());
+    body.extend_from_slice(&point.y.to_le_bytes());
+    body.extend_from_slice(&point.z.to_le_bytes());
+    body.extend_from_slice(&orientation.to_le_bytes());
+    body.extend_from_slice(&0_u32.to_le_bytes());
     body
 }
 
 fn decode_simple_movement(body: &[u8]) -> Option<(EntityId, u32, u32, Vec3, f32)> {
-    let mask = *body.first()?; let mut cursor = 1usize; let mut guid = [0_u8;8];
-    for (index, slot) in guid.iter_mut().enumerate() { if mask & (1 << index) != 0 { *slot = *body.get(cursor)?; cursor += 1; } }
-    let flags = u32::from_le_bytes(body.get(cursor..cursor+4)?.try_into().ok()?); cursor += 4;
-    let _extra = u16::from_le_bytes(body.get(cursor..cursor+2)?.try_into().ok()?); cursor += 2;
-    let client_time = u32::from_le_bytes(body.get(cursor..cursor+4)?.try_into().ok()?); cursor += 4;
-    let x = f32::from_le_bytes(body.get(cursor..cursor+4)?.try_into().ok()?); cursor += 4;
-    let y = f32::from_le_bytes(body.get(cursor..cursor+4)?.try_into().ok()?); cursor += 4;
-    let z = f32::from_le_bytes(body.get(cursor..cursor+4)?.try_into().ok()?); cursor += 4;
-    let o = f32::from_le_bytes(body.get(cursor..cursor+4)?.try_into().ok()?);
-    let point = Vec3::new(x,y,z); if !point.is_finite() || !o.is_finite() { return None; }
-    Some((EntityId(u64::from_le_bytes(guid)), flags, client_time, point, o))
+    let mask = *body.first()?;
+    let mut cursor = 1usize;
+    let mut guid = [0_u8; 8];
+    for (index, slot) in guid.iter_mut().enumerate() {
+        if mask & (1 << index) != 0 {
+            *slot = *body.get(cursor)?;
+            cursor += 1;
+        }
+    }
+    let flags = u32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
+    cursor += 4;
+    let _extra = u16::from_le_bytes(body.get(cursor..cursor + 2)?.try_into().ok()?);
+    cursor += 2;
+    let client_time = u32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
+    cursor += 4;
+    let x = f32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
+    cursor += 4;
+    let y = f32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
+    cursor += 4;
+    let z = f32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
+    cursor += 4;
+    let o = f32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
+    let point = Vec3::new(x, y, z);
+    if !point.is_finite() || !o.is_finite() {
+        return None;
+    }
+    Some((
+        EntityId(u64::from_le_bytes(guid)),
+        flags,
+        client_time,
+        point,
+        o,
+    ))
 }
 
 fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation> {
@@ -1214,7 +1781,14 @@ fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation
     const SMSG_CORPSE_RECLAIM_DELAY: u32 = 0x0269;
     match opcode {
         SMSG_INITIAL_SPELLS => parse_initial_spells(body),
-        SMSG_LEARNED_SPELL => body.get(0..4).map(|bytes| vec![ProtocolObservation::SpellKnown { spell: u32::from_le_bytes(bytes.try_into().unwrap_or([0;4])) }]).unwrap_or_default(),
+        SMSG_LEARNED_SPELL => body
+            .get(0..4)
+            .map(|bytes| {
+                vec![ProtocolObservation::SpellKnown {
+                    spell: u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])),
+                }]
+            })
+            .unwrap_or_default(),
         SMSG_AURA_UPDATE_ALL => parse_aura_update_all(body).into_iter().collect(),
         SMSG_AURA_UPDATE => parse_aura_update(body).into_iter().collect(),
         SMSG_SPELL_COOLDOWN => parse_spell_cooldowns(body),
@@ -1224,88 +1798,162 @@ fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation
     }
 }
 
-fn parse_corpse_query(body:&[u8])->Option<ProtocolObservation>{
-    if *body.first()?==0 { return Some(ProtocolObservation::CorpseLocation{position:None}); }
-    let map=u32::from_le_bytes(body.get(1..5)?.try_into().ok()?);
-    let x=f32::from_le_bytes(body.get(5..9)?.try_into().ok()?);
-    let y=f32::from_le_bytes(body.get(9..13)?.try_into().ok()?);
-    let z=f32::from_le_bytes(body.get(13..17)?.try_into().ok()?);
-    let point=Vec3::new(x,y,z); if !point.is_finite(){return None}
-    Some(ProtocolObservation::CorpseLocation{position:Some(WorldPosition{map,point,orientation:0.0})})
+fn parse_corpse_query(body: &[u8]) -> Option<ProtocolObservation> {
+    if *body.first()? == 0 {
+        return Some(ProtocolObservation::CorpseLocation { position: None });
+    }
+    let map = u32::from_le_bytes(body.get(1..5)?.try_into().ok()?);
+    let x = f32::from_le_bytes(body.get(5..9)?.try_into().ok()?);
+    let y = f32::from_le_bytes(body.get(9..13)?.try_into().ok()?);
+    let z = f32::from_le_bytes(body.get(13..17)?.try_into().ok()?);
+    let point = Vec3::new(x, y, z);
+    if !point.is_finite() {
+        return None;
+    }
+    Some(ProtocolObservation::CorpseLocation {
+        position: Some(WorldPosition {
+            map,
+            point,
+            orientation: 0.0,
+        }),
+    })
 }
-fn parse_reclaim_delay(body:&[u8])->Option<ProtocolObservation>{
-    let delay=u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
-    Some(ProtocolObservation::CorpseReclaimDelay{ready_at_ms:wall_clock_ms().saturating_add(u64::from(delay))})
+fn parse_reclaim_delay(body: &[u8]) -> Option<ProtocolObservation> {
+    let delay = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
+    Some(ProtocolObservation::CorpseReclaimDelay {
+        ready_at_ms: wall_clock_ms().saturating_add(u64::from(delay)),
+    })
 }
 
 fn wall_clock_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn parse_spell_cooldowns(body: &[u8]) -> Vec<ProtocolObservation> {
-    if body.len() < 9 { return Vec::new(); }
+    if body.len() < 9 {
+        return Vec::new();
+    }
     let now = wall_clock_ms();
     let mut offset = 9usize; // caster GUID + flags
     let mut out = Vec::new();
     while offset + 8 <= body.len() {
-        let spell = u32::from_le_bytes(body[offset..offset+4].try_into().unwrap_or([0;4]));
-        let cooldown = u32::from_le_bytes(body[offset+4..offset+8].try_into().unwrap_or([0;4]));
+        let spell = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap_or([0; 4]));
+        let cooldown =
+            u32::from_le_bytes(body[offset + 4..offset + 8].try_into().unwrap_or([0; 4]));
         offset += 8;
-        if spell != 0 { out.push(ProtocolObservation::SpellCooldown { spell, ready_at_ms: now.saturating_add(u64::from(cooldown)) }); }
+        if spell != 0 {
+            out.push(ProtocolObservation::SpellCooldown {
+                spell,
+                ready_at_ms: now.saturating_add(u64::from(cooldown)),
+            });
+        }
     }
     out
 }
 
 fn parse_initial_spells(body: &[u8]) -> Vec<ProtocolObservation> {
-    if body.len() < 3 { return Vec::new(); }
+    if body.len() < 3 {
+        return Vec::new();
+    }
     let count = u16::from_le_bytes([body[1], body[2]]) as usize;
-    if count > 4096 || body.len() < 3 + count.saturating_mul(6) { return Vec::new(); }
+    if count > 4096 || body.len() < 3 + count.saturating_mul(6) {
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity(count);
     let mut offset = 3usize;
     for _ in 0..count {
-        let spell = u32::from_le_bytes(body[offset..offset+4].try_into().unwrap_or([0;4]));
+        let spell = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap_or([0; 4]));
         offset += 6;
-        if spell != 0 { out.push(ProtocolObservation::SpellKnown { spell }); }
+        if spell != 0 {
+            out.push(ProtocolObservation::SpellKnown { spell });
+        }
     }
     out
 }
 
-fn read_packed_guid(body:&[u8], offset:&mut usize)->Option<EntityId>{
-    let mask=*body.get(*offset)?; *offset+=1; let mut bytes=[0_u8;8];
-    for (index,slot) in bytes.iter_mut().enumerate(){ if mask&(1<<index)!=0 { *slot=*body.get(*offset)?; *offset+=1; } }
+fn read_packed_guid(body: &[u8], offset: &mut usize) -> Option<EntityId> {
+    let mask = *body.get(*offset)?;
+    *offset += 1;
+    let mut bytes = [0_u8; 8];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        if mask & (1 << index) != 0 {
+            *slot = *body.get(*offset)?;
+            *offset += 1;
+        }
+    }
     Some(EntityId(u64::from_le_bytes(bytes)))
 }
 
-fn parse_aura_update(body:&[u8])->Option<ProtocolObservation>{
-    let mut offset=0usize; let entity=read_packed_guid(body,&mut offset)?; let slot=*body.get(offset)?; offset+=1;
-    let spell=u32::from_le_bytes(body.get(offset..offset+4)?.try_into().ok()?);
-    let aura=(spell!=0).then_some(wow_state::auras::AuraInstance{slot,spell,positive:None,caster:None,max_duration_ms:None,remaining_ms:None});
-    Some(ProtocolObservation::AuraSlot{entity,slot,aura})
+fn parse_aura_update(body: &[u8]) -> Option<ProtocolObservation> {
+    let mut offset = 0usize;
+    let entity = read_packed_guid(body, &mut offset)?;
+    let slot = *body.get(offset)?;
+    offset += 1;
+    let spell = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+    let aura = (spell != 0).then_some(wow_state::auras::AuraInstance {
+        slot,
+        spell,
+        positive: None,
+        caster: None,
+        max_duration_ms: None,
+        remaining_ms: None,
+    });
+    Some(ProtocolObservation::AuraSlot { entity, slot, aura })
 }
 
-fn parse_aura_update_all(body:&[u8])->Option<ProtocolObservation>{
-    let mut offset=0usize; let entity=read_packed_guid(body,&mut offset)?; let mut auras=Vec::new();
-    while offset<body.len(){
-        let slot=*body.get(offset)?; offset+=1;
-        let spell=u32::from_le_bytes(body.get(offset..offset+4)?.try_into().ok()?); offset+=4;
-        let flags=*body.get(offset)?; offset+=1;
-        let _level=*body.get(offset)?; offset+=1;
-        let caster=if flags&0x08==0 { Some(read_packed_guid(body,&mut offset)?) } else { None };
-        let (max_duration_ms,remaining_ms)=if flags&0x20!=0 {
-            let max=u32::from_le_bytes(body.get(offset..offset+4)?.try_into().ok()?); offset+=4;
-            let remaining=u32::from_le_bytes(body.get(offset..offset+4)?.try_into().ok()?); offset+=4;
-            (Some(max),Some(remaining))
-        } else {(None,None)};
-        if spell!=0 { auras.push(wow_state::auras::AuraInstance{slot,spell,positive:Some(flags&0x10!=0),caster,max_duration_ms,remaining_ms}); }
+fn parse_aura_update_all(body: &[u8]) -> Option<ProtocolObservation> {
+    let mut offset = 0usize;
+    let entity = read_packed_guid(body, &mut offset)?;
+    let mut auras = Vec::new();
+    while offset < body.len() {
+        let slot = *body.get(offset)?;
+        offset += 1;
+        let spell = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        offset += 4;
+        let flags = *body.get(offset)?;
+        offset += 1;
+        let _level = *body.get(offset)?;
+        offset += 1;
+        let caster = if flags & 0x08 == 0 {
+            Some(read_packed_guid(body, &mut offset)?)
+        } else {
+            None
+        };
+        let (max_duration_ms, remaining_ms) = if flags & 0x20 != 0 {
+            let max = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+            offset += 4;
+            let remaining = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+            offset += 4;
+            (Some(max), Some(remaining))
+        } else {
+            (None, None)
+        };
+        if spell != 0 {
+            auras.push(wow_state::auras::AuraInstance {
+                slot,
+                spell,
+                positive: Some(flags & 0x10 != 0),
+                caster,
+                max_duration_ms,
+                remaining_ms,
+            });
+        }
     }
-    Some(ProtocolObservation::AuraSnapshot{entity,auras})
+    Some(ProtocolObservation::AuraSnapshot { entity, auras })
 }
 
 fn controlled_abilities_observation(opcode: u32, body: &[u8]) -> Option<ProtocolObservation> {
     const SMSG_PET_SPELLS: u32 = 0x0179;
-    if opcode != SMSG_PET_SPELLS || body.len() < 58 { return None; }
+    if opcode != SMSG_PET_SPELLS || body.len() < 58 {
+        return None;
+    }
     let mover = EntityId(u64::from_le_bytes(body.get(0..8)?.try_into().ok()?));
-    if mover.0 == 0 { return None; }
+    if mover.0 == 0 {
+        return None;
+    }
     // AzerothCore VehicleSpellInitialize writes GUID, family, duration, one packed
     // react/command/disable-actions u32, then ten action-bar u32 values.
     let mut offset = 8 + 2 + 4 + 4;
@@ -1314,7 +1962,9 @@ fn controlled_abilities_observation(opcode: u32, body: &[u8]) -> Option<Protocol
         let packed = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
         offset += 4;
         let spell = packed & 0x00FF_FFFF;
-        if spell != 0 && !spells.contains(&spell) { spells.push(spell); }
+        if spell != 0 && !spells.contains(&spell) {
+            spells.push(spell);
+        }
     }
     Some(ProtocolObservation::ControlledAbilities { mover, spells })
 }
@@ -1344,15 +1994,23 @@ fn parse_single_quest_status(body: &[u8]) -> Option<ProtocolObservation> {
 }
 
 fn parse_multiple_quest_status(body: &[u8]) -> Vec<ProtocolObservation> {
-    let Some(count_bytes) = body.get(0..4) else { return Vec::new() };
+    let Some(count_bytes) = body.get(0..4) else {
+        return Vec::new();
+    };
     let count = u32::from_le_bytes(count_bytes.try_into().unwrap_or([0; 4])) as usize;
-    if count > 4096 || body.len() < 4 + count.saturating_mul(9) { return Vec::new(); }
+    if count > 4096 || body.len() < 4 + count.saturating_mul(9) {
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity(count);
     let mut offset = 4;
     for _ in 0..count {
-        let Some(guid_bytes) = body.get(offset..offset + 8) else { break };
+        let Some(guid_bytes) = body.get(offset..offset + 8) else {
+            break;
+        };
         let giver = EntityId(u64::from_le_bytes(guid_bytes.try_into().unwrap_or([0; 8])));
-        let Some(status) = body.get(offset + 8).copied() else { break };
+        let Some(status) = body.get(offset + 8).copied() else {
+            break;
+        };
         out.push(ProtocolObservation::QuestGiverStatus { giver, status });
         offset += 9;
     }
@@ -1360,25 +2018,47 @@ fn parse_multiple_quest_status(body: &[u8]) -> Vec<ProtocolObservation> {
 }
 
 fn parse_quest_list(body: &[u8]) -> Vec<ProtocolObservation> {
-    let Some(guid_bytes) = body.get(0..8) else { return Vec::new() };
+    let Some(guid_bytes) = body.get(0..8) else {
+        return Vec::new();
+    };
     let giver = EntityId(u64::from_le_bytes(guid_bytes.try_into().unwrap_or([0; 8])));
     let mut offset = 8;
-    if read_cstring(body, &mut offset).is_none() { return Vec::new(); }
-    if body.get(offset..offset + 8).is_none() { return Vec::new(); }
-    offset += 8; // emote delay + emote type
-    let Some(count) = body.get(offset).copied() else { return Vec::new() };
-    offset += 1;
-    let mut out = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let Some(quest_bytes) = body.get(offset..offset + 4) else { break };
-        let quest = u32::from_le_bytes(quest_bytes.try_into().unwrap_or([0; 4]));
-        let Some(icon_bytes) = body.get(offset + 4..offset + 8) else { break };
-        let icon = u32::from_le_bytes(icon_bytes.try_into().unwrap_or([0; 4]));
-        if body.get(offset + 8..offset + 17).is_none() { break; }
-        offset += 17; // quest, icon, level, flags, repeatable
-        if read_cstring(body, &mut offset).is_none() { break; }
-        out.push(ProtocolObservation::QuestOffer { giver, quest, icon });
+    if read_cstring(body, &mut offset).is_none() {
+        return Vec::new();
     }
+    if body.get(offset..offset + 8).is_none() {
+        return Vec::new();
+    }
+    offset += 8; // emote delay + emote type
+    let Some(count) = body.get(offset).copied() else {
+        return Vec::new();
+    };
+    offset += 1;
+    let mut offers = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let Some(quest_bytes) = body.get(offset..offset + 4) else {
+            return Vec::new();
+        };
+        let quest = u32::from_le_bytes(quest_bytes.try_into().unwrap_or([0; 4]));
+        let Some(icon_bytes) = body.get(offset + 4..offset + 8) else {
+            return Vec::new();
+        };
+        let icon = u32::from_le_bytes(icon_bytes.try_into().unwrap_or([0; 4]));
+        if body.get(offset + 8..offset + 17).is_none() {
+            return Vec::new();
+        }
+        offset += 17; // quest, icon, level, flags, repeatable
+        if read_cstring(body, &mut offset).is_none() {
+            return Vec::new();
+        }
+        offers.push(ProtocolObservation::QuestOffer { giver, quest, icon });
+    }
+    let mut out = Vec::with_capacity(offers.len() + 1);
+    out.push(ProtocolObservation::QuestGiverListReceived {
+        giver,
+        offer_count: count,
+    });
+    out.extend(offers);
     out
 }
 
@@ -1386,11 +2066,22 @@ fn parse_quest_request_items(body: &[u8]) -> Option<ProtocolObservation> {
     use wow_state::quests::{QuestTurnInDialog, QuestTurnInStage};
     let giver = EntityId(u64::from_le_bytes(body.get(0..8)?.try_into().ok()?));
     let quest = u32::from_le_bytes(body.get(8..12)?.try_into().ok()?);
-    if body.len() < 28 { return None; }
-    let completion_code = u32::from_le_bytes(body.get(body.len().checked_sub(16)?..body.len().checked_sub(12)?)?.try_into().ok()?);
+    if body.len() < 28 {
+        return None;
+    }
+    let completion_code = u32::from_le_bytes(
+        body.get(body.len().checked_sub(16)?..body.len().checked_sub(12)?)?
+            .try_into()
+            .ok()?,
+    );
     Some(ProtocolObservation::QuestTurnInDialog {
         quest,
-        dialog: QuestTurnInDialog { giver, stage: QuestTurnInStage::RequestItems { can_complete: completion_code == 3 } },
+        dialog: QuestTurnInDialog {
+            giver,
+            stage: QuestTurnInStage::RequestItems {
+                can_complete: completion_code == 3,
+            },
+        },
     })
 }
 
@@ -1407,17 +2098,26 @@ fn parse_quest_offer_reward(body: &[u8]) -> Option<ProtocolObservation> {
     let reward_choices = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
     Some(ProtocolObservation::QuestTurnInDialog {
         quest,
-        dialog: QuestTurnInDialog { giver, stage: QuestTurnInStage::OfferReward { reward_choices } },
+        dialog: QuestTurnInDialog {
+            giver,
+            stage: QuestTurnInStage::OfferReward { reward_choices },
+        },
     })
 }
 
 fn parse_quest_query_response(body: &[u8]) -> Option<ProtocolObservation> {
-    use wow_state::quests::{QuestDefinition, QuestItemObjective, QuestTargetKind, QuestTargetObjective};
+    use wow_state::quests::{
+        QuestDefinition, QuestItemObjective, QuestTargetKind, QuestTargetObjective,
+    };
     // AzerothCore 3.3.5a writes 65 four-byte fields before the five strings.
-    if body.len() < 260 { return None; }
+    if body.len() < 260 {
+        return None;
+    }
     let read_u32 = |index: usize| -> Option<u32> {
         let offset = index.checked_mul(4)?;
-        Some(u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?))
+        Some(u32::from_le_bytes(
+            body.get(offset..offset + 4)?.try_into().ok()?,
+        ))
     };
     let quest = read_u32(0)?;
     let poi_map_raw = read_u32(61)?;
@@ -1432,10 +2132,14 @@ fn parse_quest_query_response(body: &[u8]) -> Option<ProtocolObservation> {
 
     let mut raw_targets = Vec::with_capacity(4);
     for _ in 0..4 {
-        let encoded = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?); offset += 4;
-        let required = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?); offset += 4;
-        let item_drop = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?); offset += 4;
-        let _source_count = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?); offset += 4;
+        let encoded = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        offset += 4;
+        let required = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        offset += 4;
+        let item_drop = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        offset += 4;
+        let _source_count = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        offset += 4;
         let (kind, entry) = if encoded & 0x8000_0000 != 0 {
             (QuestTargetKind::GameObject, encoded & 0x7FFF_FFFF)
         } else {
@@ -1445,27 +2149,51 @@ fn parse_quest_query_response(body: &[u8]) -> Option<ProtocolObservation> {
     }
     let mut items = Vec::new();
     for _ in 0..6 {
-        let item = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?); offset += 4;
-        let required = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?); offset += 4;
-        if item != 0 && required != 0 { items.push(QuestItemObjective { item, required }); }
+        let item = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        offset += 4;
+        let required = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        offset += 4;
+        if item != 0 && required != 0 {
+            items.push(QuestItemObjective { item, required });
+        }
     }
     let mut texts = Vec::with_capacity(4);
-    for _ in 0..4 { texts.push(read_cstring(body, &mut offset).unwrap_or_default().to_owned()); }
-    let targets = raw_targets.into_iter().enumerate().filter_map(|(i, (kind, entry, required, item_drop))| {
-        (entry != 0 && required != 0).then(|| QuestTargetObjective {
-            slot: i, kind, entry, required, item_drop, text: texts.get(i).cloned().unwrap_or_default(),
+    for _ in 0..4 {
+        texts.push(
+            read_cstring(body, &mut offset)
+                .unwrap_or_default()
+                .to_owned(),
+        );
+    }
+    let targets = raw_targets
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, (kind, entry, required, item_drop))| {
+            (entry != 0 && required != 0).then(|| QuestTargetObjective {
+                slot: i,
+                kind,
+                entry,
+                required,
+                item_drop,
+                text: texts.get(i).cloned().unwrap_or_default(),
+            })
         })
-    }).collect();
-    let poi_valid = poi_map_raw != u32::MAX && poi_x.is_finite() && poi_y.is_finite() && (poi_x != 0.0 || poi_y != 0.0);
-    Some(ProtocolObservation::QuestDefinition { definition: QuestDefinition {
-        quest,
-        title,
-        poi_map: poi_valid.then_some(poi_map_raw),
-        poi_x: poi_valid.then_some(poi_x),
-        poi_y: poi_valid.then_some(poi_y),
-        targets,
-        items,
-    }})
+        .collect();
+    let poi_valid = poi_map_raw != u32::MAX
+        && poi_x.is_finite()
+        && poi_y.is_finite()
+        && (poi_x != 0.0 || poi_y != 0.0);
+    Some(ProtocolObservation::QuestDefinition {
+        definition: QuestDefinition {
+            quest,
+            title,
+            poi_map: poi_valid.then_some(poi_map_raw),
+            poi_x: poi_valid.then_some(poi_x),
+            poi_y: poi_valid.then_some(poi_y),
+            targets,
+            items,
+        },
+    })
 }
 
 fn read_cstring<'a>(body: &'a [u8], offset: &mut usize) -> Option<&'a str> {
@@ -1476,8 +2204,16 @@ fn read_cstring<'a>(body: &'a [u8], offset: &mut usize) -> Option<&'a str> {
     Some(text)
 }
 
-fn movement_matches_bot_visual(visual: WorldPosition, bot_opcode: u32, point: Vec3, orientation: f32, client_opcode: u32) -> bool {
-    if !point.is_finite() || !orientation.is_finite() { return false; }
+fn movement_matches_bot_visual(
+    visual: WorldPosition,
+    bot_opcode: u32,
+    point: Vec3,
+    orientation: f32,
+    client_opcode: u32,
+) -> bool {
+    if !point.is_finite() || !orientation.is_finite() {
+        return false;
+    }
     let delta = (visual.orientation - orientation).rem_euclid(std::f32::consts::TAU);
     let angular = delta.min(std::f32::consts::TAU - delta);
     point.distance(visual.point) <= 0.25
@@ -1486,19 +2222,57 @@ fn movement_matches_bot_visual(visual: WorldPosition, bot_opcode: u32, point: Ve
 }
 
 fn is_player_movement_opcode(opcode: u32) -> bool {
-    matches!(opcode,
-        0x0B5 | 0x0B6 | 0x0B7 | 0x0B8 | 0x0B9 | 0x0BA | 0x0BB | 0x0BC | 0x0BD | 0x0BE
-        | 0x0BF | 0x0C0 | 0x0C1 | 0x0C2 | 0x0C3 | 0x0C5 | 0x0C9 | 0x0CA | 0x0CB
-        | 0x0DA | 0x0DB | 0x0EE | 0x359 | 0x35A | 0x3A7)
+    matches!(
+        opcode,
+        0x0B5
+            | 0x0B6
+            | 0x0B7
+            | 0x0B8
+            | 0x0B9
+            | 0x0BA
+            | 0x0BB
+            | 0x0BC
+            | 0x0BD
+            | 0x0BE
+            | 0x0BF
+            | 0x0C0
+            | 0x0C1
+            | 0x0C2
+            | 0x0C3
+            | 0x0C5
+            | 0x0C9
+            | 0x0CA
+            | 0x0CB
+            | 0x0DA
+            | 0x0DB
+            | 0x0EE
+            | 0x359
+            | 0x35A
+            | 0x3A7
+    )
 }
 
 fn is_explicit_player_movement_intent(opcode: u32) -> bool {
     // Start/change opcodes represent direct keyboard/mouse intent. Heartbeat,
     // stop, fall-land, and run/walk-mode packets are state feedback and are
     // not sufficient by themselves to steal locomotion from an active bot.
-    matches!(opcode,
-        0x0B5 | 0x0B6 | 0x0B8 | 0x0B9 | 0x0BB | 0x0BC | 0x0BD
-        | 0x0BF | 0x0C0 | 0x0CA | 0x0DA | 0x0DB | 0x359 | 0x3A7)
+    matches!(
+        opcode,
+        0x0B5
+            | 0x0B6
+            | 0x0B8
+            | 0x0B9
+            | 0x0BB
+            | 0x0BC
+            | 0x0BD
+            | 0x0BF
+            | 0x0C0
+            | 0x0CA
+            | 0x0DA
+            | 0x0DB
+            | 0x359
+            | 0x3A7
+    )
 }
 
 fn proxy_chat(body: &[u8]) -> Option<(crate::commands::chat::ChatFamily, &str)> {
@@ -1524,38 +2298,67 @@ fn proxy_chat(body: &[u8]) -> Option<(crate::commands::chat::ChatFamily, &str)> 
     };
     let text = match chat_type {
         1 | 2 | 3 | 4 | 5 | 6 | 10 | 23 | 24 | 39 | 40 | 44 | 45 | 51 => cstring(payload)?.0,
-        7 | 17 => { let (_, consumed) = cstring(payload)?; cstring(payload.get(consumed..)?)?.0 }
+        7 | 17 => {
+            let (_, consumed) = cstring(payload)?;
+            cstring(payload.get(consumed..)?)?.0
+        }
         _ => return None,
     };
     Some((family, text))
 }
 
-async fn handle_log_command(logs: &ActionLogManager, account: &str, command: crate::commands::log::LogCommand) {
+async fn handle_log_command(
+    logs: &ActionLogManager,
+    account: &str,
+    command: crate::commands::log::LogCommand,
+) {
     use crate::commands::log::LogCommand;
     match command {
         LogCommand::Start => match logs.start(account).await {
-            Ok(path) => tracing::info!(account=%account, path=%path.display(), "action logging started"),
-            Err(error) => tracing::error!(account=%account, %error, "failed to start action logging"),
+            Ok(path) => {
+                tracing::info!(account=%account, path=%path.display(), "action logging started")
+            }
+            Err(error) => {
+                tracing::error!(account=%account, %error, "failed to start action logging")
+            }
         },
         LogCommand::Stop => match logs.stop(account).await {
-            Ok(Some(path)) => tracing::info!(account=%account, path=%path.display(), "action logging stopped"),
+            Ok(Some(path)) => {
+                tracing::info!(account=%account, path=%path.display(), "action logging stopped")
+            }
             Ok(None) => tracing::info!(account=%account, "action logging is not active"),
-            Err(error) => tracing::error!(account=%account, %error, "failed to stop action logging"),
+            Err(error) => {
+                tracing::error!(account=%account, %error, "failed to stop action logging")
+            }
         },
         LogCommand::Status => match logs.status(account).await {
-            Some(path) => tracing::info!(account=%account, path=%path.display(), "action logging is active"),
+            Some(path) => {
+                tracing::info!(account=%account, path=%path.display(), "action logging is active")
+            }
             None => tracing::info!(account=%account, "action logging is inactive"),
         },
         LogCommand::Mark(label) => match logs.mark(account, label.as_deref()).await {
             Ok(true) => tracing::info!(account=%account, ?label, "action log marker written"),
-            Ok(false) => tracing::info!(account=%account, "action logging is not active; marker ignored"),
-            Err(error) => tracing::error!(account=%account, %error, "failed to write action log marker"),
+            Ok(false) => {
+                tracing::info!(account=%account, "action logging is not active; marker ignored")
+            }
+            Err(error) => {
+                tracing::error!(account=%account, %error, "failed to write action log marker")
+            }
         },
     }
 }
 
-fn port_of(bind: &str) -> Result<u16> { Ok(bind.parse::<SocketAddr>()?.port()) }
-fn advertised(host: &str, port: u16) -> String { if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") } }
+fn port_of(bind: &str) -> Result<u16> {
+    Ok(bind.parse::<SocketAddr>()?.port())
+}
+fn advertised(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
 
 #[cfg(test)]
 mod runtime_chat_tests {
@@ -1592,30 +2395,60 @@ mod runtime_chat_tests {
             let body = chat_body(chat_type, Some(target), ".log status");
             let (family, extracted) = proxy_chat(&body).expect("chat should parse");
             assert_eq!(extracted, ".log status");
-            assert!(matches!(commands::parse_local(extracted, family, true, MissionId(1)).unwrap(), Some(LocalCommand::Log(_))));
+            assert!(matches!(
+                commands::parse_local(extracted, family, true, MissionId(1)).unwrap(),
+                Some(LocalCommand::Log(_))
+            ));
         }
     }
 
     #[test]
     fn matching_bot_facing_echo_does_not_need_human_takeover() {
-        let visual = WorldPosition { map: 1, point: Vec3::new(1.0, 2.0, 3.0), orientation: 1.25 };
-        assert!(movement_matches_bot_visual(visual, 0x0DA, visual.point, 1.25, 0x0DA));
-        assert!(!movement_matches_bot_visual(visual, 0x0DA, Vec3::new(2.0, 2.0, 3.0), 1.25, 0x0DA));
+        let visual = WorldPosition {
+            map: 1,
+            point: Vec3::new(1.0, 2.0, 3.0),
+            orientation: 1.25,
+        };
+        assert!(movement_matches_bot_visual(
+            visual,
+            0x0DA,
+            visual.point,
+            1.25,
+            0x0DA
+        ));
+        assert!(!movement_matches_bot_visual(
+            visual,
+            0x0DA,
+            Vec3::new(2.0, 2.0, 3.0),
+            1.25,
+            0x0DA
+        ));
     }
 
     #[test]
     fn passive_movement_feedback_does_not_count_as_player_intent() {
-        for opcode in [0x0B7, 0x0BA, 0x0BE, 0x0C1, 0x0C2, 0x0C3, 0x0C9, 0x0CB, 0x0EE, 0x35A] {
+        for opcode in [
+            0x0B7, 0x0BA, 0x0BE, 0x0C1, 0x0C2, 0x0C3, 0x0C9, 0x0CB, 0x0EE, 0x35A,
+        ] {
             assert!(is_player_movement_opcode(opcode));
-            assert!(!is_explicit_player_movement_intent(opcode), "opcode {opcode:#x} must remain passive");
+            assert!(
+                !is_explicit_player_movement_intent(opcode),
+                "opcode {opcode:#x} must remain passive"
+            );
         }
     }
 
     #[test]
     fn explicit_start_turn_jump_and_facing_packets_take_player_control() {
-        for opcode in [0x0B5, 0x0B6, 0x0B8, 0x0B9, 0x0BB, 0x0BC, 0x0BD, 0x0BF, 0x0C0, 0x0CA, 0x0DA, 0x0DB, 0x359, 0x3A7] {
+        for opcode in [
+            0x0B5, 0x0B6, 0x0B8, 0x0B9, 0x0BB, 0x0BC, 0x0BD, 0x0BF, 0x0C0, 0x0CA, 0x0DA, 0x0DB,
+            0x359, 0x3A7,
+        ] {
             assert!(is_player_movement_opcode(opcode));
-            assert!(is_explicit_player_movement_intent(opcode), "opcode {opcode:#x} must count as explicit intent");
+            assert!(
+                is_explicit_player_movement_intent(opcode),
+                "opcode {opcode:#x} must count as explicit intent"
+            );
         }
     }
 }
@@ -1664,40 +2497,65 @@ mod quest_protocol_tests {
         body.extend_from_slice(&0_u32.to_le_bytes());
         body.extend_from_slice(&0x08000000_u32.to_le_bytes());
         body.extend_from_slice(&(51858_u32 | (8_u32 << 24)).to_le_bytes());
-        for _ in 1..10 { body.extend_from_slice(&0_u32.to_le_bytes()); }
-        body.push(0); body.push(0);
+        for _ in 1..10 {
+            body.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        body.push(0);
+        body.push(0);
         let obs = controlled_abilities_observation(0x0179, &body).expect("vehicle spell packet");
-        assert!(matches!(obs, ProtocolObservation::ControlledAbilities { mover: EntityId(28511), ref spells } if spells == &vec![51858]));
+        assert!(
+            matches!(obs, ProtocolObservation::ControlledAbilities { mover: EntityId(28511), ref spells } if spells == &vec![51858])
+        );
     }
 
     #[test]
     fn encodes_gameobject_spell_with_gameobject_target() {
         let mut time = 1;
         let (frame, movement) = encode_gameplay_command(
-            GameplayCommand::CastGameObject { spell: 6247, target: EntityId(191609), report_use: true },
+            GameplayCommand::CastGameObject {
+                spell: 6247,
+                target: EntityId(191609),
+                report_use: true,
+            },
             None,
             None,
             0,
             &mut time,
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(frame.opcode, 0x012E);
         assert!(movement.is_none());
         assert_eq!(frame.body[0], 0);
-        assert_eq!(u32::from_le_bytes(frame.body[1..5].try_into().unwrap()), 6247);
-        assert_eq!(u32::from_le_bytes(frame.body[6..10].try_into().unwrap()), 0x0000_0800);
+        assert_eq!(
+            u32::from_le_bytes(frame.body[1..5].try_into().unwrap()),
+            6247
+        );
+        assert_eq!(
+            u32::from_le_bytes(frame.body[6..10].try_into().unwrap()),
+            0x0000_0800
+        );
     }
 
     #[test]
     fn face_direction_uses_wrath_set_facing_movement_opcode() {
         let mut time = 10;
-        let current = WorldPosition { map: 1, point: Vec3::new(1.0, 2.0, 3.0), orientation: 0.0 };
+        let current = WorldPosition {
+            map: 1,
+            point: Vec3::new(1.0, 2.0, 3.0),
+            orientation: 0.0,
+        };
         let (frame, movement) = encode_gameplay_command(
-            GameplayCommand::FaceDirection { orientation: std::f32::consts::PI },
+            GameplayCommand::FaceDirection {
+                orientation: std::f32::consts::PI,
+            },
             Some(EntityId(77)),
             Some(current),
             0,
             &mut time,
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(frame.opcode, 0x00DA);
         let (position, moving, _, _) = movement.expect("facing updates canonical movement state");
         assert!(!moving);
@@ -1706,9 +2564,32 @@ mod quest_protocol_tests {
 
     #[test]
     fn targeted_spell_correlation_covers_item_and_controlled_casts() {
-        assert_eq!(bot_targeted_cast(&GameplayCommand::VehicleCast { spell: 51858, target: Some(EntityId(2)) }), Some((51858, Some(EntityId(2)))));
-        assert_eq!(bot_targeted_cast(&GameplayCommand::UseItemInstance { item: 16114, item_guid: EntityId(9), backpack_slot: 3, spell: 19938, target: Some(EntityId(4)), cast_count: 0 }), Some((19938, Some(EntityId(4)))));
-        assert_eq!(bot_targeted_cast(&GameplayCommand::CastGameObject { spell: 6247, target: EntityId(5), report_use: true }), Some((6247, Some(EntityId(5)))));
+        assert_eq!(
+            bot_targeted_cast(&GameplayCommand::VehicleCast {
+                spell: 51858,
+                target: Some(EntityId(2))
+            }),
+            Some((51858, Some(EntityId(2))))
+        );
+        assert_eq!(
+            bot_targeted_cast(&GameplayCommand::UseItemInstance {
+                item: 16114,
+                item_guid: EntityId(9),
+                backpack_slot: 3,
+                spell: 19938,
+                target: Some(EntityId(4)),
+                cast_count: 0
+            }),
+            Some((19938, Some(EntityId(4))))
+        );
+        assert_eq!(
+            bot_targeted_cast(&GameplayCommand::CastGameObject {
+                spell: 6247,
+                target: EntityId(5),
+                report_use: true
+            }),
+            Some((6247, Some(EntityId(5))))
+        );
     }
 
     #[test]
@@ -1722,33 +2603,72 @@ mod quest_protocol_tests {
 
     #[test]
     fn parses_initial_spellbook_and_aura_updates_for_maintenance() {
-        let mut spells=vec![0_u8]; spells.extend_from_slice(&2_u16.to_le_bytes());
-        spells.extend_from_slice(&1459_u32.to_le_bytes()); spells.extend_from_slice(&0_u16.to_le_bytes());
-        spells.extend_from_slice(&1243_u32.to_le_bytes()); spells.extend_from_slice(&0_u16.to_le_bytes());
-        let observed=parse_initial_spells(&spells);
-        assert!(observed.iter().any(|o| matches!(o,ProtocolObservation::SpellKnown{spell:1459})));
-        assert!(observed.iter().any(|o| matches!(o,ProtocolObservation::SpellKnown{spell:1243})));
+        let mut spells = vec![0_u8];
+        spells.extend_from_slice(&2_u16.to_le_bytes());
+        spells.extend_from_slice(&1459_u32.to_le_bytes());
+        spells.extend_from_slice(&0_u16.to_le_bytes());
+        spells.extend_from_slice(&1243_u32.to_le_bytes());
+        spells.extend_from_slice(&0_u16.to_le_bytes());
+        let observed = parse_initial_spells(&spells);
+        assert!(
+            observed
+                .iter()
+                .any(|o| matches!(o, ProtocolObservation::SpellKnown { spell: 1459 }))
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|o| matches!(o, ProtocolObservation::SpellKnown { spell: 1243 }))
+        );
 
-        let mut aura=Vec::new(); push_packed_guid(&mut aura,EntityId(7)); aura.push(3); aura.extend_from_slice(&1459_u32.to_le_bytes());
-        assert!(matches!(parse_aura_update(&aura),Some(ProtocolObservation::AuraSlot{entity:EntityId(7),slot:3,aura:Some(wow_state::auras::AuraInstance{spell:1459,..})})));
-        let mut removed=Vec::new(); push_packed_guid(&mut removed,EntityId(7)); removed.push(3); removed.extend_from_slice(&0_u32.to_le_bytes());
-        assert!(matches!(parse_aura_update(&removed),Some(ProtocolObservation::AuraSlot{entity:EntityId(7),slot:3,aura:None})));
+        let mut aura = Vec::new();
+        push_packed_guid(&mut aura, EntityId(7));
+        aura.push(3);
+        aura.extend_from_slice(&1459_u32.to_le_bytes());
+        assert!(matches!(
+            parse_aura_update(&aura),
+            Some(ProtocolObservation::AuraSlot {
+                entity: EntityId(7),
+                slot: 3,
+                aura: Some(wow_state::auras::AuraInstance { spell: 1459, .. })
+            })
+        ));
+        let mut removed = Vec::new();
+        push_packed_guid(&mut removed, EntityId(7));
+        removed.push(3);
+        removed.extend_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            parse_aura_update(&removed),
+            Some(ProtocolObservation::AuraSlot {
+                entity: EntityId(7),
+                slot: 3,
+                aura: None
+            })
+        ));
     }
 
     #[test]
     fn encodes_controlled_unit_spell_with_unit_target() {
         let mut time = 1;
         let (frame, movement) = encode_gameplay_command(
-            GameplayCommand::VehicleCast { spell: 51858, target: Some(EntityId(28525)) },
+            GameplayCommand::VehicleCast {
+                spell: 51858,
+                target: Some(EntityId(28525)),
+            },
             Some(EntityId(28511)),
             None,
             0,
             &mut time,
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(frame.opcode, 0x012E);
         assert!(movement.is_none());
         assert_eq!(frame.body[0], 0);
-        assert_eq!(u32::from_le_bytes(frame.body[1..5].try_into().unwrap()), 51858);
+        assert_eq!(
+            u32::from_le_bytes(frame.body[1..5].try_into().unwrap()),
+            51858
+        );
         assert_eq!(u32::from_le_bytes(frame.body[6..10].try_into().unwrap()), 2);
     }
 
@@ -1761,10 +2681,19 @@ mod quest_protocol_tests {
         body.extend_from_slice(&22_u64.to_le_bytes());
         body.push(5);
         let observations = parse_multiple_quest_status(&body);
-        assert!(matches!(observations.as_slice(), [
-            ProtocolObservation::QuestGiverStatus { giver: EntityId(11), status: 8 },
-            ProtocolObservation::QuestGiverStatus { giver: EntityId(22), status: 5 },
-        ]));
+        assert!(matches!(
+            observations.as_slice(),
+            [
+                ProtocolObservation::QuestGiverStatus {
+                    giver: EntityId(11),
+                    status: 8
+                },
+                ProtocolObservation::QuestGiverStatus {
+                    giver: EntityId(22),
+                    status: 5
+                },
+            ]
+        ));
     }
 
     #[test]
@@ -1782,7 +2711,49 @@ mod quest_protocol_tests {
         body.push(0);
         body.extend_from_slice(b"A Test Quest\0");
         let observations = parse_quest_list(&body);
-        assert!(matches!(observations.as_slice(), [ProtocolObservation::QuestOffer { giver: EntityId(99), quest: 1234, icon: 2 }]));
+        assert!(matches!(
+            observations.as_slice(),
+            [
+                ProtocolObservation::QuestGiverListReceived {
+                    giver: EntityId(99),
+                    offer_count: 1
+                },
+                ProtocolObservation::QuestOffer {
+                    giver: EntityId(99),
+                    quest: 1234,
+                    icon: 2
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn parses_empty_quest_giver_list_as_response_evidence() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&99_u64.to_le_bytes());
+        body.extend_from_slice(b"Greetings\0");
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.push(0);
+        assert!(matches!(
+            parse_quest_list(&body).as_slice(),
+            [ProtocolObservation::QuestGiverListReceived {
+                giver: EntityId(99),
+                offer_count: 0
+            }]
+        ));
+    }
+
+    #[test]
+    fn headless_keepalive_uses_wrath_ping_fields() {
+        let ping = make_headless_ping(0x1234_5678, 42);
+        assert_eq!(ping.opcode, 0x01DC);
+        assert_eq!(ping.body, [0x78, 0x56, 0x34, 0x12, 42, 0, 0, 0]);
+        assert_eq!(
+            parse_headless_pong(&0x1234_5678_u32.to_le_bytes()),
+            Some(0x1234_5678)
+        );
+        assert_eq!(parse_headless_pong(&[1, 2]), None);
     }
 
     #[test]
@@ -1793,7 +2764,9 @@ mod quest_protocol_tests {
         fields[62] = 100.0_f32.to_bits();
         fields[63] = 200.0_f32.to_bits();
         let mut body = Vec::new();
-        for value in fields { body.extend_from_slice(&value.to_le_bytes()); }
+        for value in fields {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
         for text in ["Quest Title", "Objectives", "Details", "Area", "Complete"] {
             body.extend_from_slice(text.as_bytes());
             body.push(0);
@@ -1816,11 +2789,19 @@ mod quest_protocol_tests {
         // Six item objective slots.
         body.extend_from_slice(&99_u32.to_le_bytes());
         body.extend_from_slice(&4_u32.to_le_bytes());
-        for _ in 0..5 { body.extend_from_slice(&0_u32.to_le_bytes()); body.extend_from_slice(&0_u32.to_le_bytes()); }
-        for text in ["Kill wolves", "Use object", "", ""] { body.extend_from_slice(text.as_bytes()); body.push(0); }
+        for _ in 0..5 {
+            body.extend_from_slice(&0_u32.to_le_bytes());
+            body.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        for text in ["Kill wolves", "Use object", "", ""] {
+            body.extend_from_slice(text.as_bytes());
+            body.push(0);
+        }
 
         let observation = parse_quest_query_response(&body).expect("quest definition should parse");
-        let ProtocolObservation::QuestDefinition { definition } = observation else { panic!("wrong observation"); };
+        let ProtocolObservation::QuestDefinition { definition } = observation else {
+            panic!("wrong observation");
+        };
         assert_eq!(definition.quest, 1234);
         assert_eq!(definition.title, "Quest Title");
         assert_eq!(definition.poi_map, Some(0));
@@ -1828,7 +2809,10 @@ mod quest_protocol_tests {
         assert_eq!(definition.targets[0].slot, 0);
         assert_eq!(definition.targets[0].entry, 77);
         assert_eq!(definition.targets[1].slot, 1);
-        assert!(matches!(definition.targets[1].kind, wow_state::quests::QuestTargetKind::GameObject));
+        assert!(matches!(
+            definition.targets[1].kind,
+            wow_state::quests::QuestTargetKind::GameObject
+        ));
         assert_eq!(definition.items.len(), 1);
         assert_eq!(definition.items[0].item, 99);
         assert_eq!(definition.items[0].required, 4);
@@ -1845,14 +2829,15 @@ mod quest_protocol_tests {
         for slot in [1_u8, 2, 3] {
             body.push(slot);
             body.extend_from_slice(&100_u32.to_le_bytes()); // item id
-            body.extend_from_slice(&1_u32.to_le_bytes());   // count
+            body.extend_from_slice(&1_u32.to_le_bytes()); // count
             body.extend_from_slice(&200_u32.to_le_bytes()); // display id
             body.extend_from_slice(&0_u32.to_le_bytes());
             body.extend_from_slice(&0_u32.to_le_bytes());
             body.push(0);
         }
         assert_eq!(body.len(), 80);
-        let (parsed_guid, gold, slots) = parse_loot_response(&body).expect("loot response should parse");
+        let (parsed_guid, gold, slots) =
+            parse_loot_response(&body).expect("loot response should parse");
         assert_eq!(parsed_guid, guid);
         assert_eq!(gold, 7);
         assert_eq!(slots, vec![1, 2, 3]);
@@ -1871,7 +2856,16 @@ mod quest_protocol_tests {
         let n = request.len();
         request[n - 16..n - 12].copy_from_slice(&3_u32.to_le_bytes());
         let parsed = parse_quest_request_items(&request).expect("request-items should parse");
-        assert!(matches!(parsed, ProtocolObservation::QuestTurnInDialog { quest: 42, dialog: wow_state::quests::QuestTurnInDialog { giver: EntityId(77), stage: wow_state::quests::QuestTurnInStage::RequestItems { can_complete: true } } }));
+        assert!(matches!(
+            parsed,
+            ProtocolObservation::QuestTurnInDialog {
+                quest: 42,
+                dialog: wow_state::quests::QuestTurnInDialog {
+                    giver: EntityId(77),
+                    stage: wow_state::quests::QuestTurnInStage::RequestItems { can_complete: true }
+                }
+            }
+        ));
 
         let mut offer = Vec::new();
         offer.extend_from_slice(&giver.to_le_bytes());
@@ -1883,23 +2877,54 @@ mod quest_protocol_tests {
         offer.extend_from_slice(&0_u32.to_le_bytes());
         offer.extend_from_slice(&2_u32.to_le_bytes());
         let parsed = parse_quest_offer_reward(&offer).expect("offer-reward should parse");
-        assert!(matches!(parsed, ProtocolObservation::QuestTurnInDialog { quest: 42, dialog: wow_state::quests::QuestTurnInDialog { giver: EntityId(77), stage: wow_state::quests::QuestTurnInStage::OfferReward { reward_choices: 2 } } }));
+        assert!(matches!(
+            parsed,
+            ProtocolObservation::QuestTurnInDialog {
+                quest: 42,
+                dialog: wow_state::quests::QuestTurnInDialog {
+                    giver: EntityId(77),
+                    stage: wow_state::quests::QuestTurnInStage::OfferReward { reward_choices: 2 }
+                }
+            }
+        ));
     }
 
     #[test]
     fn quest_encoder_matches_azerothcore_handlers() {
         let mut time = 1;
-        let (query, _) = encode_gameplay_command(GameplayCommand::QueryQuestGivers, None, None, 0, &mut time).unwrap().unwrap();
+        let (query, _) =
+            encode_gameplay_command(GameplayCommand::QueryQuestGivers, None, None, 0, &mut time)
+                .unwrap()
+                .unwrap();
         assert_eq!(query.opcode, 0x0417);
         assert!(query.body.is_empty());
 
         let mut time = 1;
-        let (hello, _) = encode_gameplay_command(GameplayCommand::Interact(EntityId(77)), None, None, 0, &mut time).unwrap().unwrap();
+        let (hello, _) = encode_gameplay_command(
+            GameplayCommand::Interact(EntityId(77)),
+            None,
+            None,
+            0,
+            &mut time,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hello.opcode, 0x0184);
         assert_eq!(hello.body, 77_u64.to_le_bytes());
 
         let mut time = 1;
-        let (accept, _) = encode_gameplay_command(GameplayCommand::AcceptQuest { quest: 42, giver: EntityId(77) }, None, None, 0, &mut time).unwrap().unwrap();
+        let (accept, _) = encode_gameplay_command(
+            GameplayCommand::AcceptQuest {
+                quest: 42,
+                giver: EntityId(77),
+            },
+            None,
+            None,
+            0,
+            &mut time,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(accept.opcode, 0x0189);
         assert_eq!(accept.body.len(), 16);
         assert_eq!(&accept.body[0..8], &77_u64.to_le_bytes());
@@ -1907,13 +2932,36 @@ mod quest_protocol_tests {
         assert_eq!(&accept.body[12..16], &0_u32.to_le_bytes());
 
         let mut time = 1;
-        let (request_reward, _) = encode_gameplay_command(GameplayCommand::RequestQuestReward { quest: 42, giver: EntityId(77) }, None, None, 0, &mut time).unwrap().unwrap();
+        let (request_reward, _) = encode_gameplay_command(
+            GameplayCommand::RequestQuestReward {
+                quest: 42,
+                giver: EntityId(77),
+            },
+            None,
+            None,
+            0,
+            &mut time,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(request_reward.opcode, 0x018C);
         assert_eq!(&request_reward.body[0..8], &77_u64.to_le_bytes());
         assert_eq!(&request_reward.body[8..12], &42_u32.to_le_bytes());
 
         let mut time = 1;
-        let (choose_reward, _) = encode_gameplay_command(GameplayCommand::ChooseQuestReward { quest: 42, giver: EntityId(77), reward: 0 }, None, None, 0, &mut time).unwrap().unwrap();
+        let (choose_reward, _) = encode_gameplay_command(
+            GameplayCommand::ChooseQuestReward {
+                quest: 42,
+                giver: EntityId(77),
+                reward: 0,
+            },
+            None,
+            None,
+            0,
+            &mut time,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(choose_reward.opcode, 0x018E);
         assert_eq!(&choose_reward.body[12..16], &0_u32.to_le_bytes());
     }

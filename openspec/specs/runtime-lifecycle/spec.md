@@ -160,3 +160,22 @@ Each configured lane SHALL own a bounded periodic execution clock that advances 
 - **WHEN** one or more scheduled ticks are missed because the lane is busy
 - **THEN** the runtime skips or coalesces stale ticks
 - **AND** it does not enqueue an unbounded tick backlog
+
+### Requirement: Headless world sessions remain active and recover from lost frames
+The headless client SHALL send a Wrath keepalive ping at an interval shorter than the configured server active-session timeout. The upstream frame reader SHALL continue independently while gameplay commands and keepalives are processed. A disconnected lane SHALL reconnect with a bounded retry delay, and the supervisor SHALL remain loaded as a manually started macOS service until stopped.
+
+#### Scenario: Headless session remains idle
+- **GIVEN** a headless account has entered the world
+- **WHEN** no gameplay command is sent for longer than the server's active-session timeout
+- **THEN** the proxy sends periodic keepalive pings and handles their pong responses
+- **AND** it keeps reading complete upstream frames while other branches of the session loop run
+
+#### Scenario: Headless lane loses its upstream connection
+- **WHEN** one headless account's upstream connection closes
+- **THEN** that account reconnects with a bounded retry delay
+- **AND** unrelated account lanes remain active
+
+#### Scenario: Supervisor starts as a local background service
+- **WHEN** the operator starts the wow-bot service
+- **THEN** launchd keeps the supervisor and its worker processes alive after the starting shell exits
+- **AND** the service remains manually loaded until the operator stops it

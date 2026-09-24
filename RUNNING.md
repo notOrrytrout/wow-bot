@@ -69,6 +69,19 @@ The supervisor binds the worker-control socket, starts one worker process per en
 
 Set `RUST_LOG=debug` or `RUST_LOG=trace` for more diagnostics.
 
+## macOS background service
+
+Use the repository service script to keep the supervisor running after the terminal closes. The script builds the supervisor and worker when required, writes its launchd plist under the ignored `wow-bot-data/service/` directory, and loads it only when you start it. On macOS, it copies the plist and binaries to the user temporary directory because launchd cannot open this external volume's output path or executable directly. It does not enable automatic login startup.
+
+```sh
+./tools/wow-bot-service.sh start
+./tools/wow-bot-service.sh status
+./tools/wow-bot-service.sh restart
+./tools/wow-bot-service.sh stop
+```
+
+The supervisor log remains at `wow-bot-data/logs/wow-bot.log`. Launchd captures stdout and stderr in the user temporary directory as `wow-bot-supervisor-<uid>.log`; macOS does not allow launchd to open an external-volume log path for this job.
+
 ## World-knowledge generator
 
 With no output argument, generated knowledge is written under the bot-owned `generated/` directory:

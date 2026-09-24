@@ -1,1 +1,23 @@
-use serde::{de::DeserializeOwned,Serialize}; use thiserror::Error; #[derive(Debug,Error)] pub enum CodecError{#[error("json: {0}")] Json(#[from] serde_json::Error),#[error("frame too large")] TooLarge} pub const MAX_FRAME:usize=4*1024*1024; pub fn encode<T:Serialize>(v:&T)->Result<Vec<u8>,CodecError>{let b=serde_json::to_vec(v)?;if b.len()>MAX_FRAME{return Err(CodecError::TooLarge)} Ok(b)} pub fn decode<T:DeserializeOwned>(b:&[u8])->Result<T,CodecError>{if b.len()>MAX_FRAME{return Err(CodecError::TooLarge)} Ok(serde_json::from_slice(b)?)}
+use serde::{Serialize, de::DeserializeOwned};
+use thiserror::Error;
+#[derive(Debug, Error)]
+pub enum CodecError {
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("frame too large")]
+    TooLarge,
+}
+pub const MAX_FRAME: usize = 4 * 1024 * 1024;
+pub fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>, CodecError> {
+    let b = serde_json::to_vec(v)?;
+    if b.len() > MAX_FRAME {
+        return Err(CodecError::TooLarge);
+    }
+    Ok(b)
+}
+pub fn decode<T: DeserializeOwned>(b: &[u8]) -> Result<T, CodecError> {
+    if b.len() > MAX_FRAME {
+        return Err(CodecError::TooLarge);
+    }
+    Ok(serde_json::from_slice(b)?)
+}
