@@ -109,9 +109,7 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
         }
     }
 
-    if is_wand_caster(class_id) && is_oom(snapshot) {
-        oom_fallback(snapshot, target)
-    } else if is_wand_caster(class_id) {
+    if is_wand_caster(class_id) {
         deferred("caster_has_no_ready_known_offensive_spell")
     } else {
         CombatDecision::Melee { target }
@@ -484,6 +482,12 @@ mod tests {
         assert_eq!(
             select(&Snapshot::from_state(&no_spell), target),
             CombatDecision::Melee { target }
+        );
+
+        no_spell.inventory.equipped_ranged_item = wand_catalog().wand_items.first().copied();
+        assert_eq!(
+            select(&Snapshot::from_state(&no_spell), target),
+            CombatDecision::Wand { target }
         );
     }
 }
