@@ -120,6 +120,7 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
             Millis::wall_clock_now().0,
         )
         .is_ok()
+            && rotation_reserve_preserved(snapshot, class_id, tree, spell)
         {
             return CombatDecision::Cast { spell, target };
         }
@@ -140,6 +141,66 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     } else {
         deferred("no_safe_offensive_fallback")
     }
+}
+
+/// Keep a small, bounded mana reserve for reactive actions. Interrupts and
+/// emergency heals are selected before this ordinary rotation path, so these
+/// points remain available for the next combat decision when possible.
+fn rotation_reserve_preserved(
+    snapshot: &Snapshot,
+    class_id: u8,
+    tree: Option<u8>,
+    spell: u32,
+) -> bool {
+    let Some(metadata) = crate::combat::spells::metadata(spell) else {
+        return false;
+    };
+    if metadata.power_type != 0 {
+        return true;
+    }
+    let Some(player) = snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|id| snapshot.state.entities.0.get(&id))
+    else {
+        return false;
+    };
+    let Some(current) = player
+        .power
+        .filter(|_| player.power_type == Some(0))
+        .map(|power| power.0)
+    else {
+        return false;
+    };
+    let Some(maximum) = player.base_mana else {
+        return false;
+    };
+    // A class with a known interrupt retains 10% mana; healing specializations
+    // retain 20% for emergency care. Other classes spend mana normally.
+    let reserve_percent = if matches!(
+        (class_id, tree),
+        (2, Some(0)) | (5, Some(0 | 1)) | (7, Some(2)) | (11, Some(2))
+    ) {
+        20
+    } else if matches!(class_id, 1 | 2 | 3 | 4 | 6 | 7 | 8) {
+        10
+    } else {
+        0
+    };
+    let reserve = maximum.saturating_mul(reserve_percent) / 100;
+    let cost = metadata
+        .cost
+        .base
+        .saturating_add(
+            metadata
+                .cost
+                .per_level
+                .saturating_mul(player.level.unwrap_or_default()),
+        )
+        .saturating_add(maximum.saturating_mul(metadata.cost.percent) / 100);
+    current.saturating_sub(cost) >= reserve
 }
 
 fn select_ranged_attack_fallback(
@@ -171,6 +232,14 @@ fn select_ranged_attack_fallback(
                 now_ms,
             )
             .is_ok()
+        })
+        .filter(|(spell, _)| {
+            rotation_reserve_preserved(
+                snapshot,
+                class_id,
+                snapshot.state.capabilities.specialization_tree,
+                spell.id,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -1065,6 +1134,53 @@ mod tests {
                 target: Some(target),
             }
         );
+    }
+
+    #[test]
+    fn ordinary_mage_rotation_preserves_interrupt_mana_at_threshold() {
+        let target = EntityId(9);
+        let mut state = state(8, 0, 0, 10, target);
+        state.entities.0.get_mut(&EntityId(1)).unwrap().base_mana = Some(100);
+        let offensive = 116; // Frostbolt
+        let metadata = crate::combat::spells::metadata(offensive).unwrap();
+        let cost = metadata.cost.base + 100 * metadata.cost.percent / 100;
+        state.entities.0.get_mut(&EntityId(1)).unwrap().power = Some((9 + cost, 100));
+        assert!(!rotation_reserve_preserved(
+            &Snapshot::from_state(&state),
+            8,
+            Some(0),
+            offensive
+        ));
+        state.entities.0.get_mut(&EntityId(1)).unwrap().power = Some((10 + cost, 100));
+        assert!(rotation_reserve_preserved(
+            &Snapshot::from_state(&state),
+            8,
+            Some(0),
+            offensive
+        ));
+    }
+
+    #[test]
+    fn healer_rotation_keeps_larger_emergency_heal_reserve() {
+        let target = EntityId(9);
+        let mut state = state(5, 0, 0, 20, target);
+        state.entities.0.get_mut(&EntityId(1)).unwrap().base_mana = Some(100);
+        let metadata = crate::combat::spells::metadata(585).unwrap();
+        let cost = metadata.cost.base + 100 * metadata.cost.percent / 100;
+        state.entities.0.get_mut(&EntityId(1)).unwrap().power = Some((19 + cost, 100));
+        assert!(!rotation_reserve_preserved(
+            &Snapshot::from_state(&state),
+            5,
+            Some(0),
+            585
+        ));
+        state.entities.0.get_mut(&EntityId(1)).unwrap().power = Some((20 + cost, 100));
+        assert!(rotation_reserve_preserved(
+            &Snapshot::from_state(&state),
+            5,
+            Some(0),
+            585
+        ));
     }
 
     #[test]
