@@ -2278,11 +2278,7 @@ fn is_explicit_player_movement_intent(opcode: u32) -> bool {
 fn proxy_chat(body: &[u8]) -> Option<(crate::commands::chat::ChatFamily, &str)> {
     use crate::commands::chat::ChatFamily;
     let chat_type = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
-    let payload = body.get(8..)?;
-    fn cstring(bytes: &[u8]) -> Option<(&str, usize)> {
-        let end = bytes.iter().position(|b| *b == 0)?;
-        Some((std::str::from_utf8(bytes.get(..end)?).ok()?, end + 1))
-    }
+    let mut offset = 8;
     let family = match chat_type {
         1 => ChatFamily::Say,
         2 | 51 => ChatFamily::Party,
@@ -2297,10 +2293,12 @@ fn proxy_chat(body: &[u8]) -> Option<(crate::commands::chat::ChatFamily, &str)> 
         _ => ChatFamily::Other,
     };
     let text = match chat_type {
-        1 | 2 | 3 | 4 | 5 | 6 | 10 | 23 | 24 | 39 | 40 | 44 | 45 | 51 => cstring(payload)?.0,
+        1 | 2 | 3 | 4 | 5 | 6 | 10 | 23 | 24 | 39 | 40 | 44 | 45 | 51 => {
+            read_cstring(body, &mut offset)?
+        }
         7 | 17 => {
-            let (_, consumed) = cstring(payload)?;
-            cstring(payload.get(consumed..)?)?.0
+            read_cstring(body, &mut offset)?;
+            read_cstring(body, &mut offset)?
         }
         _ => return None,
     };
