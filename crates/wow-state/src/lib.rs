@@ -10,6 +10,7 @@ pub mod group;
 pub mod inventory;
 pub mod life;
 pub mod observation;
+pub mod pets;
 pub mod position;
 pub mod professions;
 pub mod quests;

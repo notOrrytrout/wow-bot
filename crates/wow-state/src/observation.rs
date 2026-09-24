@@ -32,6 +32,9 @@ pub enum ProtocolObservation {
         mover: EntityId,
         spells: Vec<u32>,
     },
+    PetControl {
+        pet: Option<EntityId>,
+    },
     CastFailed {
         spell: u32,
         reason: u8,
@@ -169,6 +172,10 @@ pub enum ProtocolObservation {
         skill: u32,
         current: u16,
         max: u16,
+    },
+    ProfessionSnapshot {
+        skills: std::collections::BTreeMap<u32, (u16, u16)>,
+        slots: std::collections::BTreeMap<usize, u32>,
     },
     RecipeKnown {
         recipe: u32,

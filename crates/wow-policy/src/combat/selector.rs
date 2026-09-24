@@ -125,14 +125,17 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
         }
     }
 
+    let hunter_melee = hunter_prefers_melee_weapon_attack(snapshot, class_id, target);
     let now_ms = Millis::wall_clock_now().0;
-    if let Some(spell) = select_ranged_attack_fallback(snapshot, class_id, target, now_ms) {
-        return CombatDecision::Cast { spell, target };
+    if !hunter_melee {
+        if let Some(spell) = select_ranged_attack_fallback(snapshot, class_id, target, now_ms) {
+            return CombatDecision::Cast { spell, target };
+        }
     }
     if is_wand_caster(class_id) && has_equipped_wand(snapshot) {
         return CombatDecision::Wand { target };
     }
-    if melee_fallback_allowed(snapshot, class_id, tree) {
+    if melee_fallback_allowed(snapshot, class_id, tree, hunter_melee) {
         CombatDecision::Melee { target }
     } else {
         deferred("no_safe_offensive_fallback")
@@ -196,7 +199,12 @@ fn spell_rank(rank: &str) -> u32 {
         .unwrap_or_default()
 }
 
-fn melee_fallback_allowed(snapshot: &Snapshot, class_id: u8, tree: Option<u8>) -> bool {
+fn melee_fallback_allowed(
+    snapshot: &Snapshot,
+    class_id: u8,
+    tree: Option<u8>,
+    hunter_melee: bool,
+) -> bool {
     let player = snapshot.state.session.character_guid.map(EntityId);
     let assigned_tank = player.is_some_and(|player| {
         snapshot.state.group.members.iter().any(|member| {
@@ -205,10 +213,34 @@ fn melee_fallback_allowed(snapshot: &Snapshot, class_id: u8, tree: Option<u8>) -
     });
     assigned_tank
         || matches!(class_id, 1 | 4 | 6)
+        || (class_id == 3 && hunter_melee)
         || matches!(
             (class_id, tree),
             (2, Some(2)) | (7, Some(1)) | (11, Some(1))
         )
+}
+
+fn hunter_prefers_melee_weapon_attack(snapshot: &Snapshot, class_id: u8, target: EntityId) -> bool {
+    const HUNTER_MELEE_SWITCH_RANGE_YARDS: f32 = 5.5;
+    if class_id != 3 || snapshot.state.pet.has_active_pet(&snapshot.state.entities) != Some(false) {
+        return false;
+    }
+    let Some(player) = snapshot.state.position.player else {
+        return false;
+    };
+    let Some(target) = snapshot
+        .state
+        .entities
+        .0
+        .get(&target)
+        .and_then(|entity| entity.position)
+    else {
+        return false;
+    };
+    player.map == target.map
+        && player.point.is_finite()
+        && target.point.is_finite()
+        && player.point.distance(target.point) <= HUNTER_MELEE_SWITCH_RANGE_YARDS
 }
 
 fn role_is_tank(role: &str) -> bool {
@@ -702,6 +734,61 @@ mod tests {
         assert_eq!(
             select(&Snapshot::from_state(&state), target),
             CombatDecision::Melee { target }
+        );
+    }
+
+    #[test]
+    fn petless_hunter_uses_melee_only_when_pet_absence_is_known_and_target_is_close() {
+        let target = EntityId(9);
+        let mut hunter = state(3, 0, 0, 100, target);
+        hunter.position.player = Some(wow_domain::WorldPosition {
+            map: 0,
+            point: wow_domain::Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        hunter.entities.0.get_mut(&target).unwrap().position = Some(wow_domain::WorldPosition {
+            map: 0,
+            point: wow_domain::Vec3::new(5.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+
+        assert_eq!(
+            select(&Snapshot::from_state(&hunter), target),
+            deferred("no_safe_offensive_fallback")
+        );
+        hunter.pet.control_known = true;
+        hunter.pet.guid = Some(EntityId(10));
+        hunter.entities.0.insert(
+            EntityId(10),
+            wow_state::entities::EntityState {
+                id: EntityId(10),
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            select(&Snapshot::from_state(&hunter), target),
+            deferred("no_safe_offensive_fallback")
+        );
+        hunter.pet.guid = None;
+        assert_eq!(
+            select(&Snapshot::from_state(&hunter), target),
+            CombatDecision::Melee { target }
+        );
+
+        hunter
+            .entities
+            .0
+            .get_mut(&target)
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap()
+            .point
+            .x = 8.0;
+        assert_eq!(
+            select(&Snapshot::from_state(&hunter), target),
+            deferred("no_safe_offensive_fallback")
         );
     }
 

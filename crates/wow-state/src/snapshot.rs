@@ -22,6 +22,10 @@ pub struct SanitizedSnapshot {
     pub nearby_entities: usize,
     pub active_quests: usize,
     pub free_slots: u16,
+    pub pet_control_known: bool,
+    pub has_active_pet: Option<bool>,
+    pub professions_known: bool,
+    pub profession_skills: std::collections::BTreeMap<u32, (u16, u16)>,
 }
 impl From<&Snapshot> for SanitizedSnapshot {
     fn from(s: &Snapshot) -> Self {
@@ -32,6 +36,10 @@ impl From<&Snapshot> for SanitizedSnapshot {
             nearby_entities: s.state.entities.0.len(),
             active_quests: s.state.quests.active.len(),
             free_slots: s.state.inventory.free_slots,
+            pet_control_known: s.state.pet.control_known,
+            has_active_pet: s.state.pet.has_active_pet(&s.state.entities),
+            professions_known: s.state.professions.known,
+            profession_skills: s.state.professions.skills.clone(),
         }
     }
 }

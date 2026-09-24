@@ -20,6 +20,7 @@ use wow_state::{ProtocolObservation, capabilities::TalentRank};
 use crate::objects::object_to_entity;
 
 const SMSG_TALENTS_INFO: u16 = 0x04c0;
+const SMSG_PET_SPELLS: u16 = 0x0179;
 
 /// Stateful bridge around Tentacli's WotLK ObjectProcessor.
 ///
@@ -42,6 +43,9 @@ pub struct ObjectObservationRuntime {
     equipment_observed: bool,
     known_equipped_items: Option<BTreeMap<u8, u32>>,
     equipment_slots_observed: bool,
+    profession_skill_info_observed: bool,
+    known_profession_skills: Option<(BTreeMap<u32, (u16, u16)>, BTreeMap<usize, u32>)>,
+    pet_control_observed: bool,
     last_class_id: Option<u8>,
     last_player_position: Option<WorldPosition>,
     map_id: u32,
@@ -68,6 +72,9 @@ impl ObjectObservationRuntime {
             equipment_observed: false,
             known_equipped_items: None,
             equipment_slots_observed: false,
+            profession_skill_info_observed: false,
+            known_profession_skills: None,
+            pet_control_observed: false,
             last_class_id: None,
             last_player_position: None,
             map_id: 0,
@@ -76,6 +83,10 @@ impl ObjectObservationRuntime {
     }
 
     pub fn set_world(&mut self, map_id: u32, player_guid: Option<EntityId>) {
+        if player_guid.is_some() {
+            self.profession_skill_info_observed = false;
+            self.known_profession_skills = None;
+        }
         self.map_id = map_id;
         if player_guid.is_some() {
             self.player_guid = player_guid;
@@ -87,6 +98,22 @@ impl ObjectObservationRuntime {
     }
 
     pub async fn observe(&mut self, opcode: u16, body: &[u8]) -> Result<Vec<ProtocolObservation>> {
+        let mut observations = Vec::new();
+        if opcode == SMSG_PET_SPELLS && body.len() >= 8 {
+            let raw_pet = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
+            observations.push(ProtocolObservation::PetControl {
+                pet: (raw_pet != 0).then_some(EntityId(raw_pet)),
+            });
+            self.pet_control_observed = true;
+        } else if opcode == SMSG_TALENTS_INFO
+            && body.first().copied() == Some(0)
+            && !self.pet_control_observed
+        {
+            // AzerothCore sends the player talent packet after pet initialization.
+            // If no pet-spell packet arrived first, this confirms no active pet.
+            observations.push(ProtocolObservation::PetControl { pet: None });
+            self.pet_control_observed = true;
+        }
         let mut packet = Packet::default();
         packet.set_type(PacketType::Incoming);
         packet.set_opcode(PacketOpcode::U16(opcode));
@@ -101,7 +128,6 @@ impl ObjectObservationRuntime {
             self.apply_outputs(outputs).await;
         }
 
-        let mut observations = Vec::new();
         if opcode == SMSG_TALENTS_INFO
             && let Some((group_count, active_group, talents)) = parse_player_talents_info(body)
         {
@@ -197,6 +223,23 @@ impl ObjectObservationRuntime {
                         }
                     }
                     if self.player_guid == Some(entity.id) {
+                        if let Some((skills, slots)) = object
+                            .player_fields
+                            .get(&PlayerField::SkillInfo)
+                            .and_then(profession_skills_from_field)
+                        {
+                            if !self.profession_skill_info_observed
+                                || self.known_profession_skills.as_ref()
+                                    != Some(&(skills.clone(), slots.clone()))
+                            {
+                                observations.push(ProtocolObservation::ProfessionSnapshot {
+                                    skills: skills.clone(),
+                                    slots: slots.clone(),
+                                });
+                                self.known_profession_skills = Some((skills, slots));
+                                self.profession_skill_info_observed = true;
+                            }
+                        }
                         let equipped_items = equipped_items_of(object, map);
                         if !self.equipment_slots_observed
                             || equipped_items != self.known_equipped_items
@@ -315,6 +358,33 @@ fn controlled_mover_of(
         Some(FieldValue::Long(value)) if *value != 0 => Some(EntityId(*value)),
         _ => None,
     }
+}
+
+/// Project the canonical WotLK SkillInfo update field into skill-line ranks.
+/// Each skill uses three TwoShorts entries: skill/step, current/maximum, bonuses.
+fn profession_skills_from_field(
+    field: &FieldValue,
+) -> Option<(BTreeMap<u32, (u16, u16)>, BTreeMap<usize, u32>)> {
+    let FieldValue::TwoShortsArray(entries) = field else {
+        return None;
+    };
+    let mut skills = BTreeMap::new();
+    let mut slots = BTreeMap::new();
+    for (slot, chunk) in entries.chunks(3).enumerate() {
+        let Some((skill, _step)) = chunk.first().and_then(|value| *value) else {
+            continue;
+        };
+        let skill = skill as u16;
+        if skill == 0 {
+            continue;
+        }
+        slots.insert(slot, u32::from(skill));
+        let Some((current, maximum)) = chunk.get(1).and_then(|value| *value) else {
+            continue;
+        };
+        skills.insert(skill as u32, (current as u16, maximum as u16));
+    }
+    Some((skills, slots))
 }
 
 fn equipped_ranged_guid_of(object: &Object) -> Option<u64> {
@@ -563,6 +633,59 @@ impl<'a> TalentPacketReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pet_control_uses_pet_bar_and_initial_talents_as_authority() {
+        let mut runtime = ObjectObservationRuntime::new().expect("object observer");
+        let mut pet_packet = vec![0; 58];
+        pet_packet[..8].copy_from_slice(&55_u64.to_le_bytes());
+        let observations = runtime
+            .observe(SMSG_PET_SPELLS, &pet_packet)
+            .await
+            .expect("pet packet");
+        assert!(matches!(
+            observations.first(),
+            Some(ProtocolObservation::PetControl {
+                pet: Some(EntityId(55))
+            })
+        ));
+
+        let talents = player_talents_packet(0, &[talent_group(&[], &[])]);
+        let observations = runtime
+            .observe(SMSG_TALENTS_INFO, &talents)
+            .await
+            .expect("talents packet");
+        assert!(
+            !observations
+                .iter()
+                .any(|observation| matches!(observation, ProtocolObservation::PetControl { .. }))
+        );
+
+        let mut no_pet_runtime = ObjectObservationRuntime::new().expect("object observer");
+        let observations = no_pet_runtime
+            .observe(SMSG_TALENTS_INFO, &talents)
+            .await
+            .expect("talents packet");
+        assert!(matches!(
+            observations.first(),
+            Some(ProtocolObservation::PetControl { pet: None })
+        ));
+    }
+
+    #[test]
+    fn skill_info_projects_rank_and_maximum_by_skill_line() {
+        let mut entries = vec![None; 384];
+        entries[0] = Some((164, 0));
+        entries[1] = Some((75, 150));
+        entries[3] = Some((185, 0));
+        entries[4] = Some((40, 75));
+        let (skills, slots) = profession_skills_from_field(&FieldValue::TwoShortsArray(entries))
+            .expect("canonical skill info");
+        assert_eq!(skills.get(&164), Some(&(75, 150)));
+        assert_eq!(skills.get(&185), Some(&(40, 75)));
+        assert_eq!(slots.get(&0), Some(&164));
+        assert_eq!(slots.get(&1), Some(&185));
+    }
 
     fn talent_group(talents: &[(u32, u8)], glyphs: &[u16]) -> Vec<u8> {
         let mut body = vec![talents.len() as u8];

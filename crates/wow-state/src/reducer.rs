@@ -103,6 +103,11 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 delta.changed.push("control".into());
             }
         }
+        ProtocolObservation::PetControl { pet } => {
+            state.pet.control_known = true;
+            state.pet.guid = pet;
+            delta.changed.push("pet".into());
+        }
         ProtocolObservation::CastFailed { .. } => {}
         ProtocolObservation::CastStarted {
             caster,
@@ -389,7 +394,14 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             current,
             max,
         } => {
+            state.professions.known = true;
             state.professions.skills.insert(skill, (current, max));
+            delta.changed.push("professions".into());
+        }
+        ProtocolObservation::ProfessionSnapshot { skills, slots } => {
+            state.professions.known = true;
+            state.professions.skills = skills;
+            state.professions.slots = slots;
             delta.changed.push("professions".into());
         }
         ProtocolObservation::RecipeKnown { recipe } => {
@@ -438,6 +450,47 @@ mod tests {
         quests::{QuestProgress, QuestTurnInDialog, QuestTurnInStage},
     };
     use wow_domain::{EntityId, Vec3, WorldPosition};
+
+    #[test]
+    fn authoritative_pet_and_profession_snapshots_keep_unknown_distinct_from_empty() {
+        let mut state = AuthoritativeState::default();
+        assert_eq!(state.pet.has_active_pet(&state.entities), None);
+        reduce(&mut state, ProtocolObservation::PetControl { pet: None });
+        assert_eq!(state.pet.has_active_pet(&state.entities), Some(false));
+
+        reduce(
+            &mut state,
+            ProtocolObservation::PetControl {
+                pet: Some(EntityId(10)),
+            },
+        );
+        assert_eq!(state.pet.has_active_pet(&state.entities), Some(true));
+        reduce(
+            &mut state,
+            ProtocolObservation::EntityUpsert {
+                entity: EntityState {
+                    id: EntityId(10),
+                    health: Some((0, 100)),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(state.pet.has_active_pet(&state.entities), Some(false));
+
+        reduce(
+            &mut state,
+            ProtocolObservation::ProfessionSnapshot {
+                skills: [(164, (75, 150))].into_iter().collect(),
+                slots: [(0, 164)].into_iter().collect(),
+            },
+        );
+        assert!(state.professions.known);
+        assert_eq!(state.professions.skill(164), 75);
+        assert_eq!(state.professions.slots.get(&0), Some(&164));
+        let sanitized = crate::SanitizedSnapshot::from(&crate::Snapshot::from_state(&state));
+        assert_eq!(sanitized.has_active_pet, Some(false));
+        assert_eq!(sanitized.profession_skills.get(&164), Some(&(75, 150)));
+    }
 
     #[test]
     fn quest_completion_events_share_unique_recording() {
