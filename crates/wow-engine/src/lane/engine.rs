@@ -754,8 +754,7 @@ impl LaneEngine {
 
         let Some(target) = wow_policy::group::encounter::from_observed(&snapshot).preferred_target
         else {
-            self.waiting("group mission is waiting for an observed encounter target".into());
-            return true;
+            return self.tick_group_follow(&snapshot, player).await;
         };
         let Some(target_state) = self.state.authoritative.entities.0.get(&target) else {
             self.waiting(
@@ -769,6 +768,55 @@ impl LaneEngine {
         }
 
         self.dispatch_combat_target(target, false).await
+    }
+
+    async fn tick_group_follow(&mut self, snapshot: &Snapshot, player: Option<EntityId>) -> bool {
+        let Some(player) = player else {
+            self.waiting("group follow is waiting for player GUID".into());
+            return true;
+        };
+        let Some(member) = wow_policy::group::follow::target_position(snapshot, player) else {
+            self.waiting("group follow is waiting for an observed online member position".into());
+            return true;
+        };
+        let Some(from) = self
+            .state
+            .authoritative
+            .control
+            .active_position(self.state.authoritative.position.player)
+        else {
+            self.waiting("group follow is waiting for authoritative player position".into());
+            return true;
+        };
+        let Some(destination) = wow_policy::group::follow::follow_destination(
+            from,
+            member,
+            wow_policy::group::follow::GROUP_FOLLOW_STOP_DISTANCE,
+        ) else {
+            return true;
+        };
+        let Some(controller) = self.movement_controller.as_ref() else {
+            self.waiting("group follow requires navigation controller".into());
+            return true;
+        };
+        let controlled_mover = self.state.authoritative.control.mover.is_some();
+        let flags = if controlled_mover {
+            self.state.authoritative.control.movement_flags
+        } else {
+            self.state.authoritative.position.flags
+        };
+        let mode = wow_navigation::LocomotionMode::from_server_flags(controlled_mover, flags);
+        match controller.next_step(from, destination, 1.0, mode) {
+            Ok(Some(step)) => {
+                self.propose_command(GameplayCommand::MoveTo(step.next), false)
+                    .await
+            }
+            Ok(None) => true,
+            Err(error) => {
+                self.waiting(format!("group follow navigation failed: {error:?}"));
+                true
+            }
+        }
     }
 
     async fn tick_survival(&mut self, target: EntityId) -> bool {
