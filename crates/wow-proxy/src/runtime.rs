@@ -826,10 +826,21 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             GameplayCommand::CastGameObject { target, report_use: true, .. } => Some(*target),
                             _ => None,
                         };
-                        let mover_guid = controlled_mover.or(player_guid);
-                        let mover_position = controlled_position.or(canonical_position);
-                        let mover_flags = if controlled_mover.is_some() { controlled_flags } else { canonical_flags };
-                        match encode_gameplay_command(command, mover_guid, mover_position, mover_flags, &mut movement_time) {
+                        let movement_context = gameplay_movement_context(
+                            controlled_mover,
+                            controlled_position,
+                            controlled_flags,
+                            player_guid,
+                            canonical_position,
+                            canonical_flags,
+                        );
+                        match encode_gameplay_command(
+                            command,
+                            movement_context.mover,
+                            movement_context.position,
+                            movement_context.flags,
+                            &mut movement_time,
+                        ) {
                             Ok(Some((frame, movement))) => {
                                 tracing::info!(account=%account_name, opcode=frame.opcode, "bot gameplay packet transmitted");
                                 if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &frame).await { break Err(e); }
@@ -1128,10 +1139,21 @@ async fn run_headless_world_session(
             command = commands.recv() => {
                 match command {
                     Ok(command) => {
-                        let mover_guid = controlled_mover.or(player_guid);
-                        let mover_position = controlled_position.or(canonical_position);
-                        let mover_flags = if controlled_mover.is_some() { controlled_flags } else { canonical_flags };
-                        match encode_gameplay_command(command.clone(), mover_guid, mover_position, mover_flags, &mut movement_time) {
+                        let movement_context = gameplay_movement_context(
+                            controlled_mover,
+                            controlled_position,
+                            controlled_flags,
+                            player_guid,
+                            canonical_position,
+                            canonical_flags,
+                        );
+                        match encode_gameplay_command(
+                            command.clone(),
+                            movement_context.mover,
+                            movement_context.position,
+                            movement_context.flags,
+                            &mut movement_time,
+                        ) {
                             Ok(Some((frame, movement))) => {
                                 if let Some((spell, target)) = bot_targeted_cast(&command) {
                                     last_bot_cast = Some((spell, target, std::time::Instant::now()));
@@ -1304,6 +1326,79 @@ fn bot_targeted_cast(command: &GameplayCommand) -> Option<(u32, Option<EntityId>
             Some((*spell, *target))
         }
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GameplayMovementContext {
+    mover: Option<EntityId>,
+    position: Option<WorldPosition>,
+    flags: u32,
+}
+
+fn gameplay_movement_context(
+    controlled_mover: Option<EntityId>,
+    controlled_position: Option<WorldPosition>,
+    controlled_flags: u32,
+    player_guid: Option<EntityId>,
+    player_position: Option<WorldPosition>,
+    player_flags: u32,
+) -> GameplayMovementContext {
+    GameplayMovementContext {
+        mover: controlled_mover.or(player_guid),
+        position: controlled_position.or(player_position),
+        flags: if controlled_mover.is_some() {
+            controlled_flags
+        } else {
+            player_flags
+        },
+    }
+}
+
+#[cfg(test)]
+mod gameplay_movement_context_tests {
+    use super::*;
+
+    #[test]
+    fn controlled_mover_state_takes_precedence_with_player_fallback() {
+        let player_position = WorldPosition {
+            map: 1,
+            point: Vec3::new(1.0, 2.0, 3.0),
+            orientation: 0.5,
+        };
+        let context = gameplay_movement_context(
+            Some(EntityId(2)),
+            None,
+            0x20,
+            Some(EntityId(1)),
+            Some(player_position),
+            0x10,
+        );
+
+        assert_eq!(context.mover, Some(EntityId(2)));
+        assert_eq!(context.position, Some(player_position));
+        assert_eq!(context.flags, 0x20);
+    }
+
+    #[test]
+    fn player_state_is_used_without_a_controlled_mover() {
+        let player_position = WorldPosition {
+            map: 1,
+            point: Vec3::new(1.0, 2.0, 3.0),
+            orientation: 0.5,
+        };
+        let context = gameplay_movement_context(
+            None,
+            None,
+            0x20,
+            Some(EntityId(1)),
+            Some(player_position),
+            0x10,
+        );
+
+        assert_eq!(context.mover, Some(EntityId(1)));
+        assert_eq!(context.position, Some(player_position));
+        assert_eq!(context.flags, 0x10);
     }
 }
 
