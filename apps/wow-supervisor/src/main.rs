@@ -167,7 +167,6 @@ async fn main() -> Result<()> {
     ensure_runtime_data(&mut config, &config_path, args.data_root.as_deref())?;
     prepare_runtime_asset_manifest(&config, &app_paths)?;
     ensure_interactive_setup(&mut config, &config_path, created)?;
-    config.runtime.data_dir = app_paths.root.clone();
     config.save(&config_path).map_err(anyhow::Error::msg)?;
     config.validate().map_err(anyhow::Error::msg)?;
     check_upstream_services(&config).await?;
