@@ -9,7 +9,7 @@ use tentacli::{
         CtxMap, HandlerOutput, Packet, PacketOpcode, PacketType, Processor, Request,
     },
     plugins::wow::wotlk::realm::object::{
-        ObjectMap, ObjectProcessor, object_names, objects,
+        Object, ObjectMap, ObjectProcessor, object_names, objects,
         types::update_fields::{FieldValue, ItemField, PlayerField, UnitField},
     },
 };
@@ -317,26 +317,16 @@ fn controlled_mover_of(
     }
 }
 
-fn equipped_ranged_guid_of(
-    object: &tentacli::plugins::wow::wotlk::realm::object::Object,
-) -> Option<u64> {
+fn equipped_ranged_guid_of(object: &Object) -> Option<u64> {
     // PLAYER_FIELD_INV_SLOT_HEAD is an array of 23 GUIDs. Equipment slot 17 is ranged/relic in 3.3.5a.
-    match object.player_fields.get(&PlayerField::InvSlot) {
-        Some(FieldValue::LongArray(values)) => values
-            .get(17)
-            .and_then(|value| *value)
-            .filter(|guid| *guid != 0),
-        _ => None,
-    }
+    inventory_slot_guids(object)?
+        .get(17)
+        .and_then(|value| *value)
+        .filter(|guid| *guid != 0)
 }
 
-fn equipped_items_of(
-    player: &tentacli::plugins::wow::wotlk::realm::object::Object,
-    objects: &ObjectMap,
-) -> Option<BTreeMap<u8, u32>> {
-    let Some(FieldValue::LongArray(slots)) = player.player_fields.get(&PlayerField::InvSlot) else {
-        return None;
-    };
+fn equipped_items_of(player: &Object, objects: &ObjectMap) -> Option<BTreeMap<u8, u32>> {
+    let slots = inventory_slot_guids(player)?;
     let mut equipped = BTreeMap::new();
     for (slot, guid) in slots.iter().take(19).enumerate() {
         let Some(guid) = guid.filter(|guid| *guid != 0) else {
@@ -349,6 +339,13 @@ fn equipped_items_of(
         equipped.insert(u8::try_from(slot).ok()?, item);
     }
     Some(equipped)
+}
+
+fn inventory_slot_guids(object: &Object) -> Option<&[Option<u64>]> {
+    match object.player_fields.get(&PlayerField::InvSlot) {
+        Some(FieldValue::LongArray(values)) => Some(values),
+        _ => None,
+    }
 }
 
 fn backpack_slots_of(
