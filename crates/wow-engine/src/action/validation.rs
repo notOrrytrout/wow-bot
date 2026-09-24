@@ -109,8 +109,7 @@ fn validate_spatial_command(
         GameplayCommand::Attack(entity)
             if !snapshot.state.entities.0.get(entity).is_some_and(|e| {
                 e.hostile
-                    || active_quest_creature_target(snapshot, e.entry)
-                    || active_quest_item_source(snapshot, e.entry)
+                    || active_quest_authorizes_attack(snapshot, e.entry)
                     || wow_policy::combat::engagement::is_attacking_player_or_group(
                         snapshot, *entity,
                     )
@@ -450,9 +449,9 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
     }
 }
 
-fn active_quest_creature_target(snapshot: &Snapshot, entry: u32) -> bool {
+fn active_quest_authorizes_attack(snapshot: &Snapshot, entry: u32) -> bool {
     active_quest_definitions(snapshot).any(|(progress, definition)| {
-        definition.targets.iter().any(|target| {
+        let incomplete_creature_target = definition.targets.iter().any(|target| {
             target.kind == wow_state::quests::QuestTargetKind::Creature
                 && target.entry == entry
                 && progress
@@ -461,13 +460,8 @@ fn active_quest_creature_target(snapshot: &Snapshot, entry: u32) -> bool {
                     .copied()
                     .unwrap_or_default()
                     < target.required
-        })
-    })
-}
-
-fn active_quest_item_source(snapshot: &Snapshot, entry: u32) -> bool {
-    active_quest_definitions(snapshot).any(|(_, definition)| {
-        definition.items.iter().any(|item| {
+        });
+        let unmet_creature_item_source = definition.items.iter().any(|item| {
             let current = snapshot
                 .state
                 .inventory
@@ -482,7 +476,8 @@ fn active_quest_item_source(snapshot: &Snapshot, entry: u32) -> bool {
                         *kind == wow_state::quests::QuestTargetKind::Creature
                             && *source_entry == entry
                     })
-        })
+        });
+        incomplete_creature_target || unmet_creature_item_source
     })
 }
 
