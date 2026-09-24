@@ -128,24 +128,18 @@ pub fn decide_next(
             return decision;
         }
         if include_party && family.party {
-            for member in snapshot
-                .state
-                .group
-                .members
-                .iter()
-                .filter(|member| member.online && member.entity != player)
-            {
-                if !snapshot.state.auras.by_entity.contains_key(&member.entity) {
+            for member in crate::group::state::online_members_except(snapshot, Some(player)) {
+                if !snapshot.state.auras.by_entity.contains_key(&member) {
                     continue;
                 }
-                if !party_member_nearby(snapshot, player_position, member.entity) {
+                if !party_member_nearby(snapshot, player_position, member) {
                     continue;
                 }
-                if has_same_or_better(snapshot, member.entity, family, desired.strength) {
+                if has_same_or_better(snapshot, member, family, desired.strength) {
                     continue;
                 }
                 if let Some(decision) =
-                    cast_decision(snapshot, family, spell, member.entity, retry_after, now)
+                    cast_decision(snapshot, family, spell, member, retry_after, now)
                 {
                     return decision;
                 }

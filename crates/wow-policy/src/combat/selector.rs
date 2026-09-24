@@ -227,15 +227,10 @@ fn select_heal(snapshot: &Snapshot) -> Option<(u32, EntityId)> {
     let player = snapshot.state.session.character_guid.map(EntityId)?;
 
     let mut candidates = vec![player];
-    candidates.extend(
-        snapshot
-            .state
-            .group
-            .members
-            .iter()
-            .filter(|member| member.online && member.entity != player)
-            .map(|member| member.entity),
-    );
+    candidates.extend(crate::group::state::online_members_except(
+        snapshot,
+        Some(player),
+    ));
 
     let target = candidates
         .into_iter()

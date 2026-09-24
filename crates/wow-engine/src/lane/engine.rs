@@ -466,12 +466,10 @@ impl LaneEngine {
             .session
             .character_guid
             .map(EntityId);
-        let has_observed_group_member = snapshot
-            .state
-            .group
-            .members
-            .iter()
-            .any(|member| member.online && Some(member.entity) != player);
+        let has_observed_group_member =
+            wow_policy::group::state::online_members_except(&snapshot, player)
+                .next()
+                .is_some();
         if !has_observed_group_member {
             self.waiting("group mission is waiting for an observed online group member".into());
             return true;
