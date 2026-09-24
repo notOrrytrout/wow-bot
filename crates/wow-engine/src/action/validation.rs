@@ -1,6 +1,6 @@
+use super::spatial;
 use wow_domain::*;
 use wow_state::Snapshot;
-use super::spatial;
 
 pub struct ValidationContext {
     pub current: ValidityStamp,
@@ -11,70 +11,294 @@ pub struct ValidationContext {
 pub struct ActionValidator;
 
 impl ActionValidator {
-    pub fn validate(snapshot: &Snapshot, context: ValidationContext, action: ProposedAction) -> ValidationOutcome {
+    pub fn validate(
+        snapshot: &Snapshot,
+        context: ValidationContext,
+        action: ProposedAction,
+    ) -> ValidationOutcome {
         let current = context.current;
-        if snapshot.revision != current.state || action.stamp.state != current.state { return reject("stale_state", "state revision changed", true); }
-        if action.stamp.mission != current.mission { return reject("stale_mission", "mission revision changed", false); }
-        if action.stamp.permission != current.permission { return reject("stale_permission", "permission revision changed", false); }
-        if action.stamp.worker != current.worker { return reject("stale_worker", "worker generation changed", false); }
-        if action.stamp.ownership != current.ownership { return reject("stale_ownership", "ownership generation changed", false); }
-        if snapshot.state.desync.suspect { return reject("desynchronized", "required authoritative state is desynchronized", true); }
-        if !snapshot.state.session.in_world { return reject("not_in_world", "character is not in world", true); }
-        if !origin_authorized(action.origin, &action.command) { return reject("origin_forbidden", "plan origin lacks authority", false); }
-        if !stage_allows(context.stage, &action.command) { return reject("activation_stage", "action is not enabled at the current activation stage", true); }
+        if snapshot.revision != current.state || action.stamp.state != current.state {
+            return reject("stale_state", "state revision changed", true);
+        }
+        if action.stamp.mission != current.mission {
+            return reject("stale_mission", "mission revision changed", false);
+        }
+        if action.stamp.permission != current.permission {
+            return reject("stale_permission", "permission revision changed", false);
+        }
+        if action.stamp.worker != current.worker {
+            return reject("stale_worker", "worker generation changed", false);
+        }
+        if action.stamp.ownership != current.ownership {
+            return reject("stale_ownership", "ownership generation changed", false);
+        }
+        if snapshot.state.desync.suspect {
+            return reject(
+                "desynchronized",
+                "required authoritative state is desynchronized",
+                true,
+            );
+        }
+        if !snapshot.state.session.in_world {
+            return reject("not_in_world", "character is not in world", true);
+        }
+        if !origin_authorized(action.origin, &action.command) {
+            return reject("origin_forbidden", "plan origin lacks authority", false);
+        }
+        if !stage_allows(context.stage, &action.command) {
+            return reject(
+                "activation_stage",
+                "action is not enabled at the current activation stage",
+                true,
+            );
+        }
         let required = required_permission(&action.command);
-        if action.origin != PlanOrigin::Recovery && !required.is_empty() && !context.permissions.contains(required) { return reject("permission_denied", "mission permissions do not authorize the action", false); }
+        if action.origin != PlanOrigin::Recovery
+            && !required.is_empty()
+            && !context.permissions.contains(required)
+        {
+            return reject(
+                "permission_denied",
+                "mission permissions do not authorize the action",
+                false,
+            );
+        }
 
-        if let Some(movement) = spatial::movement_requirement(snapshot, &action.command) { return ValidationOutcome::NeedsMovement(movement); }
-        if let Some(facing) = spatial::facing_requirement(snapshot, &action.command) { return ValidationOutcome::NeedsFacing(facing); }
+        if let Some(movement) = spatial::movement_requirement(snapshot, &action.command) {
+            return ValidationOutcome::NeedsMovement(movement);
+        }
+        if let Some(facing) = spatial::facing_requirement(snapshot, &action.command) {
+            return ValidationOutcome::NeedsFacing(facing);
+        }
 
         match &action.command {
-            GameplayCommand::MoveTo(point) if !point.is_finite() => return reject("bad_position", "movement destination is invalid", false),
-            GameplayCommand::FaceDirection { orientation } if !orientation.is_finite() => return reject("bad_orientation", "facing orientation is invalid", false),
-            GameplayCommand::Attack(entity) if !snapshot.state.entities.0.get(entity).is_some_and(|e| e.hostile || active_quest_creature_target(snapshot, e.entry) || active_quest_item_source(snapshot, e.entry) || wow_policy::combat::engagement::is_attacking_player_or_group(snapshot, *entity)) => return reject("combat_authority", "target is not an authoritative hostile, active quest target, or engaged survival attacker", false),
-            GameplayCommand::Interact(entity) | GameplayCommand::UseGameObject(entity) | GameplayCommand::CastGameObject { target: entity, .. } | GameplayCommand::Loot(entity) | GameplayCommand::Gather(entity) | GameplayCommand::EnterVehicle(entity)
-                if !snapshot.state.entities.0.contains_key(entity) => return reject("unknown_entity", "target is not authoritative", true),
+            GameplayCommand::MoveTo(point) if !point.is_finite() => {
+                return reject("bad_position", "movement destination is invalid", false);
+            }
+            GameplayCommand::FaceDirection { orientation } if !orientation.is_finite() => {
+                return reject("bad_orientation", "facing orientation is invalid", false);
+            }
+            GameplayCommand::Attack(entity)
+                if !snapshot.state.entities.0.get(entity).is_some_and(|e| {
+                    e.hostile
+                        || active_quest_creature_target(snapshot, e.entry)
+                        || active_quest_item_source(snapshot, e.entry)
+                        || wow_policy::combat::engagement::is_attacking_player_or_group(
+                            snapshot, *entity,
+                        )
+                }) =>
+            {
+                return reject(
+                    "combat_authority",
+                    "target is not an authoritative hostile, active quest target, or engaged survival attacker",
+                    false,
+                );
+            }
+            GameplayCommand::Interact(entity)
+            | GameplayCommand::UseGameObject(entity)
+            | GameplayCommand::CastGameObject { target: entity, .. }
+            | GameplayCommand::Loot(entity)
+            | GameplayCommand::Gather(entity)
+            | GameplayCommand::EnterVehicle(entity)
+                if !snapshot.state.entities.0.contains_key(entity) =>
+            {
+                return reject("unknown_entity", "target is not authoritative", true);
+            }
             GameplayCommand::Cast { spell, target } => {
                 if !snapshot.state.capabilities.spells.contains(spell)
-                    && !(*spell == 5019 && wow_policy::combat::selector::has_equipped_wand(snapshot))
-                { return reject("unknown_spell", "spell is not an authoritative known capability or equipped-wand Shoot", false); }
-                if target.as_ref().is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity)) { return reject("unknown_entity", "spell target is not authoritative", true); }
+                    && !(*spell == 5019
+                        && wow_policy::combat::selector::has_equipped_wand(snapshot))
+                {
+                    return reject(
+                        "unknown_spell",
+                        "spell is not an authoritative known capability or equipped-wand Shoot",
+                        false,
+                    );
+                }
+                if target
+                    .as_ref()
+                    .is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity))
+                {
+                    return reject("unknown_entity", "spell target is not authoritative", true);
+                }
             }
             GameplayCommand::MaintainBuff { spell, target } => {
-                if !snapshot.state.capabilities.spells.contains(spell) { return reject("unknown_spell", "maintenance spell is not an authoritative known capability", false); }
+                if !snapshot.state.capabilities.spells.contains(spell) {
+                    return reject(
+                        "unknown_spell",
+                        "maintenance spell is not an authoritative known capability",
+                        false,
+                    );
+                }
                 let self_guid = snapshot.state.session.character_guid.map(EntityId);
-                if Some(*target) != self_guid && !snapshot.state.entities.0.contains_key(target) { return reject("unknown_entity", "maintenance target is not authoritative", true); }
+                if Some(*target) != self_guid && !snapshot.state.entities.0.contains_key(target) {
+                    return reject(
+                        "unknown_entity",
+                        "maintenance target is not authoritative",
+                        true,
+                    );
+                }
             }
-            GameplayCommand::Fish if !snapshot.state.capabilities.can_fish => return reject("cannot_fish", "fishing capability is not authoritative", false),
+            GameplayCommand::Fish if !snapshot.state.capabilities.can_fish => {
+                return reject(
+                    "cannot_fish",
+                    "fishing capability is not authoritative",
+                    false,
+                );
+            }
             GameplayCommand::UseItem { item, target } => {
-                if !snapshot.state.inventory.has(*item, 1) { return reject("missing_item", "item is no longer present", false); }
-                if target.as_ref().is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity)) { return reject("unknown_entity", "item target is not authoritative", true); }
+                if !snapshot.state.inventory.has(*item, 1) {
+                    return reject("missing_item", "item is no longer present", false);
+                }
+                if target
+                    .as_ref()
+                    .is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity))
+                {
+                    return reject("unknown_entity", "item target is not authoritative", true);
+                }
             }
-            GameplayCommand::UseItemInstance { item, item_guid, backpack_slot, target, .. } => {
-                let matches = snapshot.state.inventory.instances.get(item_guid).is_some_and(|instance| instance.item == *item && instance.backpack_slot == *backpack_slot && instance.count > 0);
-                if !matches { return reject("stale_item_instance", "item slot/GUID is no longer authoritative", true); }
-                if target.as_ref().is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity)) { return reject("unknown_entity", "item target is not authoritative", true); }
+            GameplayCommand::UseItemInstance {
+                item,
+                item_guid,
+                backpack_slot,
+                target,
+                ..
+            } => {
+                let matches = snapshot
+                    .state
+                    .inventory
+                    .instances
+                    .get(item_guid)
+                    .is_some_and(|instance| {
+                        instance.item == *item
+                            && instance.backpack_slot == *backpack_slot
+                            && instance.count > 0
+                    });
+                if !matches {
+                    return reject(
+                        "stale_item_instance",
+                        "item slot/GUID is no longer authoritative",
+                        true,
+                    );
+                }
+                if target
+                    .as_ref()
+                    .is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity))
+                {
+                    return reject("unknown_entity", "item target is not authoritative", true);
+                }
             }
             GameplayCommand::AcceptQuest { quest, giver } => {
-                if !snapshot.state.entities.0.contains_key(giver) { return reject("unknown_quest_giver", "quest giver is not authoritative", true); }
-                if snapshot.state.quests.active.contains_key(quest) || snapshot.state.quests.completed.contains(quest) { return reject("quest_not_available", "quest is already active or complete", false); }
+                if !snapshot.state.entities.0.contains_key(giver) {
+                    return reject(
+                        "unknown_quest_giver",
+                        "quest giver is not authoritative",
+                        true,
+                    );
+                }
+                if snapshot.state.quests.active.contains_key(quest)
+                    || snapshot.state.quests.completed.contains(quest)
+                {
+                    return reject(
+                        "quest_not_available",
+                        "quest is already active or complete",
+                        false,
+                    );
+                }
             }
-            GameplayCommand::TurnInQuest { quest, giver } | GameplayCommand::RequestQuestReward { quest, giver } | GameplayCommand::ChooseQuestReward { quest, giver, .. } => {
-                if !snapshot.state.entities.0.contains_key(giver) { return reject("unknown_quest_giver", "quest giver is not authoritative", true); }
-                if !snapshot.state.quests.active.get(quest).is_some_and(|q| q.complete) { return reject("quest_not_complete", "authoritative quest state is not complete", true); }
+            GameplayCommand::TurnInQuest { quest, giver }
+            | GameplayCommand::RequestQuestReward { quest, giver }
+            | GameplayCommand::ChooseQuestReward { quest, giver, .. } => {
+                if !snapshot.state.entities.0.contains_key(giver) {
+                    return reject(
+                        "unknown_quest_giver",
+                        "quest giver is not authoritative",
+                        true,
+                    );
+                }
+                if !snapshot
+                    .state
+                    .quests
+                    .active
+                    .get(quest)
+                    .is_some_and(|q| q.complete)
+                {
+                    return reject(
+                        "quest_not_complete",
+                        "authoritative quest state is not complete",
+                        true,
+                    );
+                }
             }
-            GameplayCommand::VendorBuy { vendor, .. } | GameplayCommand::VendorSell { vendor, .. }
-                if snapshot.state.inventory.vendor != Some(*vendor) => return reject("vendor_not_open", "vendor interaction is not currently authoritative", true),
-            GameplayCommand::VendorSell { item, count, .. } if !snapshot.state.inventory.has(*item, *count) => return reject("missing_item", "sale item quantity is no longer present", false),
-            GameplayCommand::TradeAccept { generation, .. } if snapshot.state.inventory.trade.generation != *generation || !snapshot.state.inventory.trade.open => return reject("stale_trade", "trade generation changed", true),
-            GameplayCommand::TradeAccept { gift_only: true, .. } if !snapshot.state.inventory.trade.our_items.is_empty() || snapshot.state.inventory.trade.our_money != 0 => return reject("not_clear_gift", "gift acceptance would send reciprocal assets", false),
-            GameplayCommand::AuctionBuy { query_generation, listing_id, max_buyout } => {
-                if snapshot.state.inventory.auction.query_generation != *query_generation { return reject("stale_auction", "auction query generation changed", true); }
-                let Some(listing) = snapshot.state.inventory.auction.listings.get(listing_id) else { return reject("listing_missing", "auction listing is no longer current", true); };
-                if listing.buyout > *max_buyout || listing.buyout > snapshot.state.inventory.money { return reject("auction_price", "listing exceeds authorized buyout or current funds", false); }
+            GameplayCommand::VendorBuy { vendor, .. }
+            | GameplayCommand::VendorSell { vendor, .. }
+                if snapshot.state.inventory.vendor != Some(*vendor) =>
+            {
+                return reject(
+                    "vendor_not_open",
+                    "vendor interaction is not currently authoritative",
+                    true,
+                );
             }
-            GameplayCommand::MailTake { mailbox_generation, mail_id } => {
-                if snapshot.state.inventory.mailbox.generation != *mailbox_generation || !snapshot.state.inventory.mailbox.mails.contains_key(mail_id) { return reject("stale_mail", "mailbox contents changed", true); }
+            GameplayCommand::VendorSell { item, count, .. }
+                if !snapshot.state.inventory.has(*item, *count) =>
+            {
+                return reject(
+                    "missing_item",
+                    "sale item quantity is no longer present",
+                    false,
+                );
+            }
+            GameplayCommand::TradeAccept { generation, .. }
+                if snapshot.state.inventory.trade.generation != *generation
+                    || !snapshot.state.inventory.trade.open =>
+            {
+                return reject("stale_trade", "trade generation changed", true);
+            }
+            GameplayCommand::TradeAccept {
+                gift_only: true, ..
+            } if !snapshot.state.inventory.trade.our_items.is_empty()
+                || snapshot.state.inventory.trade.our_money != 0 =>
+            {
+                return reject(
+                    "not_clear_gift",
+                    "gift acceptance would send reciprocal assets",
+                    false,
+                );
+            }
+            GameplayCommand::AuctionBuy {
+                query_generation,
+                listing_id,
+                max_buyout,
+            } => {
+                if snapshot.state.inventory.auction.query_generation != *query_generation {
+                    return reject("stale_auction", "auction query generation changed", true);
+                }
+                let Some(listing) = snapshot.state.inventory.auction.listings.get(listing_id)
+                else {
+                    return reject(
+                        "listing_missing",
+                        "auction listing is no longer current",
+                        true,
+                    );
+                };
+                if listing.buyout > *max_buyout || listing.buyout > snapshot.state.inventory.money {
+                    return reject(
+                        "auction_price",
+                        "listing exceeds authorized buyout or current funds",
+                        false,
+                    );
+                }
+            }
+            GameplayCommand::MailTake {
+                mailbox_generation,
+                mail_id,
+            } => {
+                if snapshot.state.inventory.mailbox.generation != *mailbox_generation
+                    || !snapshot.state.inventory.mailbox.mails.contains_key(mail_id)
+                {
+                    return reject("stale_mail", "mailbox contents changed", true);
+                }
             }
             _ => {}
         }
@@ -83,32 +307,79 @@ impl ActionValidator {
 }
 
 fn send(action: ProposedAction) -> ValidationOutcome {
-    ValidationOutcome::Sendable(SendableAction::from_validated(ValidatedAction { id: action.id, task: action.task, origin: action.origin, stamp: action.stamp, command: action.command }))
+    ValidationOutcome::Sendable(SendableAction::from_validated(ValidatedAction {
+        id: action.id,
+        task: action.task,
+        origin: action.origin,
+        stamp: action.stamp,
+        command: action.command,
+    }))
 }
 
 fn required_permission(command: &GameplayCommand) -> PermissionSet {
     match command {
-        GameplayCommand::MoveTo(_) | GameplayCommand::FaceDirection { .. } | GameplayCommand::StopMovement => PermissionSet::MOVE,
-        GameplayCommand::ReleaseSpirit | GameplayCommand::QueryCorpse | GameplayCommand::ReclaimCorpse { .. } => PermissionSet::empty(),
-        GameplayCommand::Attack(_) | GameplayCommand::Cast { .. } | GameplayCommand::EnterVehicle(_) | GameplayCommand::VehicleCast { .. } => PermissionSet::COMBAT,
+        GameplayCommand::MoveTo(_)
+        | GameplayCommand::FaceDirection { .. }
+        | GameplayCommand::StopMovement => PermissionSet::MOVE,
+        GameplayCommand::ReleaseSpirit
+        | GameplayCommand::QueryCorpse
+        | GameplayCommand::ReclaimCorpse { .. } => PermissionSet::empty(),
+        GameplayCommand::Attack(_)
+        | GameplayCommand::Cast { .. }
+        | GameplayCommand::EnterVehicle(_)
+        | GameplayCommand::VehicleCast { .. } => PermissionSet::COMBAT,
         GameplayCommand::MaintainBuff { .. } => PermissionSet::MAINTENANCE,
         GameplayCommand::Loot(_) => PermissionSet::LOOT,
         GameplayCommand::Gather(_) | GameplayCommand::Fish => PermissionSet::GATHER,
-        GameplayCommand::QueryQuestGivers | GameplayCommand::QueryQuest { .. } | GameplayCommand::AcceptQuest { .. } | GameplayCommand::TurnInQuest { .. } | GameplayCommand::RequestQuestReward { .. } | GameplayCommand::ChooseQuestReward { .. } => PermissionSet::QUEST,
-        GameplayCommand::VendorBuy { .. } | GameplayCommand::VendorSell { .. } => PermissionSet::ECONOMY,
-        GameplayCommand::TradeAccept { .. } | GameplayCommand::AuctionBuy { .. } | GameplayCommand::MailTake { .. } => PermissionSet::ECONOMY | PermissionSet::ASSET_TRANSFER,
+        GameplayCommand::QueryQuestGivers
+        | GameplayCommand::QueryQuest { .. }
+        | GameplayCommand::AcceptQuest { .. }
+        | GameplayCommand::TurnInQuest { .. }
+        | GameplayCommand::RequestQuestReward { .. }
+        | GameplayCommand::ChooseQuestReward { .. } => PermissionSet::QUEST,
+        GameplayCommand::VendorBuy { .. } | GameplayCommand::VendorSell { .. } => {
+            PermissionSet::ECONOMY
+        }
+        GameplayCommand::TradeAccept { .. }
+        | GameplayCommand::AuctionBuy { .. }
+        | GameplayCommand::MailTake { .. } => {
+            PermissionSet::ECONOMY | PermissionSet::ASSET_TRANSFER
+        }
         GameplayCommand::Chat { .. } => PermissionSet::CHAT,
         GameplayCommand::Raw { .. } => PermissionSet::SERVER_COMMAND,
-        GameplayCommand::Interact(_) | GameplayCommand::UseGameObject(_) | GameplayCommand::CastGameObject { .. } | GameplayCommand::UseItem { .. } | GameplayCommand::UseItemInstance { .. } => PermissionSet::empty(),
+        GameplayCommand::Interact(_)
+        | GameplayCommand::UseGameObject(_)
+        | GameplayCommand::CastGameObject { .. }
+        | GameplayCommand::UseItem { .. }
+        | GameplayCommand::UseItemInstance { .. } => PermissionSet::empty(),
     }
 }
 
 fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
     match origin {
         PlanOrigin::Dialogue => matches!(command, GameplayCommand::Chat { .. }),
-        PlanOrigin::Llm => !matches!(command, GameplayCommand::Raw { .. } | GameplayCommand::Chat { .. } | GameplayCommand::TradeAccept { .. } | GameplayCommand::AuctionBuy { .. } | GameplayCommand::MailTake { .. }),
-        PlanOrigin::Recovery => !matches!(command, GameplayCommand::Raw { .. } | GameplayCommand::Chat { .. }),
-        PlanOrigin::Deterministic | PlanOrigin::SystemPolicy | PlanOrigin::GroupPolicy => !matches!(command, GameplayCommand::Raw { .. } | GameplayCommand::Chat { .. } | GameplayCommand::ReleaseSpirit | GameplayCommand::QueryCorpse | GameplayCommand::ReclaimCorpse { .. }),
+        PlanOrigin::Llm => !matches!(
+            command,
+            GameplayCommand::Raw { .. }
+                | GameplayCommand::Chat { .. }
+                | GameplayCommand::TradeAccept { .. }
+                | GameplayCommand::AuctionBuy { .. }
+                | GameplayCommand::MailTake { .. }
+        ),
+        PlanOrigin::Recovery => !matches!(
+            command,
+            GameplayCommand::Raw { .. } | GameplayCommand::Chat { .. }
+        ),
+        PlanOrigin::Deterministic | PlanOrigin::SystemPolicy | PlanOrigin::GroupPolicy => {
+            !matches!(
+                command,
+                GameplayCommand::Raw { .. }
+                    | GameplayCommand::Chat { .. }
+                    | GameplayCommand::ReleaseSpirit
+                    | GameplayCommand::QueryCorpse
+                    | GameplayCommand::ReclaimCorpse { .. }
+            )
+        }
         PlanOrigin::Operator => true,
     }
 }
@@ -116,40 +387,91 @@ fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
 fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
     match stage {
         ActivationStage::Observe => matches!(command, GameplayCommand::Chat { .. }),
-        ActivationStage::Maintain => matches!(command, GameplayCommand::Chat { .. } | GameplayCommand::UseItem { .. } | GameplayCommand::UseItemInstance { .. } | GameplayCommand::MaintainBuff { .. }),
-        ActivationStage::Move => matches!(command, GameplayCommand::Chat { .. } | GameplayCommand::UseItem { .. } | GameplayCommand::UseItemInstance { .. } | GameplayCommand::MaintainBuff { .. } | GameplayCommand::MoveTo(_) | GameplayCommand::FaceDirection { .. } | GameplayCommand::StopMovement),
+        ActivationStage::Maintain => matches!(
+            command,
+            GameplayCommand::Chat { .. }
+                | GameplayCommand::UseItem { .. }
+                | GameplayCommand::UseItemInstance { .. }
+                | GameplayCommand::MaintainBuff { .. }
+        ),
+        ActivationStage::Move => matches!(
+            command,
+            GameplayCommand::Chat { .. }
+                | GameplayCommand::UseItem { .. }
+                | GameplayCommand::UseItemInstance { .. }
+                | GameplayCommand::MaintainBuff { .. }
+                | GameplayCommand::MoveTo(_)
+                | GameplayCommand::FaceDirection { .. }
+                | GameplayCommand::StopMovement
+        ),
         ActivationStage::Act => true,
     }
 }
 
 fn active_quest_creature_target(snapshot: &Snapshot, entry: u32) -> bool {
-    snapshot.state.quests.active.iter().any(|(quest, progress)| {
-        if progress.complete { return false; }
-        let Some(definition) = snapshot.state.quests.definitions.get(quest) else { return false; };
-        definition.targets.iter().any(|target| {
-            target.kind == wow_state::quests::QuestTargetKind::Creature
-                && target.entry == entry
-                && progress.objectives.get(target.slot).copied().unwrap_or_default() < target.required
+    snapshot
+        .state
+        .quests
+        .active
+        .iter()
+        .any(|(quest, progress)| {
+            if progress.complete {
+                return false;
+            }
+            let Some(definition) = snapshot.state.quests.definitions.get(quest) else {
+                return false;
+            };
+            definition.targets.iter().any(|target| {
+                target.kind == wow_state::quests::QuestTargetKind::Creature
+                    && target.entry == entry
+                    && progress
+                        .objectives
+                        .get(target.slot)
+                        .copied()
+                        .unwrap_or_default()
+                        < target.required
+            })
         })
-    })
 }
 
 fn active_quest_item_source(snapshot: &Snapshot, entry: u32) -> bool {
-    snapshot.state.quests.active.iter().any(|(quest, progress)| {
-        if progress.complete { return false; }
-        let Some(definition) = snapshot.state.quests.definitions.get(quest) else { return false; };
-        definition.items.iter().any(|item| {
-            let current = snapshot.state.inventory.items.get(&item.item).copied().unwrap_or_default();
-            current < item.required
-                && wow_policy::questing::static_hints::item_source_entries(item.item)
-                    .iter()
-                    .any(|(kind, source_entry)| *kind == wow_state::quests::QuestTargetKind::Creature && *source_entry == entry)
+    snapshot
+        .state
+        .quests
+        .active
+        .iter()
+        .any(|(quest, progress)| {
+            if progress.complete {
+                return false;
+            }
+            let Some(definition) = snapshot.state.quests.definitions.get(quest) else {
+                return false;
+            };
+            definition.items.iter().any(|item| {
+                let current = snapshot
+                    .state
+                    .inventory
+                    .items
+                    .get(&item.item)
+                    .copied()
+                    .unwrap_or_default();
+                current < item.required
+                    && wow_policy::questing::static_hints::item_source_entries(item.item)
+                        .iter()
+                        .any(|(kind, source_entry)| {
+                            *kind == wow_state::quests::QuestTargetKind::Creature
+                                && *source_entry == entry
+                        })
+            })
         })
-    })
 }
 
 fn reject(code: &str, message: &str, retryable: bool) -> ValidationOutcome {
-    ValidationOutcome::Rejected(ActionFailure { code: code.into(), message: message.into(), retryable })
+    ValidationOutcome::Rejected(ActionFailure {
+        code: code.into(),
+        message: message.into(),
+        retryable,
+    })
 }
 
 #[cfg(test)]
@@ -188,10 +510,16 @@ mod tests {
         };
         let outcome = ActionValidator::validate(
             &snapshot(),
-            ValidationContext { current: base_stamp(), stage: ActivationStage::Act, permissions: PermissionSet::ALL },
+            ValidationContext {
+                current: base_stamp(),
+                stage: ActivationStage::Act,
+                permissions: PermissionSet::ALL,
+            },
             action,
         );
-        assert!(matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "stale_state"));
+        assert!(
+            matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "stale_state")
+        );
     }
 
     #[test]
@@ -201,28 +529,47 @@ mod tests {
         state.revision = base_stamp().state;
         state.session.in_world = true;
         for (guid, slot) in [(10, 3), (11, 1)] {
-            state.inventory.instances.insert(EntityId(guid), InventoryItemInstance {
-                item: 99, guid: EntityId(guid), backpack_slot: slot, count: 1,
-            });
+            state.inventory.instances.insert(
+                EntityId(guid),
+                InventoryItemInstance {
+                    item: 99,
+                    guid: EntityId(guid),
+                    backpack_slot: slot,
+                    count: 1,
+                },
+            );
         }
         let snapshot = Snapshot::from_state(&state);
-        let validate = |guid, slot| ActionValidator::validate(
-            &snapshot,
-            ValidationContext { current: base_stamp(), stage: ActivationStage::Act, permissions: PermissionSet::ALL },
-            ProposedAction {
-                id: ActionId(1), task: TaskId(1), origin: PlanOrigin::Operator,
-                stamp: base_stamp(),
-                command: GameplayCommand::UseItemInstance {
-                    item: 99, item_guid: EntityId(guid), backpack_slot: slot,
-                    spell: 0, target: None, cast_count: 0,
+        let validate = |guid, slot| {
+            ActionValidator::validate(
+                &snapshot,
+                ValidationContext {
+                    current: base_stamp(),
+                    stage: ActivationStage::Act,
+                    permissions: PermissionSet::ALL,
                 },
-            },
-        );
+                ProposedAction {
+                    id: ActionId(1),
+                    task: TaskId(1),
+                    origin: PlanOrigin::Operator,
+                    stamp: base_stamp(),
+                    command: GameplayCommand::UseItemInstance {
+                        item: 99,
+                        item_guid: EntityId(guid),
+                        backpack_slot: slot,
+                        spell: 0,
+                        target: None,
+                        cast_count: 0,
+                    },
+                },
+            )
+        };
         assert!(matches!(validate(10, 3), ValidationOutcome::Sendable(_)));
         assert!(matches!(validate(11, 1), ValidationOutcome::Sendable(_)));
-        assert!(matches!(validate(12, 1), ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "stale_item_instance"));
+        assert!(
+            matches!(validate(12, 1), ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "stale_item_instance")
+        );
     }
-
 
     #[test]
     fn recovery_attack_is_authorized_for_npc_targeting_player_without_pull_ownership() {
@@ -230,12 +577,42 @@ mod tests {
         let mut state = AuthoritativeState::default();
         state.session.in_world = true;
         state.session.character_guid = Some(1);
-        state.entities.0.insert(EntityId(1), EntityState { id: EntityId(1), kind: EntityKind::Player, ..Default::default() });
-        state.entities.0.insert(EntityId(9), EntityState { id: EntityId(9), kind: EntityKind::Unit, health: Some((10,10)), target: Some(EntityId(1)), ..Default::default() });
+        state.entities.0.insert(
+            EntityId(1),
+            EntityState {
+                id: EntityId(1),
+                kind: EntityKind::Player,
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            EntityId(9),
+            EntityState {
+                id: EntityId(9),
+                kind: EntityKind::Unit,
+                health: Some((10, 10)),
+                target: Some(EntityId(1)),
+                ..Default::default()
+            },
+        );
         let snapshot = Snapshot::from_state(&state);
         let stamp = ValidityStamp::default();
-        let action = ProposedAction { id: ActionId(1), task: TaskId(1), origin: PlanOrigin::Recovery, stamp, command: GameplayCommand::Attack(EntityId(9)) };
-        let result = ActionValidator::validate(&snapshot, ValidationContext { current: stamp, stage: ActivationStage::Act, permissions: PermissionSet::empty() }, action);
+        let action = ProposedAction {
+            id: ActionId(1),
+            task: TaskId(1),
+            origin: PlanOrigin::Recovery,
+            stamp,
+            command: GameplayCommand::Attack(EntityId(9)),
+        };
+        let result = ActionValidator::validate(
+            &snapshot,
+            ValidationContext {
+                current: stamp,
+                stage: ActivationStage::Act,
+                permissions: PermissionSet::empty(),
+            },
+            action,
+        );
         assert!(matches!(result, ValidationOutcome::Sendable(_)));
     }
 
@@ -244,19 +621,40 @@ mod tests {
         use wow_state::entities::{EntityKind, EntityState};
         let mut state = AuthoritativeState::default();
         state.session.in_world = true;
-        state.position.player = Some(WorldPosition { map: 609, point: Vec3::new(0.0, 0.0, 0.0), orientation: 0.0 });
-        state.control.mover = Some(EntityId(500));
-        state.control.mover_position = Some(WorldPosition { map: 609, point: Vec3::new(0.0, 0.0, 40.0), orientation: 0.0 });
-        state.entities.0.insert(EntityId(900), EntityState {
-            id: EntityId(900),
-            entry: 28525,
-            kind: EntityKind::Unit,
-            position: Some(WorldPosition { map: 609, point: Vec3::new(50.0, 0.0, 40.0), orientation: 0.0 }),
-            ..Default::default()
+        state.position.player = Some(WorldPosition {
+            map: 609,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
         });
+        state.control.mover = Some(EntityId(500));
+        state.control.mover_position = Some(WorldPosition {
+            map: 609,
+            point: Vec3::new(0.0, 0.0, 40.0),
+            orientation: 0.0,
+        });
+        state.entities.0.insert(
+            EntityId(900),
+            EntityState {
+                id: EntityId(900),
+                entry: 28525,
+                kind: EntityKind::Unit,
+                position: Some(WorldPosition {
+                    map: 609,
+                    point: Vec3::new(50.0, 0.0, 40.0),
+                    orientation: 0.0,
+                }),
+                ..Default::default()
+            },
+        );
         let snapshot = Snapshot::from_state(&state);
-        let requirement = spatial::movement_requirement(&snapshot, &GameplayCommand::VehicleCast { spell: 51858, target: Some(EntityId(900)) })
-            .expect("out-of-range controlled spell should request movement");
+        let requirement = spatial::movement_requirement(
+            &snapshot,
+            &GameplayCommand::VehicleCast {
+                spell: 51858,
+                target: Some(EntityId(900)),
+            },
+        )
+        .expect("out-of-range controlled spell should request movement");
         assert_eq!(requirement.destination, Vec3::new(50.0, 0.0, 40.0));
         assert_eq!(requirement.acceptable_range, 18.0);
     }
@@ -268,13 +666,22 @@ mod tests {
             task: TaskId(2),
             origin: PlanOrigin::Dialogue,
             stamp: base_stamp(),
-            command: GameplayCommand::Raw { opcode: 1, body: vec![] },
+            command: GameplayCommand::Raw {
+                opcode: 1,
+                body: vec![],
+            },
         };
         let outcome = ActionValidator::validate(
             &snapshot(),
-            ValidationContext { current: base_stamp(), stage: ActivationStage::Act, permissions: PermissionSet::ALL },
+            ValidationContext {
+                current: base_stamp(),
+                stage: ActivationStage::Act,
+                permissions: PermissionSet::ALL,
+            },
             action,
         );
-        assert!(matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "origin_forbidden"));
+        assert!(
+            matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "origin_forbidden")
+        );
     }
 }

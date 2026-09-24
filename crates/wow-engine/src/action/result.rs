@@ -17,8 +17,12 @@ impl TerminalResults {
     pub fn record(&mut self, result: &ExecutionResult) -> bool {
         match result {
             ExecutionResult::Submitted(_) => true,
-            ExecutionResult::Completed(id) | ExecutionResult::Failed(id, _) => self.terminal.insert(*id),
+            ExecutionResult::Completed(id) | ExecutionResult::Failed(id, _) => {
+                self.terminal.insert(*id)
+            }
         }
     }
-    pub fn is_terminal(&self, id: ActionId) -> bool { self.terminal.contains(&id) }
+    pub fn is_terminal(&self, id: ActionId) -> bool {
+        self.terminal.contains(&id)
+    }
 }

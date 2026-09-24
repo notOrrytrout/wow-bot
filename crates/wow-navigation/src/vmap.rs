@@ -1,1 +1,4 @@
-#[derive(Clone,Debug,Default)]pub struct VmapSource{pub root:String}
+#[derive(Clone, Debug, Default)]
+pub struct VmapSource {
+    pub root: String,
+}

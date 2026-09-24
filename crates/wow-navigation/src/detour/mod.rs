@@ -9,18 +9,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-
-
 use anyhow::{Context, Result, bail};
 
-
 use reader::PacketReader;
-
 
 mod reader;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlayerPositionSource { Authoritative }
+pub enum PlayerPositionSource {
+    Authoritative,
+}
 
 #[derive(Clone, Debug)]
 pub struct NavigationTuning {
@@ -35,17 +33,29 @@ pub struct NavigationTuning {
     pub max_terrain_height_reconcile_yards: f32,
 }
 impl Default for NavigationTuning {
-    fn default() -> Self { Self {
-        nearest_horizontal_yards: 3.0, nearest_vertical_yards: 16.0,
-        destination_projection_horizontal_yards: 12.0, max_visited_nodes: 4096,
-        long_route_nodes_per_yard: 96, long_route_max_visited_nodes: 65536,
-        graph_cache_capacity: 4, terrain_sample_spacing_yards: 1.0,
-        max_terrain_height_reconcile_yards: 2.5,
-    }}
+    fn default() -> Self {
+        Self {
+            nearest_horizontal_yards: 3.0,
+            nearest_vertical_yards: 16.0,
+            destination_projection_horizontal_yards: 12.0,
+            max_visited_nodes: 4096,
+            long_route_nodes_per_yard: 96,
+            long_route_max_visited_nodes: 65536,
+            graph_cache_capacity: 4,
+            terrain_sample_spacing_yards: 1.0,
+            max_terrain_height_reconcile_yards: 2.5,
+        }
+    }
 }
 
-fn lock_recover<'a, T>(mutex: &'a std::sync::Mutex<T>, _name: &'static str) -> std::sync::MutexGuard<'a, T> {
-    match mutex.lock() { Ok(guard) => guard, Err(poisoned) => poisoned.into_inner() }
+fn lock_recover<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    _name: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 mod cache;
