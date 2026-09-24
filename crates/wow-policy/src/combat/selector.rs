@@ -269,6 +269,10 @@ pub fn select_action(snapshot: &Snapshot, target: EntityId) -> Result<CombatActi
         return Ok(cast_action(spell, heal_target, combat_cycle(snapshot)));
     }
 
+    if let Some((spell, utility_target)) = select_combat_utility(snapshot, target) {
+        return Ok(cast_action(spell, utility_target, combat_cycle(snapshot)));
+    }
+
     let cycle = combat_cycle(snapshot);
     match select(snapshot, target) {
         CombatDecision::Cast { spell, target } => Ok(cast_action(spell, target, cycle)),
@@ -279,6 +283,181 @@ pub fn select_action(snapshot: &Snapshot, target: EntityId) -> Result<CombatActi
         }),
         CombatDecision::Deferred { reason } => Err(reason),
     }
+}
+
+/// Select one bounded dispel or refresh an owned crowd-control effect before
+/// normal damage. Aura ownership and group membership come from observations;
+/// readiness remains the final authority for every cast.
+fn select_combat_utility(snapshot: &Snapshot, target: EntityId) -> Option<(u32, EntityId)> {
+    let player = snapshot.state.session.character_guid.map(EntityId)?;
+    let class_id = snapshot.state.capabilities.class_id?;
+    let now_ms = Millis::wall_clock_now().0;
+
+    // Refresh only effects which this player applied to a valid hostile target.
+    let cc = match class_id {
+        2 => &[20066][..],                // Repentance
+        5 => &[9484, 9485],               // Shackle Undead
+        7 => &[51514],                    // Hex
+        8 => &[118, 12824, 12825, 12826], // Polymorph
+        9 => &[710, 18647, 18658],        // Banish
+        11 => &[2637, 339, 770, 1062],    // Hibernate / Roots
+        _ => &[],
+    };
+    for (entity, state) in &snapshot.state.entities.0 {
+        if *entity != target || !state.hostile || state.is_dead() {
+            continue;
+        }
+        let Some(auras) = snapshot.state.auras.by_entity.get(entity) else {
+            continue;
+        };
+        for aura in auras.values() {
+            if aura.caster != Some(player) || !cc.contains(&aura.spell) {
+                continue;
+            }
+            let Some(remaining) = aura.remaining_ms else {
+                continue;
+            };
+            let window = aura
+                .max_duration_ms
+                .map(|duration| (duration / 5).clamp(1_000, 3_000))
+                .unwrap_or(1_500);
+            if remaining <= 300 || remaining > window {
+                continue;
+            }
+            if snapshot.state.capabilities.spells.contains(&aura.spell)
+                && crate::combat::readiness::check_spell_readiness(
+                    snapshot,
+                    aura.spell,
+                    Some(*entity),
+                    now_ms,
+                )
+                .is_ok()
+            {
+                return Some((aura.spell, *entity));
+            }
+        }
+    }
+
+    // Purge only a buff which the observed hostile cast on itself. This keeps
+    // the selector from treating our magic debuffs as enemy buffs.
+    if let Some(enemy) = snapshot
+        .state
+        .entities
+        .0
+        .get(&target)
+        .filter(|entity| entity.hostile && !entity.is_dead())
+    {
+        let offensive = match class_id {
+            3 => &[19801][..], // Tranquilizing Shot
+            5 => &[976, 988],  // Dispel Magic
+            7 => &[370, 8012], // Purge
+            8 => &[30449],     // Spellsteal
+            _ => &[],
+        };
+        let owns_buff = snapshot
+            .state
+            .auras
+            .by_entity
+            .get(&target)
+            .is_some_and(|auras| {
+                auras.values().any(|aura| {
+                    aura.positive == Some(true)
+                        && aura.caster == Some(target)
+                        && aura.remaining_ms.is_none_or(|remaining| remaining > 500)
+                })
+            });
+        if owns_buff {
+            if let Some(spell) = offensive.iter().copied().find(|spell| {
+                snapshot.state.capabilities.spells.contains(spell)
+                    && crate::combat::readiness::check_spell_readiness(
+                        snapshot,
+                        *spell,
+                        Some(enemy.id),
+                        now_ms,
+                    )
+                    .is_ok()
+            }) {
+                return Some((spell, enemy.id));
+            }
+        }
+    }
+
+    // The state feed does not include DBC dispel types. Use a deliberately
+    // small set of well-known dangerous debuffs and require authoritative,
+    // explicitly harmful aura state on the player or an online group member.
+    let targets = std::iter::once(player).chain(crate::group::state::online_members_except(
+        snapshot,
+        Some(player),
+    ));
+    for member in targets {
+        let Some(auras) = snapshot.state.auras.by_entity.get(&member) else {
+            continue;
+        };
+        if auras.values().any(|aura| {
+            aura.positive == Some(false)
+                && matches!(
+                    aura.spell,
+                    118 | 51514
+                        | 605
+                        | 710
+                        | 7922
+                        | 8643
+                        | 11719
+                        | 12355
+                        | 12824
+                        | 12825
+                        | 12826
+                        | 14308
+                        | 18469
+                        | 20066
+                        | 2094
+                        | 24394
+                        | 27068
+                        | 27223
+                        | 27224
+                        | 33786
+                        | 34490
+                        | 44572
+                        | 49203
+                        | 49206
+                        | 49231
+                        | 49233
+                        | 53308
+                        | 64803
+                        | 65809
+                        | 66054
+                        | 66058
+                        | 66060
+                        | 66061
+                        | 66062
+                        | 66063
+                        | 66064
+                        | 66065
+                )
+        }) {
+            let dispel = match class_id {
+                2 => &[4987, 53551][..],
+                5 => &[527, 988, 528][..],
+                7 => &[51886, 526][..],
+                8 => &[475, 2893][..],
+                11 => &[2782, 2893][..],
+                _ => &[],
+            };
+            if let Some(spell) = dispel.iter().copied().find(|spell| {
+                snapshot.state.capabilities.spells.contains(spell)
+                    && crate::combat::readiness::check_spell_readiness(
+                        snapshot,
+                        *spell,
+                        Some(member),
+                        now_ms,
+                    )
+                    .is_ok()
+            }) {
+                return Some((spell, member));
+            }
+        }
+    }
+    None
 }
 
 fn cast_action(spell: u32, target: EntityId, cycle: std::time::Duration) -> CombatAction {
@@ -507,6 +686,203 @@ mod tests {
             },
         );
         state
+    }
+
+    #[test]
+    fn dispel_selection_requires_a_known_harmful_aura_and_authorized_target() {
+        let target = EntityId(9);
+        let mut state = state(5, 0, 0, 100, target);
+        state.capabilities.spells.insert(527); // Dispel Magic
+        state
+            .auras
+            .by_entity
+            .entry(EntityId(1))
+            .or_default()
+            .insert(
+                0,
+                wow_state::auras::AuraInstance {
+                    slot: 0,
+                    spell: 118,
+                    positive: Some(false),
+                    caster: None,
+                    max_duration_ms: None,
+                    remaining_ms: None,
+                },
+            );
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(
+            select_combat_utility(&snapshot, target),
+            Some((527, EntityId(1)))
+        );
+
+        state
+            .auras
+            .by_entity
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .positive = Some(true);
+        assert_eq!(
+            select_combat_utility(&Snapshot::from_state(&state), target),
+            None
+        );
+    }
+
+    #[test]
+    fn crowd_control_refresh_preserves_effects_owned_by_another_caster() {
+        let target = EntityId(9);
+        let mut state = state(11, 0, 0, 100, target);
+        state.entities.0.get_mut(&target).unwrap().hostile = true;
+        state.entities.0.get_mut(&target).unwrap().position = Some(wow_domain::WorldPosition {
+            map: 0,
+            point: wow_domain::Vec3::new(10.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.position.player = Some(wow_domain::WorldPosition {
+            map: 0,
+            point: wow_domain::Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.capabilities.spells.insert(339);
+        let aura = wow_state::auras::AuraInstance {
+            slot: 0,
+            spell: 339,
+            positive: Some(false),
+            caster: Some(EntityId(1)),
+            max_duration_ms: Some(50_000),
+            remaining_ms: Some(1_200),
+        };
+        state
+            .auras
+            .by_entity
+            .entry(target)
+            .or_default()
+            .insert(0, aura.clone());
+        assert!(
+            crate::combat::readiness::check_spell_readiness(
+                &Snapshot::from_state(&state),
+                339,
+                Some(target),
+                Millis::wall_clock_now().0
+            )
+            .is_ok(),
+            "{:?}",
+            crate::combat::readiness::check_spell_readiness(
+                &Snapshot::from_state(&state),
+                339,
+                Some(target),
+                Millis::wall_clock_now().0
+            )
+        );
+        assert_eq!(
+            select_combat_utility(&Snapshot::from_state(&state), target),
+            Some((339, target))
+        );
+
+        state
+            .auras
+            .by_entity
+            .get_mut(&target)
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .caster = Some(EntityId(3));
+        assert_eq!(
+            select_combat_utility(&Snapshot::from_state(&state), target),
+            None
+        );
+    }
+
+    #[test]
+    fn offensive_dispel_requires_an_observed_hostile_owned_buff() {
+        let target = EntityId(9);
+        let mut state = state(7, 0, 0, 100, target);
+        state.entities.0.get_mut(&target).unwrap().hostile = true;
+        state.capabilities.spells.insert(370); // Purge
+        state.auras.by_entity.entry(target).or_default().insert(
+            0,
+            wow_state::auras::AuraInstance {
+                slot: 0,
+                spell: 1459,
+                positive: Some(true),
+                caster: Some(target),
+                max_duration_ms: Some(30_000),
+                remaining_ms: Some(10_000),
+            },
+        );
+        assert_eq!(
+            select_combat_utility(&Snapshot::from_state(&state), target),
+            Some((370, target))
+        );
+
+        state
+            .auras
+            .by_entity
+            .get_mut(&target)
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .caster = Some(EntityId(1));
+        assert_eq!(
+            select_combat_utility(&Snapshot::from_state(&state), target),
+            None
+        );
+    }
+
+    #[test]
+    fn utility_cast_precedes_regular_damage_but_interrupts_remain_first() {
+        let target = EntityId(9);
+        let mut state = state(5, 0, 0, 100, target);
+        state.entities.0.get_mut(&target).unwrap().hostile = true;
+        state.capabilities.spells.extend([527, 585]); // Dispel Magic, Smite
+        state
+            .auras
+            .by_entity
+            .entry(EntityId(1))
+            .or_default()
+            .insert(
+                0,
+                wow_state::auras::AuraInstance {
+                    slot: 0,
+                    spell: 118,
+                    positive: Some(false),
+                    caster: None,
+                    max_duration_ms: None,
+                    remaining_ms: None,
+                },
+            );
+        assert_eq!(
+            select_action(&Snapshot::from_state(&state), target)
+                .unwrap()
+                .command,
+            GameplayCommand::Cast {
+                spell: 527,
+                target: Some(EntityId(1))
+            }
+        );
+
+        state.capabilities.class_id = Some(8);
+        state.capabilities.spells.remove(&527);
+        state.capabilities.spells.insert(2139); // Counterspell
+        let now = Millis::wall_clock_now().0;
+        state.active_casts.insert(
+            target,
+            ActiveCastState {
+                spell: 1,
+                started_at_ms: now,
+                ends_at_ms: now + 5_000,
+            },
+        );
+        assert_eq!(
+            select_action(&Snapshot::from_state(&state), target)
+                .unwrap()
+                .command,
+            GameplayCommand::Cast {
+                spell: 2139,
+                target: Some(target)
+            }
+        );
     }
 
     #[test]
