@@ -4,7 +4,7 @@ use std::{
     sync::OnceLock,
     time::{Duration, Instant},
 };
-use wow_domain::{EntityId, Millis};
+use wow_domain::{EntityId, time::Millis};
 use wow_state::Snapshot;
 
 #[derive(Clone, Debug, Deserialize)]

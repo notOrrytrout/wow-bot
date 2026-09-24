@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::{collections::BTreeMap, sync::OnceLock};
-use wow_domain::{EntityId, Millis};
+use wow_domain::{EntityId, time::Millis};
 use wow_state::Snapshot;
 
 #[derive(Clone, Debug, Deserialize)]
