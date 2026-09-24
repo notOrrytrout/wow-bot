@@ -128,7 +128,12 @@ fn validate_spatial_command(
         | GameplayCommand::Loot(entity)
         | GameplayCommand::Gather(entity)
         | GameplayCommand::EnterVehicle(entity) => {
-            require_authoritative_target(snapshot, Some(*entity), "target is not authoritative")?;
+            require_authoritative_entity(
+                snapshot,
+                Some(*entity),
+                "unknown_entity",
+                "target is not authoritative",
+            )?;
         }
         GameplayCommand::Cast { spell, target } => {
             if !snapshot.state.capabilities.spells.contains(spell)
@@ -140,7 +145,12 @@ fn validate_spatial_command(
                     false,
                 ));
             }
-            require_authoritative_target(snapshot, *target, "spell target is not authoritative")?;
+            require_authoritative_entity(
+                snapshot,
+                *target,
+                "unknown_entity",
+                "spell target is not authoritative",
+            )?;
         }
         GameplayCommand::MaintainBuff { spell, target } => {
             if !snapshot.state.capabilities.spells.contains(spell) {
@@ -152,9 +162,10 @@ fn validate_spatial_command(
             }
             let self_guid = snapshot.state.session.character_guid.map(EntityId);
             if Some(*target) != self_guid {
-                require_authoritative_target(
+                require_authoritative_entity(
                     snapshot,
                     Some(*target),
+                    "unknown_entity",
                     "maintenance target is not authoritative",
                 )?;
             }
@@ -170,7 +181,12 @@ fn validate_spatial_command(
             if !snapshot.state.inventory.has(*item, 1) {
                 return Err(reject("missing_item", "item is no longer present", false));
             }
-            require_authoritative_target(snapshot, *target, "item target is not authoritative")?;
+            require_authoritative_entity(
+                snapshot,
+                *target,
+                "unknown_entity",
+                "item target is not authoritative",
+            )?;
         }
         GameplayCommand::UseItemInstance {
             item,
@@ -196,7 +212,12 @@ fn validate_spatial_command(
                     true,
                 ));
             }
-            require_authoritative_target(snapshot, *target, "item target is not authoritative")?;
+            require_authoritative_entity(
+                snapshot,
+                *target,
+                "unknown_entity",
+                "item target is not authoritative",
+            )?;
         }
         _ => {}
     }
@@ -209,13 +230,12 @@ fn validate_quest_command(
 ) -> Result<(), ValidationOutcome> {
     match command {
         GameplayCommand::AcceptQuest { quest, giver } => {
-            if !has_entity(snapshot, *giver) {
-                return Err(reject(
-                    "unknown_quest_giver",
-                    "quest giver is not authoritative",
-                    true,
-                ));
-            }
+            require_authoritative_entity(
+                snapshot,
+                Some(*giver),
+                "unknown_quest_giver",
+                "quest giver is not authoritative",
+            )?;
             if snapshot.state.quests.active.contains_key(quest)
                 || snapshot.state.quests.completed.contains(quest)
             {
@@ -229,13 +249,12 @@ fn validate_quest_command(
         GameplayCommand::TurnInQuest { quest, giver }
         | GameplayCommand::RequestQuestReward { quest, giver }
         | GameplayCommand::ChooseQuestReward { quest, giver, .. } => {
-            if !has_entity(snapshot, *giver) {
-                return Err(reject(
-                    "unknown_quest_giver",
-                    "quest giver is not authoritative",
-                    true,
-                ));
-            }
+            require_authoritative_entity(
+                snapshot,
+                Some(*giver),
+                "unknown_quest_giver",
+                "quest giver is not authoritative",
+            )?;
             if !snapshot
                 .state
                 .quests
@@ -337,15 +356,16 @@ fn validate_economy_command(
     Ok(())
 }
 
-fn require_authoritative_target(
+fn require_authoritative_entity(
     snapshot: &Snapshot,
     target: Option<EntityId>,
+    code: &str,
     message: &str,
 ) -> Result<(), ValidationOutcome> {
     if target.is_none_or(|entity| has_entity(snapshot, entity)) {
         Ok(())
     } else {
-        Err(reject("unknown_entity", message, true))
+        Err(reject(code, message, true))
     }
 }
 
