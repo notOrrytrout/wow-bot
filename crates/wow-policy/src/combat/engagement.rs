@@ -25,18 +25,22 @@ pub fn is_attacking_player_or_group(snapshot: &Snapshot, entity: EntityId) -> bo
     let Some(attacker) = snapshot.state.entities.0.get(&entity) else {
         return false;
     };
-    if attacker.kind != EntityKind::Unit {
-        return false;
-    }
-    if attacker.is_dead() {
-        return false;
-    }
-    attacker
-        .target
-        .is_some_and(|target| protected_guids(snapshot).contains(&target))
+    is_attacking_protected_guid(attacker, &protected_guids(snapshot))
+}
+
+fn is_attacking_protected_guid(
+    attacker: &wow_state::entities::EntityState,
+    protected: &BTreeSet<EntityId>,
+) -> bool {
+    attacker.kind == EntityKind::Unit
+        && !attacker.is_dead()
+        && attacker
+            .target
+            .is_some_and(|target| protected.contains(&target))
 }
 
 pub fn survival_attacker(snapshot: &Snapshot) -> Option<EntityId> {
+    let protected = protected_guids(snapshot);
     let player_position = snapshot
         .state
         .control
@@ -47,7 +51,7 @@ pub fn survival_attacker(snapshot: &Snapshot) -> Option<EntityId> {
         .entities
         .0
         .iter()
-        .filter(|(id, _)| is_attacking_player_or_group(snapshot, **id))
+        .filter(|(_, attacker)| is_attacking_protected_guid(attacker, &protected))
         .min_by(|(a_id, a), (b_id, b)| {
             let distance = |entity: &wow_state::entities::EntityState| match (
                 player_position,
