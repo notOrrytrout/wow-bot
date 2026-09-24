@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use wow_domain::{EntityId, Vec3};
 use wow_state::{
     Snapshot,
+    entities::{EntityKind, EntityState},
     quests::{QuestDefinition, QuestTargetKind},
 };
 
@@ -285,23 +286,10 @@ pub fn resolve_with_exclusions(
 fn nearest_live_gameobject_entry<'a>(
     snapshot: &'a Snapshot,
     entries: &[u32],
-) -> Option<&'a wow_state::entities::EntityState> {
-    let player = snapshot.state.position.player?;
-    snapshot
-        .state
-        .entities
-        .0
-        .values()
-        .filter(|entity| {
-            entity.kind == wow_state::entities::EntityKind::GameObject
-                && entries.contains(&entity.entry)
-        })
-        .filter_map(|entity| {
-            let position = entity.position?;
-            (position.map == player.map).then_some((player.point.distance(position.point), entity))
-        })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, entity)| entity)
+) -> Option<&'a EntityState> {
+    nearest_live_entity(snapshot, |entity| {
+        entity.kind == EntityKind::GameObject && entries.contains(&entity.entry)
+    })
 }
 
 fn nearest_live_target<'a>(
@@ -311,22 +299,29 @@ fn nearest_live_target<'a>(
     require_alive: bool,
     objective: usize,
     excluded: &BTreeSet<(usize, EntityId)>,
-) -> Option<&'a wow_state::entities::EntityState> {
+) -> Option<&'a EntityState> {
+    nearest_live_entity(snapshot, |entity| {
+        entity.entry == entry
+            && match kind {
+                QuestTargetKind::Creature => entity.kind == EntityKind::Unit,
+                QuestTargetKind::GameObject => entity.kind == EntityKind::GameObject,
+            }
+            && !excluded.contains(&(objective, entity.id))
+            && (!require_alive || !entity.health.is_some_and(|(current, _)| current == 0))
+    })
+}
+
+fn nearest_live_entity(
+    snapshot: &Snapshot,
+    matches: impl Fn(&EntityState) -> bool,
+) -> Option<&EntityState> {
     let player = snapshot.state.position.player?;
     snapshot
         .state
         .entities
         .0
         .values()
-        .filter(|entity| entity.entry == entry)
-        .filter(|entity| match kind {
-            QuestTargetKind::Creature => entity.kind == wow_state::entities::EntityKind::Unit,
-            QuestTargetKind::GameObject => {
-                entity.kind == wow_state::entities::EntityKind::GameObject
-            }
-        })
-        .filter(|entity| !excluded.contains(&(objective, entity.id)))
-        .filter(|entity| !require_alive || !entity.health.is_some_and(|(current, _)| current == 0))
+        .filter(|entity| matches(entity))
         .filter_map(|entity| {
             let position = entity.position?;
             (position.map == player.map).then_some((player.point.distance(position.point), entity))

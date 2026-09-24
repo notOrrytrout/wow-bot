@@ -115,28 +115,11 @@ pub fn decide_next(
         };
         let spell = desired.spell;
         if !has_same_or_better(snapshot, player, family, desired.strength) {
-            if retry_after
-                .get(&(spell, player))
-                .is_some_and(|deadline| *deadline > now)
-            {
+            let Some(decision) = cast_decision(snapshot, family, spell, player, retry_after, now)
+            else {
                 continue;
-            }
-            if let Err(reason) = crate::combat::readiness::check_spell_readiness(
-                snapshot,
-                spell,
-                Some(player),
-                wall_clock_ms(),
-            ) {
-                return MaintenanceDecision::Deferred {
-                    family: family.family.clone(),
-                    reason: readiness_reason(reason),
-                };
-            }
-            return MaintenanceDecision::Cast {
-                family: family.family.clone(),
-                spell,
-                target: player,
             };
+            return decision;
         }
         if include_party && family.party {
             for member in snapshot
@@ -155,32 +138,47 @@ pub fn decide_next(
                 if has_same_or_better(snapshot, member.entity, family, desired.strength) {
                     continue;
                 }
-                if retry_after
-                    .get(&(spell, member.entity))
-                    .is_some_and(|deadline| *deadline > now)
+                if let Some(decision) =
+                    cast_decision(snapshot, family, spell, member.entity, retry_after, now)
                 {
-                    continue;
+                    return decision;
                 }
-                if let Err(reason) = crate::combat::readiness::check_spell_readiness(
-                    snapshot,
-                    spell,
-                    Some(member.entity),
-                    wall_clock_ms(),
-                ) {
-                    return MaintenanceDecision::Deferred {
-                        family: family.family.clone(),
-                        reason: readiness_reason(reason),
-                    };
-                }
-                return MaintenanceDecision::Cast {
-                    family: family.family.clone(),
-                    spell,
-                    target: member.entity,
-                };
             }
         }
     }
     MaintenanceDecision::Satisfied
+}
+
+fn cast_decision(
+    snapshot: &Snapshot,
+    family: &BuffFamilyPolicy,
+    spell: u32,
+    target: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    if retry_after
+        .get(&(spell, target))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    if let Err(reason) = crate::combat::readiness::check_spell_readiness(
+        snapshot,
+        spell,
+        Some(target),
+        wall_clock_ms(),
+    ) {
+        return Some(MaintenanceDecision::Deferred {
+            family: family.family.clone(),
+            reason: readiness_reason(reason),
+        });
+    }
+    Some(MaintenanceDecision::Cast {
+        family: family.family.clone(),
+        spell,
+        target,
+    })
 }
 
 fn wall_clock_ms() -> u64 {
