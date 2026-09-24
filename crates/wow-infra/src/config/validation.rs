@@ -19,16 +19,7 @@ pub fn validate(config: &RuntimeConfig) -> Result<(), String> {
 }
 
 pub fn validate_runtime_data(config: &RuntimeConfig) -> Result<(), String> {
-    let p = config.runtime_data.resolved();
-    for (kind, path) in [
-        ("dbc", p.dbc),
-        ("maps", p.maps),
-        ("vmaps", p.vmaps),
-        ("mmaps", p.mmaps),
-    ] {
-        validate_data_directory(kind, &path)?;
-    }
-    Ok(())
+    validate_runtime_data_paths(config.runtime_data.resolved())
 }
 
 pub fn validate_runtime_data_root(root: impl AsRef<Path>) -> Result<(), String> {
@@ -39,12 +30,17 @@ pub fn validate_runtime_data_root(root: impl AsRef<Path>) -> Result<(), String> 
         vmaps: None,
         mmaps: None,
     };
-    let resolved = paths.resolved();
+    validate_runtime_data_paths(paths.resolved())
+}
+
+fn validate_runtime_data_paths(
+    paths: super::runtime_data::ResolvedRuntimeDataPaths,
+) -> Result<(), String> {
     for (kind, path) in [
-        ("dbc", resolved.dbc),
-        ("maps", resolved.maps),
-        ("vmaps", resolved.vmaps),
-        ("mmaps", resolved.mmaps),
+        ("dbc", paths.dbc),
+        ("maps", paths.maps),
+        ("vmaps", paths.vmaps),
+        ("mmaps", paths.mmaps),
     ] {
         validate_data_directory(kind, &path)?;
     }
