@@ -15,6 +15,7 @@ The workspace pins Tentacli 15.3.2 in `Cargo.toml`. If Cargo reports an adapter 
 
 The most important regression areas are:
 
+- an unexpected worker process exit or worker control disconnect stops the supervisor and its proxy tasks; headless sessions must not stay connected without a lane engine;
 - worker action validation rejects stale state, mission, permission, worker, and ownership generations;
 - proxy transport validation rejects stale worker, ownership, and movement generations;
 - player attach/movement/detach changes only the player-control pause reason;

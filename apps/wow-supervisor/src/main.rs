@@ -8,7 +8,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -222,12 +222,17 @@ async fn main() -> Result<()> {
 
     let routes = Arc::new(lane_io);
     let accept_routes = routes.clone();
-    let accept_task = tokio::spawn(async move { accept_workers(listener, accept_routes).await });
+    let (worker_disconnect_tx, mut worker_disconnect_rx) = mpsc::unbounded_channel();
+    let mut accept_task =
+        tokio::spawn(
+            async move { accept_workers(listener, accept_routes, worker_disconnect_tx).await },
+        );
 
     let runtime_paths = config.runtime.runtime_data.resolved();
     let mut children = Vec::new();
     for account in config.accounts.iter().filter(|a| a.enabled) {
-        children.push(
+        children.push((
+            account.lane,
             spawn_worker(
                 &worker_bin,
                 account.lane,
@@ -236,7 +241,7 @@ async fn main() -> Result<()> {
                 &runtime_paths.maps,
             )
             .await?,
-        );
+        ));
     }
 
     let dispatch_routes = routes.clone();
@@ -278,7 +283,7 @@ async fn main() -> Result<()> {
         warden_client_image: config.proxy.warden_client_image.clone(),
         log_dir: app_paths.logs.clone(),
     };
-    let proxy_task = tokio::spawn(wow_proxy::runtime::run(proxy, managed));
+    let mut proxy_task = tokio::spawn(wow_proxy::runtime::run(proxy, managed));
 
     // Workers begin in STARTUP_GATE. Clear it only after listeners and routing exist.
     for lane in routes.keys().copied() {
@@ -289,15 +294,60 @@ async fn main() -> Result<()> {
     }
     tracing::info!(accounts = routes.len(), "wow-bot runtime started");
 
-    tokio::select! {
-        result = proxy_task => result??,
-        result = accept_task => result??,
-        signal = shutdown_signal() => tracing::info!(signal, "shutdown requested"),
+    enum StopReason {
+        Proxy(std::result::Result<Result<()>, tokio::task::JoinError>),
+        Accept(std::result::Result<Result<()>, tokio::task::JoinError>),
+        Signal(&'static str),
+        WorkerExited(LaneId, ExitStatus),
+        WorkerConnectionEnded(String),
+        WorkerMonitorFailed(std::io::Error),
     }
+
+    let mut worker_check = tokio::time::interval(Duration::from_millis(500));
+    worker_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let shutdown_signal = shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    let stop_reason = loop {
+        tokio::select! {
+            result = &mut proxy_task => break StopReason::Proxy(result),
+            result = &mut accept_task => break StopReason::Accept(result),
+            signal = &mut shutdown_signal => break StopReason::Signal(signal),
+            message = worker_disconnect_rx.recv() => match message {
+                Some(message) => break StopReason::WorkerConnectionEnded(message),
+                None => break StopReason::WorkerMonitorFailed(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "worker disconnect monitor stopped",
+                )),
+            },
+            _ = worker_check.tick() => match exited_worker(&mut children) {
+                Ok(Some((lane, status))) => break StopReason::WorkerExited(lane, status),
+                Ok(None) => {},
+                Err(error) => break StopReason::WorkerMonitorFailed(error),
+            }
+        }
+    };
+
     let _ = supervisor_tx.send(SupervisorCommand::Shutdown).await;
     dispatcher.abort();
-    for child in &mut children {
+    proxy_task.abort();
+    accept_task.abort();
+    for (_, child) in &mut children {
         terminate(child).await;
+    }
+
+    match stop_reason {
+        StopReason::Proxy(result) => result.context("proxy runtime task failed")??,
+        StopReason::Accept(result) => result.context("worker accept task failed")??,
+        StopReason::Signal(signal) => tracing::info!(signal, "shutdown requested"),
+        StopReason::WorkerExited(lane, status) => {
+            bail!("worker for lane {lane} exited unexpectedly with status {status}")
+        }
+        StopReason::WorkerConnectionEnded(message) => {
+            bail!("worker control connection ended unexpectedly: {message}")
+        }
+        StopReason::WorkerMonitorFailed(error) => {
+            return Err(error).context("monitor worker process status");
+        }
     }
     Ok(())
 }
@@ -723,19 +773,25 @@ fn prompt_line(prompt: &str) -> Result<String> {
 async fn accept_workers(
     listener: TcpListener,
     routes: Arc<HashMap<LaneId, Arc<LaneIo>>>,
+    disconnect_tx: mpsc::UnboundedSender<String>,
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let routes = routes.clone();
+        let disconnect_tx = disconnect_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = attach_worker(stream, routes).await {
+            if let Err(e) = attach_worker(stream, routes, disconnect_tx).await {
                 tracing::warn!(%peer, error=%format_args!("{e:#}"), "worker control connection ended");
             }
         });
     }
 }
 
-async fn attach_worker(stream: TcpStream, routes: Arc<HashMap<LaneId, Arc<LaneIo>>>) -> Result<()> {
+async fn attach_worker(
+    stream: TcpStream,
+    routes: Arc<HashMap<LaneId, Arc<LaneIo>>>,
+    disconnect_tx: mpsc::UnboundedSender<String>,
+) -> Result<()> {
     stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
     let hello: WorkerWire = read_frame(&mut reader).await?;
@@ -783,19 +839,22 @@ async fn attach_worker(stream: TcpStream, routes: Arc<HashMap<LaneId, Arc<LaneIo
         match read_frame::<_, WorkerWire>(&mut reader).await {
             Ok(WorkerWire::Proxy(message)) => {
                 if w2p.send(message).await.is_err() {
-                    break;
+                    writer_task.abort();
+                    let message = worker_disconnect_message(lane, generation, "proxy route closed");
+                    let _ = disconnect_tx.send(message.clone());
+                    bail!(message);
                 }
             }
             Ok(WorkerWire::Event(event)) => log_worker_event(event),
             Ok(WorkerWire::Hello { .. }) => bail!("worker sent duplicate Hello"),
             Err(e) => {
                 writer_task.abort();
-                return Err(e.into());
+                let message = worker_disconnect_message(lane, generation, &e.to_string());
+                let _ = disconnect_tx.send(message.clone());
+                return Err(e).context(message);
             }
         }
     }
-    writer_task.abort();
-    Ok(())
 }
 
 fn log_worker_event(event: WorkerEvent) {
@@ -826,6 +885,7 @@ async fn spawn_worker(
 ) -> Result<Child> {
     tracing::info!(%lane, worker=%path.display(), "starting worker process");
     let mut child = Command::new(path)
+        .kill_on_drop(true)
         .arg("--lane")
         .arg(lane.to_string())
         .arg("--generation")
@@ -857,6 +917,21 @@ async fn spawn_worker(
         });
     }
     Ok(child)
+}
+
+fn exited_worker(
+    children: &mut [(LaneId, Child)],
+) -> std::io::Result<Option<(LaneId, ExitStatus)>> {
+    for (lane, child) in children {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some((*lane, status)));
+        }
+    }
+    Ok(None)
+}
+
+fn worker_disconnect_message(lane: LaneId, generation: WorkerGeneration, reason: &str) -> String {
+    format!("lane {lane} generation {}: {reason}", generation.get())
 }
 
 async fn resolve_worker_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -989,4 +1064,35 @@ async fn shutdown_signal() -> &'static str {
 async fn shutdown_signal() -> &'static str {
     let _ = tokio::signal::ctrl_c().await;
     "CTRL-C"
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_monitor_reports_the_lane_for_an_exited_child() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("start test worker");
+        child.wait().await.expect("wait for test worker");
+        let mut children = vec![(LaneId(4), child)];
+
+        let exited = exited_worker(&mut children).expect("check worker status");
+
+        assert_eq!(
+            exited.map(|(lane, status)| (lane, status.code())),
+            Some((LaneId(4), Some(7)))
+        );
+    }
+
+    #[test]
+    fn worker_disconnect_message_identifies_lane_and_generation() {
+        assert_eq!(
+            worker_disconnect_message(LaneId(4), WorkerGeneration(2), "unexpected end of file"),
+            "lane 4 generation 2: unexpected end of file"
+        );
+    }
 }
