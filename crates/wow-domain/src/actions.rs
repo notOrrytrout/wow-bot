@@ -114,6 +114,36 @@ pub enum GameplayCommand {
     },
 }
 
+impl PlanOrigin {
+    /// Check command classes that are forbidden to an action origin.
+    pub fn permits(self, command: &GameplayCommand) -> bool {
+        match self {
+            Self::Dialogue => matches!(command, GameplayCommand::Chat { .. }),
+            Self::Llm => !matches!(
+                command,
+                GameplayCommand::Raw { .. }
+                    | GameplayCommand::Chat { .. }
+                    | GameplayCommand::TradeAccept { .. }
+                    | GameplayCommand::AuctionBuy { .. }
+                    | GameplayCommand::MailTake { .. }
+            ),
+            Self::Recovery => !matches!(
+                command,
+                GameplayCommand::Raw { .. } | GameplayCommand::Chat { .. }
+            ),
+            Self::Deterministic | Self::SystemPolicy | Self::GroupPolicy => !matches!(
+                command,
+                GameplayCommand::Raw { .. }
+                    | GameplayCommand::Chat { .. }
+                    | GameplayCommand::ReleaseSpirit
+                    | GameplayCommand::QueryCorpse
+                    | GameplayCommand::ReclaimCorpse { .. }
+            ),
+            Self::Operator => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProposedAction {
     pub id: ActionId,

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod controller;
 pub mod distance;
 pub mod endpoint;
 pub mod errors;
@@ -17,6 +18,7 @@ pub mod text;
 pub mod time;
 
 pub use actions::*;
+pub use controller::*;
 pub use errors::*;
 pub use geometry::*;
 pub use ids::*;

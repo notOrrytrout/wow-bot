@@ -1,4 +1,5 @@
 pub mod control_service;
+pub mod controller;
 pub mod lane_registry;
 pub mod startup;
 pub mod watchdog;

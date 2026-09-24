@@ -419,32 +419,7 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
 }
 
 fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
-    match origin {
-        PlanOrigin::Dialogue => matches!(command, GameplayCommand::Chat { .. }),
-        PlanOrigin::Llm => !matches!(
-            command,
-            GameplayCommand::Raw { .. }
-                | GameplayCommand::Chat { .. }
-                | GameplayCommand::TradeAccept { .. }
-                | GameplayCommand::AuctionBuy { .. }
-                | GameplayCommand::MailTake { .. }
-        ),
-        PlanOrigin::Recovery => !matches!(
-            command,
-            GameplayCommand::Raw { .. } | GameplayCommand::Chat { .. }
-        ),
-        PlanOrigin::Deterministic | PlanOrigin::SystemPolicy | PlanOrigin::GroupPolicy => {
-            !matches!(
-                command,
-                GameplayCommand::Raw { .. }
-                    | GameplayCommand::Chat { .. }
-                    | GameplayCommand::ReleaseSpirit
-                    | GameplayCommand::QueryCorpse
-                    | GameplayCommand::ReclaimCorpse { .. }
-            )
-        }
-        PlanOrigin::Operator => true,
-    }
+    origin.permits(command)
 }
 
 fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {

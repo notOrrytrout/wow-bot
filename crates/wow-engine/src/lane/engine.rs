@@ -2487,6 +2487,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_proposal_uses_the_shared_action_validator() {
+        let (mut engine, mut proxy) = combat_engine();
+        let action = ProposedAction {
+            id: ActionId(41),
+            task: TaskId(42),
+            origin: PlanOrigin::Llm,
+            stamp: engine.state.stamp(),
+            command: GameplayCommand::Attack(EntityId(9)),
+        };
+
+        assert!(engine.handle(LaneMessage::Propose(action)).await);
+        let WorkerToProxy::Action(validated) = proxy.recv().await.unwrap() else {
+            panic!("expected validated LLM proposal")
+        };
+        assert_eq!(validated.command(), &GameplayCommand::Attack(EntityId(9)));
+        assert_eq!(validated.origin(), PlanOrigin::Llm);
+    }
+
+    #[tokio::test]
     async fn world_exit_discards_pending_work_and_keeps_mission() {
         let (_lane_tx, lane_rx) = mpsc::channel(1);
         let (proxy_tx, _proxy_rx) = mpsc::channel(1);
