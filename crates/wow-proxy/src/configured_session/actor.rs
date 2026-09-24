@@ -57,7 +57,7 @@ impl ConfiguredSessionActor {
             SessionMessage::Worker(msg) => self.handle_worker(msg).await,
             SessionMessage::PlayerAttached { connection } => {
                 self.state.player.attach(connection);
-                if self.pause_for_player().await.is_ok() {
+                if self.update_player_pause(true).await.is_ok() {
                     self.state.ownership.player_attached_manual_off();
                     self.publish_ownership().await;
                 }
@@ -68,19 +68,13 @@ impl ConfiguredSessionActor {
                 if final_connection {
                     self.state.upstream_connected = false;
                     self.state.world_authoritative = false;
-                    let _ = self
-                        .worker_tx
-                        .send(ProxyToWorker::SessionState {
-                            connected: false,
-                            in_world: false,
-                        })
-                        .await;
+                    self.publish_session_state().await;
                     if self.state.worker_running {
                         self.state.ownership.player_logout_reclaiming(true);
                         self.publish_ownership().await;
                         let ticket = self.state.ownership.reconnect();
                         if self.state.upstream_connected && self.state.ownership.commit(ticket) {
-                            let _ = self.clear_player_pause().await;
+                            let _ = self.update_player_pause(false).await;
                             self.publish_ownership().await;
                         }
                     } else {
@@ -108,7 +102,7 @@ impl ConfiguredSessionActor {
                 let committed =
                     self.state.upstream_connected && self.state.ownership.commit(ticket);
                 if committed {
-                    let _ = self.clear_player_pause().await;
+                    let _ = self.update_player_pause(false).await;
                 }
                 let owner = self.state.ownership.snapshot();
                 tracing::info!(lane=?self.state.lane, committed, generation=?owner.generation, movement_epoch=?owner.movement_epoch, "bot ownership command applied: ON");
@@ -118,7 +112,7 @@ impl ConfiguredSessionActor {
             SessionMessage::BotOff => {
                 self.state.player.bot_off();
                 let ticket = self.state.ownership.begin(ControlMode::Manual);
-                let _ = self.pause_for_player().await;
+                let _ = self.update_player_pause(true).await;
                 let committed = self.state.ownership.commit(ticket);
                 let owner = self.state.ownership.snapshot();
                 tracing::info!(lane=?self.state.lane, committed, generation=?owner.generation, movement_epoch=?owner.movement_epoch, "bot ownership command applied: OFF");
@@ -131,7 +125,7 @@ impl ConfiguredSessionActor {
                 if self.state.player.should_resume(now) && self.state.upstream_connected {
                     let ticket = self.state.ownership.begin(ControlMode::Bot);
                     if self.state.ownership.commit(ticket) {
-                        if self.clear_player_pause().await.is_ok() {
+                        if self.update_player_pause(false).await.is_ok() {
                             self.state.player.resumed();
                         }
                         let owner = self.state.ownership.snapshot();
@@ -146,24 +140,12 @@ impl ConfiguredSessionActor {
                 if !value {
                     self.state.world_authoritative = false;
                 }
-                let _ = self
-                    .worker_tx
-                    .send(ProxyToWorker::SessionState {
-                        connected: value,
-                        in_world: self.state.world_authoritative,
-                    })
-                    .await;
+                self.publish_session_state().await;
                 false
             }
             SessionMessage::WorldAuthoritative(value) => {
                 self.state.world_authoritative = value;
-                let _ = self
-                    .worker_tx
-                    .send(ProxyToWorker::SessionState {
-                        connected: self.state.upstream_connected,
-                        in_world: value,
-                    })
-                    .await;
+                self.publish_session_state().await;
                 tracing::info!(lane=?self.state.lane, connected=self.state.upstream_connected, in_world=value, "configured world authority state changed");
                 false
             }
@@ -201,13 +183,7 @@ impl ConfiguredSessionActor {
                 false
             }
             WorkerToProxy::QuerySession => {
-                let _ = self
-                    .worker_tx
-                    .send(ProxyToWorker::SessionState {
-                        connected: self.state.upstream_connected,
-                        in_world: self.state.world_authoritative,
-                    })
-                    .await;
+                self.publish_session_state().await;
                 false
             }
             WorkerToProxy::ShutdownAck => true,
@@ -237,26 +213,33 @@ impl ConfiguredSessionActor {
         }
     }
 
-    async fn pause_for_player(&self) -> Result<(), String> {
+    async fn update_player_pause(&self, paused: bool) -> Result<(), String> {
         self.supervisor_tx
             .send(SupervisorCommand::UpdatePause {
                 lane: self.state.lane,
-                set: PauseReasons::PLAYER_CONTROL,
-                clear: PauseReasons::empty(),
+                set: if paused {
+                    PauseReasons::PLAYER_CONTROL
+                } else {
+                    PauseReasons::empty()
+                },
+                clear: if paused {
+                    PauseReasons::empty()
+                } else {
+                    PauseReasons::PLAYER_CONTROL
+                },
             })
             .await
             .map_err(|_| "supervisor unavailable".into())
     }
 
-    async fn clear_player_pause(&self) -> Result<(), String> {
-        self.supervisor_tx
-            .send(SupervisorCommand::UpdatePause {
-                lane: self.state.lane,
-                set: PauseReasons::empty(),
-                clear: PauseReasons::PLAYER_CONTROL,
+    async fn publish_session_state(&self) {
+        let _ = self
+            .worker_tx
+            .send(ProxyToWorker::SessionState {
+                connected: self.state.upstream_connected,
+                in_world: self.state.world_authoritative,
             })
-            .await
-            .map_err(|_| "supervisor unavailable".into())
+            .await;
     }
 
     async fn publish_ownership(&self) {
