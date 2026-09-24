@@ -409,60 +409,62 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
 }
 
 fn active_quest_creature_target(snapshot: &Snapshot, entry: u32) -> bool {
-    snapshot
-        .state
-        .quests
-        .active
-        .iter()
-        .any(|(quest, progress)| {
-            if progress.complete {
-                return false;
-            }
-            let Some(definition) = snapshot.state.quests.definitions.get(quest) else {
-                return false;
-            };
-            definition.targets.iter().any(|target| {
-                target.kind == wow_state::quests::QuestTargetKind::Creature
-                    && target.entry == entry
-                    && progress
-                        .objectives
-                        .get(target.slot)
-                        .copied()
-                        .unwrap_or_default()
-                        < target.required
-            })
+    active_quest_definitions(snapshot).any(|(progress, definition)| {
+        definition.targets.iter().any(|target| {
+            target.kind == wow_state::quests::QuestTargetKind::Creature
+                && target.entry == entry
+                && progress
+                    .objectives
+                    .get(target.slot)
+                    .copied()
+                    .unwrap_or_default()
+                    < target.required
         })
+    })
 }
 
 fn active_quest_item_source(snapshot: &Snapshot, entry: u32) -> bool {
+    active_quest_definitions(snapshot).any(|(_, definition)| {
+        definition.items.iter().any(|item| {
+            let current = snapshot
+                .state
+                .inventory
+                .items
+                .get(&item.item)
+                .copied()
+                .unwrap_or_default();
+            current < item.required
+                && wow_policy::questing::static_hints::item_source_entries(item.item)
+                    .iter()
+                    .any(|(kind, source_entry)| {
+                        *kind == wow_state::quests::QuestTargetKind::Creature
+                            && *source_entry == entry
+                    })
+        })
+    })
+}
+
+fn active_quest_definitions(
+    snapshot: &Snapshot,
+) -> impl Iterator<
+    Item = (
+        &wow_state::quests::QuestProgress,
+        &wow_state::quests::QuestDefinition,
+    ),
+> {
     snapshot
         .state
         .quests
         .active
         .iter()
-        .any(|(quest, progress)| {
-            if progress.complete {
-                return false;
-            }
-            let Some(definition) = snapshot.state.quests.definitions.get(quest) else {
-                return false;
-            };
-            definition.items.iter().any(|item| {
-                let current = snapshot
-                    .state
-                    .inventory
-                    .items
-                    .get(&item.item)
-                    .copied()
-                    .unwrap_or_default();
-                current < item.required
-                    && wow_policy::questing::static_hints::item_source_entries(item.item)
-                        .iter()
-                        .any(|(kind, source_entry)| {
-                            *kind == wow_state::quests::QuestTargetKind::Creature
-                                && *source_entry == entry
-                        })
-            })
+        .filter(|(_, progress)| !progress.complete)
+        .filter_map(|(quest, progress)| {
+            snapshot
+                .state
+                .quests
+                .definitions
+                .get(quest)
+                .map(|definition| (progress, definition))
         })
 }
 

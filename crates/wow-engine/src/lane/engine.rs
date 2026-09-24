@@ -734,13 +734,7 @@ impl LaneEngine {
 
         if movement.started_at.elapsed() >= Duration::from_secs(90) {
             tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, "movement operation timed out");
-            if movement.purpose == MovementPurpose::SurvivalApproach {
-                let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
-            } else {
-                let _ = self
-                    .propose_command(GameplayCommand::StopMovement, false)
-                    .await;
-            }
+            self.stop_owned_movement(movement.purpose).await;
             self.current_work = None;
             self.waiting(format!(
                 "movement for {:?} timed out; waiting for authoritative state before retry",
@@ -762,13 +756,7 @@ impl LaneEngine {
         }
         if movement.last_progress_at.elapsed() >= Duration::from_secs(5) {
             tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, "movement made no authoritative progress; stopping owned movement for deterministic retry");
-            if movement.purpose == MovementPurpose::SurvivalApproach {
-                let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
-            } else {
-                let _ = self
-                    .propose_command(GameplayCommand::StopMovement, false)
-                    .await;
-            }
+            self.stop_owned_movement(movement.purpose).await;
             self.current_work = None;
             self.waiting(format!(
                 "movement for {:?} stalled; scheduler will re-ground before retry",
@@ -785,13 +773,7 @@ impl LaneEngine {
         }
         if distance <= movement.acceptable_range {
             tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, remaining=distance, purpose=?movement.purpose, "owned movement work reached interaction envelope");
-            if movement.purpose == MovementPurpose::SurvivalApproach {
-                let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
-            } else {
-                let _ = self
-                    .propose_command(GameplayCommand::StopMovement, false)
-                    .await;
-            }
+            self.stop_owned_movement(movement.purpose).await;
             self.current_work = None;
             if let Some(resume) = movement.resume.take() {
                 let work_key = movement.work.key.clone();
@@ -842,6 +824,16 @@ impl LaneEngine {
         } else {
             self.propose_command(GameplayCommand::MoveTo(next), false)
                 .await
+        }
+    }
+
+    async fn stop_owned_movement(&mut self, purpose: MovementPurpose) {
+        if purpose == MovementPurpose::SurvivalApproach {
+            let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
+        } else {
+            let _ = self
+                .propose_command(GameplayCommand::StopMovement, false)
+                .await;
         }
     }
 
