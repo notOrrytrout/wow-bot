@@ -32,8 +32,8 @@ use tokio::{
 };
 use wow_control_proto::{ProxyToWorker, SupervisorCommand, WorkerToProxy};
 use wow_domain::{
-    AccountId, EntityId, GameplayCommand, LaneId, Mission, MissionId, Vec3, WorkerGeneration,
-    WorldPosition,
+    AccountId, EntityId, GameplayCommand, LaneId, Millis, Mission, MissionId, Vec3,
+    WorkerGeneration, WorldPosition,
 };
 use wow_login_messages::Message as _;
 use wow_login_messages::{
@@ -899,11 +899,9 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                 }
                 const SMSG_CAST_FAILED_OPCODE: u32 = 0x0130;
                 if u32::from(frame.opcode) == SMSG_CAST_FAILED_OPCODE {
-                    if let Some((cast_count, spell, reason)) = parse_cast_failed(&frame.body) {
-                        let target = last_bot_cast
-                            .take()
-                            .filter(|(pending_spell, _, at)| *pending_spell == spell && at.elapsed() < Duration::from_secs(5))
-                            .and_then(|(_, target, _)| target);
+                    if let Some((cast_count, spell, reason, target)) =
+                        take_bot_cast_failure(&frame.body, &mut last_bot_cast)
+                    {
                         tracing::info!(account=%account_name, cast_count, spell, reason, ?target, "authoritative bot cast failure observed");
                         let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::CastFailed { spell, reason, target })).await;
                     }
@@ -932,18 +930,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         }
                     }
                 }
-                for observation in quest_observations(u32::from(frame.opcode), &frame.body) {
-                    tracing::debug!(account=%account_name, ?observation, "authoritative quest observation");
-                    let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;
-                }
-                for observation in maintenance_observations(u32::from(frame.opcode), &frame.body) {
-                    tracing::debug!(account=%account_name, ?observation, "authoritative maintenance observation");
-                    let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;
-                }
-                if let Some(observation) = controlled_abilities_observation(u32::from(frame.opcode), &frame.body) {
-                    tracing::info!(account=%account_name, ?observation, "authoritative controlled-unit abilities observed");
-                    let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;
-                }
+                forward_protocol_observations(&account, &account_name, u32::from(frame.opcode), &frame.body).await;
                 match object_observer.observe(frame.opcode, &frame.body).await {
                     Ok(observations) => {
                         for observation in observations {
@@ -1222,8 +1209,9 @@ async fn run_headless_world_session(
                     bot_loot_target = None;
                 }
                 if opcode == 0x0130 {
-                    if let Some((_cast_count, spell, reason)) = parse_cast_failed(&frame.body) {
-                        let target = last_bot_cast.take().filter(|(pending, _, at)| *pending == spell && at.elapsed() < Duration::from_secs(5)).and_then(|(_, target, _)| target);
+                    if let Some((_cast_count, spell, reason, target)) =
+                        take_bot_cast_failure(&frame.body, &mut last_bot_cast)
+                    {
                         let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::CastFailed { spell, reason, target })).await;
                     }
                 }
@@ -1249,15 +1237,7 @@ async fn run_headless_world_session(
                         }
                     }
                 }
-                for observation in quest_observations(opcode, &frame.body) {
-                    let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;
-                }
-                for observation in maintenance_observations(opcode, &frame.body) {
-                    let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;
-                }
-                if let Some(observation) = controlled_abilities_observation(opcode, &frame.body) {
-                    let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;
-                }
+                forward_protocol_observations(&account, &account.config.account_name, opcode, &frame.body).await;
                 match object_observer.observe(frame.opcode, &frame.body).await {
                     Ok(observations) => for observation in observations {
                         if let ProtocolObservation::ControlledMover { mover, position, flags } = &observation {
@@ -1332,6 +1312,20 @@ fn parse_cast_failed(body: &[u8]) -> Option<(u8, u32, u8)> {
     let spell = u32::from_le_bytes(body.get(1..5)?.try_into().ok()?);
     let reason = *body.get(5)?;
     Some((cast_count, spell, reason))
+}
+
+fn take_bot_cast_failure(
+    body: &[u8],
+    last_bot_cast: &mut Option<(u32, Option<EntityId>, std::time::Instant)>,
+) -> Option<(u8, u32, u8, Option<EntityId>)> {
+    let (cast_count, spell, reason) = parse_cast_failed(body)?;
+    let target = last_bot_cast
+        .take()
+        .filter(|(pending_spell, _, at)| {
+            *pending_spell == spell && at.elapsed() < Duration::from_secs(5)
+        })
+        .and_then(|(_, target, _)| target);
+    Some((cast_count, spell, reason, target))
 }
 
 fn parse_loot_response(body: &[u8]) -> Option<(u64, u32, Vec<u8>)> {
@@ -1798,6 +1792,47 @@ fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation
     }
 }
 
+async fn forward_protocol_observations(
+    account: &AccountRuntime,
+    account_name: &str,
+    opcode: u32,
+    body: &[u8],
+) {
+    for observation in quest_observations(opcode, body) {
+        tracing::debug!(
+            account = account_name,
+            ?observation,
+            "authoritative quest observation"
+        );
+        let _ = account
+            .session_tx
+            .send(SessionMessage::Observation(observation))
+            .await;
+    }
+    for observation in maintenance_observations(opcode, body) {
+        tracing::debug!(
+            account = account_name,
+            ?observation,
+            "authoritative maintenance observation"
+        );
+        let _ = account
+            .session_tx
+            .send(SessionMessage::Observation(observation))
+            .await;
+    }
+    if let Some(observation) = controlled_abilities_observation(opcode, body) {
+        tracing::info!(
+            account = account_name,
+            ?observation,
+            "authoritative controlled-unit abilities observed"
+        );
+        let _ = account
+            .session_tx
+            .send(SessionMessage::Observation(observation))
+            .await;
+    }
+}
+
 fn parse_corpse_query(body: &[u8]) -> Option<ProtocolObservation> {
     if *body.first()? == 0 {
         return Some(ProtocolObservation::CorpseLocation { position: None });
@@ -1821,22 +1856,15 @@ fn parse_corpse_query(body: &[u8]) -> Option<ProtocolObservation> {
 fn parse_reclaim_delay(body: &[u8]) -> Option<ProtocolObservation> {
     let delay = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
     Some(ProtocolObservation::CorpseReclaimDelay {
-        ready_at_ms: wall_clock_ms().saturating_add(u64::from(delay)),
+        ready_at_ms: Millis::wall_clock_now().0.saturating_add(u64::from(delay)),
     })
-}
-
-fn wall_clock_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn parse_spell_cooldowns(body: &[u8]) -> Vec<ProtocolObservation> {
     if body.len() < 9 {
         return Vec::new();
     }
-    let now = wall_clock_ms();
+    let now = Millis::wall_clock_now().0;
     let mut offset = 9usize; // caster GUID + flags
     let mut out = Vec::new();
     while offset + 8 <= body.len() {
