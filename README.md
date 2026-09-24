@@ -53,6 +53,7 @@ In a configured account's chat session through the proxy, use:
 | `.bot on` | Enable bot control. |
 | `.bot off` | Disable bot control. |
 | `.bot status` | Show bot status. |
+| `.bot help` | Show bot and log commands in game. |
 | `.bot quest` | Request the quest mission. |
 | `.log start` | Start a packet/action trace. |
 | `.log status` | Show trace status and its path. |

@@ -5,8 +5,16 @@ pub enum BotCommand {
     On,
     Off,
     Status,
+    Help,
     Mission(Mission),
 }
+
+pub const HELP_LINES: &[&str] = &[
+    ".bot quest | .bot gather \"resource\" | .bot grind \"creature\" | .bot goal \"text\"",
+    ".bot party [tank|healer|melee|ranged|support] | .bot raid [tank|healer|melee|ranged|support]",
+    ".bot on | .bot off | .bot status | .bot help",
+    ".log start | .log mark [label] | .log status | .log stop",
+];
 
 pub fn parse(text: &str, mission_id: MissionId) -> Result<Option<BotCommand>, String> {
     let trimmed = text.trim();
@@ -22,6 +30,9 @@ pub fn parse(text: &str, mission_id: MissionId) -> Result<Option<BotCommand>, St
     }
     if rest.eq_ignore_ascii_case("status") {
         return Ok(Some(BotCommand::Status));
+    }
+    if rest.eq_ignore_ascii_case("help") {
+        return Ok(Some(BotCommand::Help));
     }
     if rest.eq_ignore_ascii_case("quest") {
         return Ok(Some(BotCommand::Mission(Mission::quest(mission_id))));

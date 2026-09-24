@@ -112,7 +112,7 @@ The default locations are:
 
 If `WOW_BOT_HOME` is set, the log directory is `$WOW_BOT_HOME/logs/` instead.
 
-Configured-account chat commands such as `.bot on`, `.bot off`, `.bot status`, `.log start`, `.log stop`, `.log status`, and `.log mark` are consumed by the proxy and are not forwarded to AzerothCore. Each recognized command is printed to the supervisor console and written to `wow-bot.log`.
+Configured-account chat commands such as `.bot on`, `.bot off`, `.bot status`, `.bot help`, `.log start`, `.log stop`, `.log status`, and `.log mark` are consumed by the proxy and are not forwarded to AzerothCore. Each recognized command is printed to the supervisor console and written to `wow-bot.log`.
 
 `.log start` creates a per-account JSONL packet/action trace in the same log directory. The console prints the exact path. `.log status` prints whether action logging is active and its path. `.log stop` closes the trace and prints its path.
 

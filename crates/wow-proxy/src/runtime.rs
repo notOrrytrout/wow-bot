@@ -821,6 +821,13 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                 tracing::info!(account=%account_name, "bot status requested from chat; use the ownership messages below to inspect current control state");
                                 continue;
                             }
+                            Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::Help))) => {
+                                for line in crate::commands::bot::HELP_LINES {
+                                    let notice = format!("[wow-bot] {line}");
+                                    let _ = write_bot_notice(&mut dw, &mut down_enc, &notice).await;
+                                }
+                                continue;
+                            }
                             Ok(Some(crate::commands::LocalCommand::Log(log))) => {
                                 handle_log_command(&shared.action_logs, &account_name, log).await;
                                 continue;

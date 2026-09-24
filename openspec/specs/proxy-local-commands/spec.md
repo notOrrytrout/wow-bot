@@ -14,6 +14,12 @@ The proxy SHALL consume recognized `.bot` commands locally rather than forwardin
 - **THEN** the proxy handles it locally for the matching configured lane
 - **AND** the literal command is not forwarded upstream as a server command
 
+#### Scenario: Player requests bot command help
+- **WHEN** the command arrives through a supported stock-client chat channel
+- **AND** the player sends `.bot help`
+- **THEN** the proxy shows the supported bot and log commands as in-game system messages
+- **AND** the literal command is not forwarded upstream as a server command
+
 ### Requirement: Supported mission commands map to typed missions
 The proxy SHALL translate recognized mission-setting commands into the corresponding typed supervisor mission request.
 
