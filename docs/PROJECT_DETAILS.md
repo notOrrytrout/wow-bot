@@ -14,7 +14,7 @@ Static world data can guide a search. A live server observation must identify a 
 
 ## Shared state rules
 
-Keep rules that apply across policies in the state types that own the data. For example, `EntityState::is_dead` treats an entity as dead only when observed health is zero; missing health remains unknown. Combat and quest policies use this shared rule so they do not interpret the same observation differently.
+Keep rules that apply across policies in the state types that own the data. `EntityState::is_dead` treats an entity as dead only when observed health is zero; missing health remains unknown. `EntityState::mark_dead` applies the shared synthesized corpse state and preserves a valid maximum-health value. Combat and quest policies use these shared rules so they do not interpret or update the same entity state differently.
 
 ## Current gameplay paths
 

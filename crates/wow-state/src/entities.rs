@@ -37,6 +37,11 @@ impl EntityState {
     pub fn is_dead(&self) -> bool {
         self.health.is_some_and(|(current, _)| current == 0)
     }
+
+    /// Set health to zero and retain a valid maximum for synthesized corpse state.
+    pub fn mark_dead(&mut self) {
+        self.health = Some((0, self.health.map_or(1, |(_, max)| max)));
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

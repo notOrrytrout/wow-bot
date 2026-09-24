@@ -876,7 +876,7 @@ impl LaneEngine {
                 return true;
             }
             if let Some(mut cached_target) = cached_target {
-                cached_target.health = Some((0, cached_target.health.map_or(1, |(_, max)| max)));
+                cached_target.mark_dead();
                 self.post_combat_loot = Some((target, completed_at, Some(cached_target)));
                 let baseline_generation = self.state.authoritative.inventory.bot_loot_generation;
                 tracing::info!(lane=?self.state.lane, ?target, baseline_generation, "post-combat loot attempt using last observed target while corpse update is delayed");
@@ -1631,7 +1631,7 @@ impl LaneEngine {
                         .cloned()
                         .or(target_state);
                     if let Some(corpse) = &mut corpse {
-                        corpse.health = Some((0, corpse.health.map_or(1, |(_, max)| max)));
+                        corpse.mark_dead();
                     }
                     self.post_combat_loot = Some((target, Instant::now(), corpse));
                     self.pending_quest_action = None;
