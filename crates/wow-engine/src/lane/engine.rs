@@ -38,6 +38,7 @@ enum MovementPurpose {
 
 const TURN_IN_SEARCH_RANGE: f32 = 5.0;
 const QUEST_SEARCH_ARRIVAL_RANGE: f32 = 18.0;
+const QUEST_TOOL_SEARCH_RANGE: f32 = 12.0;
 
 #[derive(Clone, Debug)]
 enum PendingQuestAction {
@@ -1265,7 +1266,7 @@ impl LaneEngine {
                     .authoritative
                     .position
                     .player
-                    .is_some_and(|player| player.point.distance(destination) <= 12.0)
+                    .is_some_and(|player| quest_tool_search_arrived(player.point, destination))
                 {
                     self.waiting(format!("quest {quest} reached quest-control search area; waiting for live authoritative control object"));
                     return true;
@@ -1273,7 +1274,7 @@ impl LaneEngine {
                 tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "quest scheduler traveling to quest-bound control object search area");
                 self.queue_movement(
                     destination,
-                    12.0,
+                    QUEST_TOOL_SEARCH_RANGE,
                     None,
                     None,
                     PlanOrigin::SystemPolicy,
@@ -2434,6 +2435,9 @@ fn turn_in_search_arrived(player: Vec3, destination: Vec3) -> bool {
 fn quest_search_arrived(player: Vec3, destination: Vec3) -> bool {
     player.distance(destination) <= QUEST_SEARCH_ARRIVAL_RANGE
 }
+fn quest_tool_search_arrived(player: Vec3, destination: Vec3) -> bool {
+    player.distance(destination) <= QUEST_TOOL_SEARCH_RANGE
+}
 fn should_supersede_search_movement(purpose: MovementPurpose, live_target_available: bool) -> bool {
     purpose == MovementPurpose::SearchArea && live_target_available
 }
@@ -2786,6 +2790,19 @@ mod tests {
         assert!(!quest_search_arrived(
             origin,
             Vec3::new(QUEST_SEARCH_ARRIVAL_RANGE + 0.1, 0.0, 0.0)
+        ));
+    }
+
+    #[test]
+    fn quest_tool_search_arrival_uses_its_movement_range() {
+        let origin = Vec3::new(0.0, 0.0, 0.0);
+        assert!(quest_tool_search_arrived(
+            origin,
+            Vec3::new(QUEST_TOOL_SEARCH_RANGE, 0.0, 0.0)
+        ));
+        assert!(!quest_tool_search_arrived(
+            origin,
+            Vec3::new(QUEST_TOOL_SEARCH_RANGE + 0.1, 0.0, 0.0)
         ));
     }
 }
