@@ -19,10 +19,17 @@ pub struct AuraState {
 
 impl AuraState {
     pub fn spells(&self, entity: EntityId) -> BTreeSet<u32> {
-        self.by_entity.get(&entity).into_iter().flat_map(|slots| slots.values()).map(|a| a.spell).collect()
+        self.by_entity
+            .get(&entity)
+            .into_iter()
+            .flat_map(|slots| slots.values())
+            .map(|a| a.spell)
+            .collect()
     }
 
     pub fn has_any(&self, entity: EntityId, spells: &[u32]) -> bool {
-        self.by_entity.get(&entity).is_some_and(|slots| slots.values().any(|aura| spells.contains(&aura.spell)))
+        self.by_entity
+            .get(&entity)
+            .is_some_and(|slots| slots.values().any(|aura| spells.contains(&aura.spell)))
     }
 }

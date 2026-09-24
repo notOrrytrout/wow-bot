@@ -11,5 +11,7 @@ pub struct ProfessionState {
     pub fishing: bool,
 }
 impl ProfessionState {
-    pub fn skill(&self, skill: u32) -> u16 { self.skills.get(&skill).map_or(0, |v| v.0) }
+    pub fn skill(&self, skill: u32) -> u16 {
+        self.skills.get(&skill).map_or(0, |v| v.0)
+    }
 }

@@ -1,4 +1,7 @@
-use std::{env, path::{Path, PathBuf}};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 const APP_DIR_NAME: &str = "wow-bot-data";
 const WORKSPACE_MANIFEST: &str = "Cargo.toml";
@@ -36,19 +39,35 @@ impl AppPaths {
     }
 
     pub fn ensure(&self) -> Result<(), String> {
-        for path in [&self.root, &self.logs, &self.generated, &self.cache, &self.state] {
+        for path in [
+            &self.root,
+            &self.logs,
+            &self.generated,
+            &self.cache,
+            &self.state,
+        ] {
             #[cfg(unix)]
-            crate::security::paths::secure_private_dir(path)
-                .map_err(|e| format!("failed to secure bot-owned directory {}: {e}", path.display()))?;
+            crate::security::paths::secure_private_dir(path).map_err(|e| {
+                format!(
+                    "failed to secure bot-owned directory {}: {e}",
+                    path.display()
+                )
+            })?;
             #[cfg(not(unix))]
-            std::fs::create_dir_all(path)
-                .map_err(|e| format!("failed to create bot-owned directory {}: {e}", path.display()))?;
+            std::fs::create_dir_all(path).map_err(|e| {
+                format!(
+                    "failed to create bot-owned directory {}: {e}",
+                    path.display()
+                )
+            })?;
         }
         Ok(())
     }
 }
 
-pub fn resolve(root: impl AsRef<Path>) -> PathBuf { root.as_ref().to_path_buf() }
+pub fn resolve(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().to_path_buf()
+}
 
 fn default_repo_data_root() -> Result<PathBuf, String> {
     discover_workspace_root()
@@ -90,7 +109,9 @@ fn find_workspace_root(start: &Path) -> Option<PathBuf> {
 }
 
 fn is_wow_bot_workspace(manifest: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(manifest) else { return false; };
+    let Ok(text) = std::fs::read_to_string(manifest) else {
+        return false;
+    };
     text.contains("[workspace]")
         && text.contains("apps/wow-supervisor")
         && text.contains("crates/wow-infra")
@@ -103,23 +124,34 @@ mod tests {
     #[test]
     fn app_paths_use_repo_local_layout() {
         let paths = AppPaths::from_root(PathBuf::from("/repo/wow-bot-data"));
-        assert_eq!(paths.config, PathBuf::from("/repo/wow-bot-data/config.json"));
+        assert_eq!(
+            paths.config,
+            PathBuf::from("/repo/wow-bot-data/config.json")
+        );
         assert_eq!(paths.logs, PathBuf::from("/repo/wow-bot-data/logs"));
-        assert_eq!(paths.generated, PathBuf::from("/repo/wow-bot-data/generated"));
+        assert_eq!(
+            paths.generated,
+            PathBuf::from("/repo/wow-bot-data/generated")
+        );
         assert_eq!(paths.cache, PathBuf::from("/repo/wow-bot-data/cache"));
         assert_eq!(paths.state, PathBuf::from("/repo/wow-bot-data/state"));
     }
 
     #[test]
     fn workspace_manifest_detection_requires_expected_members() {
-        let root = std::env::temp_dir().join(format!("wow-bot-workspace-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("wow-bot-workspace-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("apps/wow-supervisor")).expect("create test dir");
         std::fs::write(
             root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"apps/wow-supervisor\", \"crates/wow-infra\"]\n",
-        ).expect("write manifest");
-        assert_eq!(find_workspace_root(&root.join("apps/wow-supervisor")), Some(root.clone()));
+        )
+        .expect("write manifest");
+        assert_eq!(
+            find_workspace_root(&root.join("apps/wow-supervisor")),
+            Some(root.clone())
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

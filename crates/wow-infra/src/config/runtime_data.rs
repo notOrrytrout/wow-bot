@@ -16,8 +16,14 @@ impl RuntimeDataPaths {
         ResolvedRuntimeDataPaths {
             dbc: self.dbc.clone().unwrap_or_else(|| self.root.join("dbc")),
             maps: self.maps.clone().unwrap_or_else(|| self.root.join("maps")),
-            vmaps: self.vmaps.clone().unwrap_or_else(|| self.root.join("vmaps")),
-            mmaps: self.mmaps.clone().unwrap_or_else(|| self.root.join("mmaps")),
+            vmaps: self
+                .vmaps
+                .clone()
+                .unwrap_or_else(|| self.root.join("vmaps")),
+            mmaps: self
+                .mmaps
+                .clone()
+                .unwrap_or_else(|| self.root.join("mmaps")),
         }
     }
 }
@@ -47,7 +53,13 @@ impl Default for RuntimeConfig {
             control_bind: "127.0.0.1:7878".into(),
             worker_queue: 256,
             handshake_timeout_ms: 10_000,
-            runtime_data: RuntimeDataPaths { root: "data".into(), dbc: None, maps: None, vmaps: None, mmaps: None },
+            runtime_data: RuntimeDataPaths {
+                root: "data".into(),
+                dbc: None,
+                maps: None,
+                vmaps: None,
+                mmaps: None,
+            },
         }
     }
 }

@@ -1,1 +1,8 @@
-use bitflags::bitflags; use serde::{Deserialize,Serialize}; bitflags!{#[derive(Clone,Copy,Debug,Default,Eq,PartialEq,Hash,Serialize,Deserialize)] pub struct PauseReasons:u32{const OPERATOR=1<<0;const PLAYER_CONTROL=1<<1;const SAFETY=1<<2;const STARTUP_GATE=1<<3;const HANDOFF=1<<4;const SHUTDOWN=1<<5;}} impl PauseReasons{pub fn runnable(self)->bool{self.is_empty()}}
+use bitflags::bitflags;
+use serde::{Deserialize, Serialize};
+bitflags! {#[derive(Clone,Copy,Debug,Default,Eq,PartialEq,Hash,Serialize,Deserialize)] pub struct PauseReasons:u32{const OPERATOR=1<<0;const PLAYER_CONTROL=1<<1;const SAFETY=1<<2;const STARTUP_GATE=1<<3;const HANDOFF=1<<4;const SHUTDOWN=1<<5;}}
+impl PauseReasons {
+    pub fn runnable(self) -> bool {
+        self.is_empty()
+    }
+}

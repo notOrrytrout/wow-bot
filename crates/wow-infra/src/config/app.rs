@@ -27,15 +27,33 @@ impl std::fmt::Debug for AccountConfig {
     }
 }
 
-const fn default_true() -> bool { true }
-const fn default_auth_port() -> u16 { 3724 }
-const fn default_world_port() -> u16 { 8085 }
-fn default_proxy_auth_bind() -> String { "0.0.0.0:3725".to_owned() }
-fn default_proxy_world_bind() -> String { "0.0.0.0:8086".to_owned() }
-fn default_transparent_world_bind() -> String { "0.0.0.0:8088".to_owned() }
-fn default_advertise_host() -> String { "127.0.0.1".to_owned() }
-const fn default_max_total() -> usize { 128 }
-const fn default_max_per_ip() -> usize { 8 }
+const fn default_true() -> bool {
+    true
+}
+const fn default_auth_port() -> u16 {
+    3724
+}
+const fn default_world_port() -> u16 {
+    8085
+}
+fn default_proxy_auth_bind() -> String {
+    "0.0.0.0:3725".to_owned()
+}
+fn default_proxy_world_bind() -> String {
+    "0.0.0.0:8086".to_owned()
+}
+fn default_transparent_world_bind() -> String {
+    "0.0.0.0:8088".to_owned()
+}
+fn default_advertise_host() -> String {
+    "127.0.0.1".to_owned()
+}
+const fn default_max_total() -> usize {
+    128
+}
+const fn default_max_per_ip() -> usize {
+    8
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,8 +142,12 @@ impl AppConfig {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), String> {
         let path = path.as_ref();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create config directory {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create config directory {}: {e}",
+                    parent.display()
+                )
+            })?;
         }
         let body = serde_json::to_string_pretty(self)
             .map_err(|e| format!("failed to serialize config: {e}"))?;
@@ -158,25 +180,48 @@ impl AppConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         super::validation::validate(&self.runtime)?;
-        self.proxy.auth_bind.parse::<std::net::SocketAddr>().map_err(|e| format!("invalid proxy.auth_bind: {e}"))?;
-        self.proxy.world_bind.parse::<std::net::SocketAddr>().map_err(|e| format!("invalid proxy.world_bind: {e}"))?;
-        self.proxy.transparent_world_bind.parse::<std::net::SocketAddr>().map_err(|e| format!("invalid proxy.transparent_world_bind: {e}"))?;
-        if self.proxy.max_pre_auth_connections == 0 || self.proxy.max_pre_auth_connections_per_ip == 0 {
+        self.proxy
+            .auth_bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("invalid proxy.auth_bind: {e}"))?;
+        self.proxy
+            .world_bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("invalid proxy.world_bind: {e}"))?;
+        self.proxy
+            .transparent_world_bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("invalid proxy.transparent_world_bind: {e}"))?;
+        if self.proxy.max_pre_auth_connections == 0
+            || self.proxy.max_pre_auth_connections_per_ip == 0
+        {
             return Err("proxy pre-authentication limits must be positive".into());
         }
-        if self.proxy.auth_bind == self.proxy.world_bind || self.proxy.auth_bind == self.proxy.transparent_world_bind || self.proxy.world_bind == self.proxy.transparent_world_bind {
+        if self.proxy.auth_bind == self.proxy.world_bind
+            || self.proxy.auth_bind == self.proxy.transparent_world_bind
+            || self.proxy.world_bind == self.proxy.transparent_world_bind
+        {
             return Err("proxy listener addresses must be distinct".into());
         }
-        if self.upstream.realm_name.trim().is_empty() || self.upstream.auth_host.trim().is_empty() || self.upstream.world_host.trim().is_empty() {
+        if self.upstream.realm_name.trim().is_empty()
+            || self.upstream.auth_host.trim().is_empty()
+            || self.upstream.world_host.trim().is_empty()
+        {
             return Err("upstream auth_host, world_host, and realm_name are required".into());
         }
         let mut lanes = std::collections::BTreeSet::new();
         let mut names = std::collections::BTreeSet::new();
         for account in self.accounts.iter().filter(|a| a.enabled) {
-            if !lanes.insert(account.lane) { return Err(format!("duplicate lane {}", account.lane)); }
+            if !lanes.insert(account.lane) {
+                return Err(format!("duplicate lane {}", account.lane));
+            }
             let upper = account.account_name.to_uppercase();
-            if !names.insert(upper.clone()) { return Err(format!("duplicate account {upper}")); }
-            if account.password.is_empty() { return Err(format!("password is empty for account {upper}")); }
+            if !names.insert(upper.clone()) {
+                return Err(format!("duplicate account {upper}"));
+            }
+            if account.password.is_empty() {
+                return Err(format!("password is empty for account {upper}"));
+            }
         }
         Ok(())
     }

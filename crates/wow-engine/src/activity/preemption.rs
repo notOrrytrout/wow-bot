@@ -1,1 +1,3 @@
-use super::ActivityLease;#[derive(Clone,Copy,Debug)]pub struct Preempted(pub ActivityLease);
+use super::ActivityLease;
+#[derive(Clone, Copy, Debug)]
+pub struct Preempted(pub ActivityLease);

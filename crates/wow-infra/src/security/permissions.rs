@@ -1,1 +1,6 @@
-#[derive(Clone,Copy,Debug,Eq,PartialEq)]pub enum Access{ReadOnly,ReadWrite,Admin}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Access {
+    ReadOnly,
+    ReadWrite,
+    Admin,
+}

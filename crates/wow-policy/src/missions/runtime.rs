@@ -9,7 +9,14 @@ pub struct MissionRuntime {
 }
 
 impl MissionRuntime {
-    pub fn new(mission: Mission, revision: MissionRevision) -> Self { Self { mission, revision, active_task: None, failed_attempts: 0 } }
+    pub fn new(mission: Mission, revision: MissionRevision) -> Self {
+        Self {
+            mission,
+            revision,
+            active_task: None,
+            failed_attempts: 0,
+        }
+    }
     pub fn reset(&mut self, mission: Mission) {
         self.mission = mission;
         self.revision = self.revision.next();
@@ -18,6 +25,11 @@ impl MissionRuntime {
     }
     pub fn note_failure(&mut self, max_attempts: u8) -> bool {
         self.failed_attempts = self.failed_attempts.saturating_add(1);
-        if self.failed_attempts >= max_attempts { self.active_task = None; true } else { false }
+        if self.failed_attempts >= max_attempts {
+            self.active_task = None;
+            true
+        } else {
+            false
+        }
     }
 }

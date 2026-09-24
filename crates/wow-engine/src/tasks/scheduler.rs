@@ -1,1 +1,16 @@
-use std::collections::VecDeque;use wow_domain::TaskId;#[derive(Default)]pub struct TaskScheduler{queue:VecDeque<TaskId>}impl TaskScheduler{pub fn push(&mut self,id:TaskId){if !self.queue.contains(&id){self.queue.push_back(id)}}pub fn pop(&mut self)->Option<TaskId>{self.queue.pop_front()}}
+use std::collections::VecDeque;
+use wow_domain::TaskId;
+#[derive(Default)]
+pub struct TaskScheduler {
+    queue: VecDeque<TaskId>,
+}
+impl TaskScheduler {
+    pub fn push(&mut self, id: TaskId) {
+        if !self.queue.contains(&id) {
+            self.queue.push_back(id)
+        }
+    }
+    pub fn pop(&mut self) -> Option<TaskId> {
+        self.queue.pop_front()
+    }
+}

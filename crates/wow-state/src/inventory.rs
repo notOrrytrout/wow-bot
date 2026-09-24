@@ -3,8 +3,10 @@ use std::collections::BTreeMap;
 use wow_domain::EntityId;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ItemStack { pub item: u32, pub count: u32 }
-
+pub struct ItemStack {
+    pub item: u32,
+    pub count: u32,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryItemInstance {
@@ -34,13 +36,23 @@ pub struct AuctionListing {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct AuctionState { pub query_generation: u64, pub listings: BTreeMap<u64, AuctionListing> }
+pub struct AuctionState {
+    pub query_generation: u64,
+    pub listings: BTreeMap<u64, AuctionListing>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct MailEntry { pub mail_id: u32, pub money: u64, pub attachments: BTreeMap<u32, u32> }
+pub struct MailEntry {
+    pub mail_id: u32,
+    pub money: u64,
+    pub attachments: BTreeMap<u32, u32>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct MailboxState { pub generation: u64, pub mails: BTreeMap<u32, MailEntry> }
+pub struct MailboxState {
+    pub generation: u64,
+    pub mails: BTreeMap<u32, MailEntry>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InventoryState {
@@ -61,10 +73,13 @@ pub struct InventoryState {
 }
 
 impl InventoryState {
-    pub fn has(&self, item: u32, count: u32) -> bool { self.items.get(&item).copied().unwrap_or(0) >= count }
+    pub fn has(&self, item: u32, count: u32) -> bool {
+        self.items.get(&item).copied().unwrap_or(0) >= count
+    }
 
     pub fn usable_instance(&self, item: u32) -> Option<&InventoryItemInstance> {
-        self.instances.values()
+        self.instances
+            .values()
             .filter(|instance| instance.item == item && instance.count > 0)
             .min_by_key(|instance| (instance.backpack_slot, instance.guid))
     }

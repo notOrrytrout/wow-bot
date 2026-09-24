@@ -1,1 +1,7 @@
-use wow_domain::ValidityStamp;pub fn still_valid(expected:ValidityStamp,current:ValidityStamp)->bool{expected.mission==current.mission&&expected.permission==current.permission&&expected.worker==current.worker&&expected.ownership==current.ownership}
+use wow_domain::ValidityStamp;
+pub fn still_valid(expected: ValidityStamp, current: ValidityStamp) -> bool {
+    expected.mission == current.mission
+        && expected.permission == current.permission
+        && expected.worker == current.worker
+        && expected.ownership == current.ownership
+}

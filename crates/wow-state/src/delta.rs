@@ -1,1 +1,8 @@
-use serde::{Deserialize,Serialize}; use wow_domain::{EntityId,StateRevision}; #[derive(Clone,Debug,Default,Serialize,Deserialize)] pub struct StateDelta{pub revision:StateRevision,pub changed:Vec<String>,pub touched_entities:Vec<EntityId>}
+use serde::{Deserialize, Serialize};
+use wow_domain::{EntityId, StateRevision};
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StateDelta {
+    pub revision: StateRevision,
+    pub changed: Vec<String>,
+    pub touched_entities: Vec<EntityId>,
+}

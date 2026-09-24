@@ -2,10 +2,21 @@ use serde::{Deserialize, Serialize};
 use wow_domain::EntityId;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct GroupMember { pub entity: EntityId, pub name: String, pub role: Option<String>, pub online: bool }
+pub struct GroupMember {
+    pub entity: EntityId,
+    pub name: String,
+    pub role: Option<String>,
+    pub online: bool,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GroupLifecycle { #[default] Solo, Forming, Active, Leaving }
+pub enum GroupLifecycle {
+    #[default]
+    Solo,
+    Forming,
+    Active,
+    Leaving,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GroupState {
