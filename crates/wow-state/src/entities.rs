@@ -31,5 +31,13 @@ pub struct EntityState {
     pub hostile: bool,
     pub interactable: bool,
 }
+
+impl EntityState {
+    /// Return true only when observed health confirms that the entity is dead.
+    pub fn is_dead(&self) -> bool {
+        self.health.is_some_and(|(current, _)| current == 0)
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Entities(pub BTreeMap<EntityId, EntityState>);

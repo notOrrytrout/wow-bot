@@ -258,7 +258,7 @@ pub fn resolve_with_exclusions(
                         QuestTargetKind::Creature => ObjectiveResolution::GroundedItemCreature {
                             item: item.item,
                             target: entity.id,
-                            dead: entity.health.is_some_and(|(current, _)| current == 0),
+                            dead: entity.is_dead(),
                         },
                         QuestTargetKind::GameObject => {
                             ObjectiveResolution::GroundedItemGameObject {
@@ -307,7 +307,7 @@ fn nearest_live_target<'a>(
                 QuestTargetKind::GameObject => entity.kind == EntityKind::GameObject,
             }
             && !excluded.contains(&(objective, entity.id))
-            && (!require_alive || !entity.health.is_some_and(|(current, _)| current == 0))
+            && (!require_alive || !entity.is_dead())
     })
 }
 

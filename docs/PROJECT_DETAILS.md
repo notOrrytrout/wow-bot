@@ -12,6 +12,10 @@ This page describes the current runtime and its main limits. The [README](../REA
 
 Static world data can guide a search. A live server observation must identify a creature, game object, or item before the bot acts on it or counts progress.
 
+## Shared state rules
+
+Keep rules that apply across policies in the state types that own the data. For example, `EntityState::is_dead` treats an entity as dead only when observed health is zero; missing health remains unknown. Combat and quest policies use this shared rule so they do not interpret the same observation differently.
+
 ## Current gameplay paths
 
 - Quest work includes quest-giver discovery, quest accept, objective tracking, live target selection, movement, loot, and reward steps. Some quest types have specific handling, including Lazy Peons and the Eye of Acherus control sequence.

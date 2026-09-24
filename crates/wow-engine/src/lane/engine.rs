@@ -1613,7 +1613,7 @@ impl LaneEngine {
                     .entities
                     .0
                     .get(&target)
-                    .is_none_or(|entity| entity.health.is_some_and(|(current, _)| current == 0));
+                    .is_none_or(wow_state::entities::EntityState::is_dead);
                 if dead_or_gone {
                     let corpse_present = self
                         .state
@@ -1621,9 +1621,7 @@ impl LaneEngine {
                         .entities
                         .0
                         .get(&target)
-                        .is_some_and(|entity| {
-                            entity.health.is_some_and(|(current, _)| current == 0)
-                        });
+                        .is_some_and(wow_state::entities::EntityState::is_dead);
                     tracing::info!(lane=?self.state.lane, ?target, corpse_present, "authoritative combat completion observed");
                     let mut corpse = self
                         .state

@@ -28,7 +28,7 @@ pub fn is_attacking_player_or_group(snapshot: &Snapshot, entity: EntityId) -> bo
     if attacker.kind != EntityKind::Unit {
         return false;
     }
-    if attacker.health.is_some_and(|(current, _)| current == 0) {
+    if attacker.is_dead() {
         return false;
     }
     attacker
