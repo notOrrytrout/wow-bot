@@ -42,6 +42,7 @@ const TURN_IN_SEARCH_RANGE: f32 = 5.0;
 enum PendingQuestAction {
     Combat {
         target: EntityId,
+        target_state: Option<wow_state::entities::EntityState>,
         started: Instant,
         cycle: Duration,
     },
@@ -84,16 +85,6 @@ enum PendingQuestAction {
     },
 }
 
-impl PendingQuestAction {
-    fn combat(target: EntityId, cycle: Duration) -> Self {
-        Self::Combat {
-            target,
-            started: Instant::now(),
-            cycle,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchOutcome {
     Sent,
@@ -129,10 +120,13 @@ pub struct LaneEngine {
     los_blocked: BTreeSet<EntityId>,
     los_attempts: BTreeMap<EntityId, u8>,
     server_range_recovery: BTreeMap<EntityId, (crate::action::spatial::ServerRangeCorrection, u8)>,
+    behind_reposition_pending: BTreeSet<(u32, EntityId)>,
+    behind_retry_after: BTreeMap<(u32, EntityId), Instant>,
+    behind_retry_cast_allowed: BTreeSet<(u32, EntityId)>,
     maintenance_retry_after: BTreeMap<(u32, EntityId), Instant>,
     last_maintenance_tick: Option<Instant>,
     last_maintenance_status: Option<String>,
-    post_combat_loot: Option<EntityId>,
+    post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
     last_recovery_action: Option<Instant>,
     last_survival_action: Option<(EntityId, Instant)>,
 }
@@ -169,6 +163,9 @@ impl LaneEngine {
             los_blocked: BTreeSet::new(),
             los_attempts: BTreeMap::new(),
             server_range_recovery: BTreeMap::new(),
+            behind_reposition_pending: BTreeSet::new(),
+            behind_retry_after: BTreeMap::new(),
+            behind_retry_cast_allowed: BTreeSet::new(),
             maintenance_retry_after: BTreeMap::new(),
             last_maintenance_tick: None,
             last_maintenance_status: None,
@@ -256,10 +253,26 @@ impl LaneEngine {
                                 );
                                 tracing::info!(lane=?self.state.lane, spell, ?target, attempts, "authoritative too-close failure armed shared range recovery");
                             }
+                            57 => {
+                                let key = (*spell, *target);
+                                let now = Instant::now();
+                                if self
+                                    .behind_retry_after
+                                    .get(&key)
+                                    .is_none_or(|deadline| *deadline <= now)
+                                {
+                                    self.behind_retry_after
+                                        .insert(key, now + Duration::from_secs(10));
+                                    self.behind_reposition_pending.insert(key);
+                                    tracing::info!(lane=?self.state.lane, spell, ?target, "server requires a rear-arc position; one reposition and retry are armed");
+                                } else {
+                                    tracing::info!(lane=?self.state.lane, spell, ?target, "rear-arc retry is cooling down after a failed reposition");
+                                }
+                            }
                             _ => {}
                         }
                     }
-                    if matches!(*reason, 47 | 97 | 128) {
+                    if matches!(*reason, 47 | 57 | 95 | 97 | 128) {
                         // The semantic action did not happen. Do not wait for quest credit
                         // or interaction evidence that can never arrive.
                         self.pending_quest_action = None;
@@ -330,6 +343,9 @@ impl LaneEngine {
                 self.los_blocked.clear();
                 self.los_attempts.clear();
                 self.server_range_recovery.clear();
+                self.behind_reposition_pending.clear();
+                self.behind_retry_after.clear();
+                self.behind_retry_cast_allowed.clear();
                 self.last_wait_reason = None;
                 tracing::info!(lane=?self.state.lane, mission=?self.state.mission.intent, revision=?self.state.mission_revision, "mission installed in lane engine");
             }
@@ -773,6 +789,7 @@ impl LaneEngine {
         }
         if distance <= movement.acceptable_range {
             tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, remaining=distance, purpose=?movement.purpose, "owned movement work reached interaction envelope");
+            self.record_search_arrival(&movement);
             self.stop_owned_movement(movement.purpose).await;
             self.current_work = None;
             if let Some(resume) = movement.resume.take() {
@@ -861,15 +878,15 @@ impl LaneEngine {
         if self.pending_quest_action_blocks() {
             return true;
         }
-        if let Some(target) = self.post_combat_loot.take() {
-            if self
+        if let Some((target, completed_at, cached_target)) = self.post_combat_loot.clone() {
+            let corpse_present = self
                 .state
                 .authoritative
                 .entities
                 .0
                 .get(&target)
-                .is_some_and(|entity| entity.health.is_some_and(|(current, _)| current == 0))
-            {
+                .is_some_and(|entity| entity.health.is_none_or(|(current, _)| current == 0));
+            if corpse_present {
                 let baseline_generation = self.state.authoritative.inventory.bot_loot_generation;
                 tracing::info!(lane=?self.state.lane, ?target, baseline_generation, "post-combat corpse loot selected before next quest target");
                 return self
@@ -883,6 +900,27 @@ impl LaneEngine {
                     )
                     .await;
             }
+            if completed_at.elapsed() < Duration::from_secs(2) {
+                self.waiting(format!("combat target {target} is waiting for authoritative corpse state before the next target"));
+                return true;
+            }
+            if let Some(mut cached_target) = cached_target {
+                cached_target.health = Some((0, cached_target.health.map_or(1, |(_, max)| max)));
+                self.post_combat_loot = Some((target, completed_at, Some(cached_target)));
+                let baseline_generation = self.state.authoritative.inventory.bot_loot_generation;
+                tracing::info!(lane=?self.state.lane, ?target, baseline_generation, "post-combat loot attempt using last observed target while corpse update is delayed");
+                return self
+                    .dispatch_quest_semantic(
+                        GameplayCommand::Loot(target),
+                        PendingQuestAction::CorpseLoot {
+                            target,
+                            baseline_generation,
+                            started: Instant::now(),
+                        },
+                    )
+                    .await;
+            }
+            self.post_combat_loot = None;
         }
         if self
             .last_quest_step
@@ -1323,23 +1361,20 @@ impl LaneEngine {
                     .player
                     .map(|player| player.point);
                 let candidates = bounded_candidates(destinations, current_pos.unwrap_or_default());
-                let arrived = current_pos.is_some_and(|position| {
+                let reached_destination = current_pos.and_then(|position| {
                     candidates
                         .iter()
-                        .any(|candidate| position.distance(*candidate) <= 18.0)
+                        .copied()
+                        .filter(|point| position.distance(*point) <= 18.0)
+                        .min_by(|a, b| position.distance(*a).total_cmp(&position.distance(*b)))
                 });
-                let current_destination = candidates.iter().copied().find(|point| {
-                    current_pos.is_some_and(|position| position.distance(*point) <= 18.0)
-                });
-                let Some(destination) = self.next_search_destination(
-                    key,
-                    &candidates,
-                    arrived.then_some(current_destination).flatten(),
-                ) else {
+                let Some(destination) =
+                    self.next_search_destination(key, &candidates, reached_destination)
+                else {
                     self.waiting(format!("quest {quest} exhausted nearby loot-source hints for item {item} at {current}/{required}; waiting before a bounded retry"));
                     return true;
                 };
-                if !arrived || current_destination != Some(destination) {
+                if reached_destination != Some(destination) {
                     tracing::info!(lane=?self.state.lane, quest, item, current, required, work_id=?work.id, x=destination.x, y=destination.y, "quest item objective using AzerothCore loot-source search hint");
                     self.queue_movement(
                         destination,
@@ -1469,6 +1504,23 @@ impl LaneEngine {
         work
     }
 
+    fn record_search_arrival(&mut self, movement: &PendingMovement) {
+        if movement.purpose != MovementPurpose::SearchArea {
+            return;
+        }
+        let key = match &movement.work.key {
+            QuestWorkKey::TravelToObjective {
+                quest, objective, ..
+            } => (*quest, *objective, 0),
+            QuestWorkKey::CollectItem { quest, item } => (*quest, usize::MAX, *item),
+            _ => return,
+        };
+        self.search_attempts
+            .entry(key)
+            .or_default()
+            .insert(search_point_key(movement.destination));
+    }
+
     fn defer_quest_giver(&mut self, giver: EntityId) {
         let attempts = self
             .giver_retry_after
@@ -1579,6 +1631,7 @@ impl LaneEngine {
         match pending {
             PendingQuestAction::Combat {
                 target,
+                target_state,
                 started,
                 cycle,
             } => {
@@ -1600,9 +1653,18 @@ impl LaneEngine {
                             entity.health.is_some_and(|(current, _)| current == 0)
                         });
                     tracing::info!(lane=?self.state.lane, ?target, corpse_present, "authoritative combat completion observed");
-                    if corpse_present {
-                        self.post_combat_loot = Some(target);
+                    let mut corpse = self
+                        .state
+                        .authoritative
+                        .entities
+                        .0
+                        .get(&target)
+                        .cloned()
+                        .or(target_state);
+                    if let Some(corpse) = &mut corpse {
+                        corpse.health = Some((0, corpse.health.map_or(1, |(_, max)| max)));
                     }
+                    self.post_combat_loot = Some((target, Instant::now(), corpse));
                     self.pending_quest_action = None;
                     return false;
                 }
@@ -1628,6 +1690,7 @@ impl LaneEngine {
                 {
                     tracing::info!(lane=?self.state.lane, ?target, "pending bot corpse loot was superseded by player loot; cancelling without bot-success credit");
                     self.pending_quest_action = None;
+                    self.post_combat_loot = None;
                     return false;
                 }
                 if generation > baseline_generation
@@ -1635,12 +1698,14 @@ impl LaneEngine {
                 {
                     tracing::info!(lane=?self.state.lane, ?target, baseline_generation, generation, "authoritative bot-owned post-combat loot transaction completed");
                     self.pending_quest_action = None;
+                    self.post_combat_loot = None;
                     return false;
                 }
                 if !self.state.authoritative.entities.0.contains_key(&target)
                     && generation > baseline_generation
                 {
                     self.pending_quest_action = None;
+                    self.post_combat_loot = None;
                     return false;
                 }
                 if started.elapsed() < Duration::from_secs(6) {
@@ -1651,6 +1716,7 @@ impl LaneEngine {
                 }
                 tracing::warn!(lane=?self.state.lane, ?target, baseline_generation, generation, "post-combat loot timed out; allowing quest scheduler to continue");
                 self.pending_quest_action = None;
+                self.post_combat_loot = None;
                 false
             }
             PendingQuestAction::Loot {
@@ -1810,7 +1876,7 @@ impl LaneEngine {
                         spell,
                         target: Some(target),
                     },
-                    PendingQuestAction::combat(target, Duration::from_secs(3)),
+                    self.combat_pending(target, Duration::from_secs(3)),
                 )
                 .await
             }
@@ -1821,7 +1887,7 @@ impl LaneEngine {
                         spell: 5019,
                         target: Some(target),
                     },
-                    PendingQuestAction::combat(target, Duration::from_secs(12)),
+                    self.combat_pending(target, Duration::from_secs(12)),
                 )
                 .await
             }
@@ -1829,7 +1895,7 @@ impl LaneEngine {
                 tracing::info!(lane=?self.state.lane, ?target, "shared combat selector chose melee fallback");
                 self.dispatch_quest_semantic(
                     GameplayCommand::Attack(target),
-                    PendingQuestAction::combat(target, Duration::from_secs(12)),
+                    self.combat_pending(target, Duration::from_secs(12)),
                 )
                 .await
             }
@@ -1840,6 +1906,15 @@ impl LaneEngine {
         }
     }
 
+    fn combat_pending(&self, target: EntityId, cycle: Duration) -> PendingQuestAction {
+        PendingQuestAction::Combat {
+            target,
+            target_state: self.state.authoritative.entities.0.get(&target).cloned(),
+            started: Instant::now(),
+            cycle,
+        }
+    }
+
     async fn dispatch_resumed_quest_action(
         &mut self,
         command: GameplayCommand,
@@ -1847,7 +1922,7 @@ impl LaneEngine {
     ) -> bool {
         let pending = match command.clone() {
             GameplayCommand::Attack(target) => {
-                Some(PendingQuestAction::combat(target, Duration::from_secs(12)))
+                Some(self.combat_pending(target, Duration::from_secs(12)))
             }
             GameplayCommand::Cast {
                 target: Some(target),
@@ -1857,7 +1932,7 @@ impl LaneEngine {
                 QuestWorkKey::CombatObjective { .. } | QuestWorkKey::CollectItem { .. }
             ) =>
             {
-                Some(PendingQuestAction::combat(target, Duration::from_secs(3)))
+                Some(self.combat_pending(target, Duration::from_secs(3)))
             }
             GameplayCommand::Loot(target) => {
                 let item = match work {
@@ -2008,7 +2083,96 @@ impl LaneEngine {
         }
         let original_command = action.command.clone();
         let action_origin = action.origin;
-        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        let mut snapshot = Snapshot::from_state(&self.state.authoritative);
+        if let GameplayCommand::Loot(target) = &original_command
+            && let Some((post_target, _, Some(cached_target))) = &self.post_combat_loot
+            && post_target == target
+        {
+            snapshot
+                .state
+                .entities
+                .0
+                .entry(*target)
+                .or_insert_with(|| cached_target.clone());
+        }
+
+        if let GameplayCommand::Cast { spell, .. } = &original_command
+            && wow_policy::combat::spells::requires_stealth(*spell)
+            && !wow_policy::combat::spells::player_has_stealth(&snapshot)
+        {
+            self.waiting(format!(
+                "spell {spell} is waiting for an authoritative stealth aura"
+            ));
+            self.last_dispatch = DispatchOutcome::DeferredSpatial;
+            return true;
+        }
+
+        if let GameplayCommand::Cast {
+            spell,
+            target: Some(target),
+        } = &original_command
+        {
+            let key = (*spell, *target);
+            let now = Instant::now();
+            if self.behind_reposition_pending.remove(&key) {
+                let Some(mover) = crate::action::spatial::active_mover(&snapshot) else {
+                    self.behind_reposition_pending.insert(key);
+                    self.waiting(
+                        "rear-arc recovery is waiting for authoritative mover position".to_owned(),
+                    );
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                let Some(target_position) =
+                    crate::action::spatial::target_position(&snapshot, *target)
+                else {
+                    self.behind_reposition_pending.insert(key);
+                    self.waiting(format!(
+                        "rear-arc recovery is waiting for target {:?} position",
+                        target
+                    ));
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                let Some(requirement) =
+                    crate::action::spatial::mob_behind_approach_requirement(mover, target_position)
+                else {
+                    self.behind_retry_cast_allowed.insert(key);
+                    self.waiting(format!(
+                        "rear-arc recovery cannot derive a safe position for {:?}",
+                        target
+                    ));
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                self.behind_retry_cast_allowed.insert(key);
+                self.defer_spatial_movement(
+                    requirement.destination,
+                    requirement.acceptable_range,
+                    original_command,
+                    action_origin,
+                    "server-required rear-arc reposition",
+                );
+                return true;
+            }
+            if self
+                .behind_retry_after
+                .get(&key)
+                .is_some_and(|deadline| *deadline <= now)
+            {
+                self.behind_retry_after.remove(&key);
+                self.behind_retry_cast_allowed.remove(&key);
+            }
+            if self.behind_retry_after.contains_key(&key)
+                && !self.behind_retry_cast_allowed.remove(&key)
+            {
+                self.waiting(format!(
+                    "spell {spell} is waiting for its rear-arc retry cooldown"
+                ));
+                self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                return true;
+            }
+        }
 
         if let Some(profile) = crate::action::spatial::profile(&original_command) {
             if let Some((correction, attempts)) =
@@ -2238,6 +2402,9 @@ impl LaneEngine {
         self.los_blocked.clear();
         self.los_attempts.clear();
         self.server_range_recovery.clear();
+        self.behind_reposition_pending.clear();
+        self.behind_retry_after.clear();
+        self.behind_retry_cast_allowed.clear();
         self.maintenance_retry_after.clear();
         self.last_maintenance_tick = None;
         self.last_maintenance_status = None;
