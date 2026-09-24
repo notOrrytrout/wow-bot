@@ -11,6 +11,7 @@ This project is under development. The source includes quest discovery, acceptan
 Full class combat rotations, general quest-item use, group and raid automation, and battleground behavior are not complete. Learned gameplay memory does not currently persist across worker restarts.
 
 See [Project details](docs/PROJECT_DETAILS.md) for the runtime design, implemented paths, and known gaps.
+See [Capability traceability](docs/TRACEABILITY.md) for implementation and verification status by baseline specification.
 
 ## Requirements
 
