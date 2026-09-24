@@ -412,22 +412,23 @@ impl AzerothCoreCatalog {
         )
     }
     pub fn nearest_vendor(&self, service: VendorKind, map: u32, from: Vec3) -> Option<(u32, Vec3)> {
-        self.world
-            .vendor_services
-            .iter()
-            .filter(|vendor| match service {
-                VendorKind::Sell => vendor.can_sell,
-                VendorKind::Repair => vendor.can_repair,
-                VendorKind::Auction => vendor.can_auction,
-            })
-            .flat_map(|vendor| {
-                vendor.spawns.iter().filter_map(move |spawn| {
-                    nearest_location(spawn, map)
-                        .map(|point| (from.distance(point), vendor.entry_id, point))
+        closest_by_distance(
+            self.world
+                .vendor_services
+                .iter()
+                .filter(|vendor| match service {
+                    VendorKind::Sell => vendor.can_sell,
+                    VendorKind::Repair => vendor.can_repair,
+                    VendorKind::Auction => vendor.can_auction,
                 })
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, entry, point)| (entry, point))
+                .flat_map(|vendor| {
+                    vendor.spawns.iter().filter_map(move |spawn| {
+                        nearest_location(spawn, map)
+                            .map(|point| (from.distance(point), vendor.entry_id, point))
+                    })
+                })
+                .map(|(distance, entry, point)| (distance, (entry, point))),
+        )
     }
     pub fn nearest_profession_trainer(
         &self,
@@ -435,18 +436,19 @@ impl AzerothCoreCatalog {
         map: u32,
         from: Vec3,
     ) -> Option<(u32, Vec3)> {
-        self.world
-            .trainer_services
-            .iter()
-            .filter(|trainer| trainer.skills.contains(&skill))
-            .flat_map(|trainer| {
-                trainer.spawns.iter().filter_map(move |spawn| {
-                    nearest_location(spawn, map)
-                        .map(|point| (from.distance(point), trainer.entry_id, point))
+        closest_by_distance(
+            self.world
+                .trainer_services
+                .iter()
+                .filter(|trainer| trainer.skills.contains(&skill))
+                .flat_map(|trainer| {
+                    trainer.spawns.iter().filter_map(move |spawn| {
+                        nearest_location(spawn, map)
+                            .map(|point| (from.distance(point), trainer.entry_id, point))
+                    })
                 })
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, entry, point)| (entry, point))
+                .map(|(distance, entry, point)| (distance, (entry, point))),
+        )
     }
     pub fn nearest_gather_node(
         &self,
@@ -454,17 +456,19 @@ impl AzerothCoreCatalog {
         map: u32,
         from: Vec3,
     ) -> Option<(&GatherNode, Vec3)> {
-        self.world
-            .gather_nodes
-            .iter()
-            .filter(|node| node.kind == kind)
-            .flat_map(|node| {
-                node.spawns.iter().filter_map(move |spawn| {
-                    nearest_location(spawn, map).map(|point| (from.distance(point), node, point))
+        closest_by_distance(
+            self.world
+                .gather_nodes
+                .iter()
+                .filter(|node| node.kind == kind)
+                .flat_map(|node| {
+                    node.spawns.iter().filter_map(move |spawn| {
+                        nearest_location(spawn, map)
+                            .map(|point| (from.distance(point), node, point))
+                    })
                 })
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, node, point)| (node, point))
+                .map(|(distance, node, point)| (distance, (node, point))),
+        )
     }
     fn nearest_spawn_for_entries(
         &self,
@@ -472,15 +476,18 @@ impl AzerothCoreCatalog {
         map: u32,
         from: Vec3,
     ) -> Option<Vec3> {
-        entries
-            .into_iter()
-            .filter_map(|(kind, entry)| {
-                self.nearest_spawn(kind.into(), entry, map, from)
-                    .map(|point| (from.distance(point), point))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, point)| point)
+        closest_by_distance(entries.into_iter().filter_map(|(kind, entry)| {
+            self.nearest_spawn(kind.into(), entry, map, from)
+                .map(|point| (from.distance(point), point))
+        }))
     }
+}
+
+fn closest_by_distance<T>(candidates: impl IntoIterator<Item = (f32, T)>) -> Option<T> {
+    candidates
+        .into_iter()
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, candidate)| candidate)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
