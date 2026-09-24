@@ -65,20 +65,42 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     let Some(class_id) = snapshot.state.capabilities.class_id else {
         return deferred("class_not_authoritative");
     };
-    let Some(tree) = snapshot.state.capabilities.specialization_tree else {
-        return deferred("specialization_not_authoritative");
-    };
-    let Some(policy) = combat_catalog()
-        .classes
-        .get(&class_id)
-        .and_then(|class| class.trees.get(&tree))
-    else {
+    let Some(policy) = combat_catalog().classes.get(&class_id) else {
         return deferred("class_specialization_policy_unavailable");
     };
+    let tree = snapshot.state.capabilities.specialization_tree;
+    if tree.is_none() && !player_is_pre_specialization(snapshot) {
+        return deferred("specialization_not_authoritative");
+    }
     let Some((power_type, power)) = player_power(snapshot) else {
         return deferred("combat_resource_state_unknown");
     };
-    let Some(priorities) = policy.power_policies.get(&power_type) else {
+    let priorities = match tree {
+        Some(tree) => {
+            let Some(tree_policy) = policy.trees.get(&tree) else {
+                return deferred("class_specialization_policy_unavailable");
+            };
+            tree_policy.power_policies.get(&power_type).cloned()
+        }
+        None => {
+            // Before level 10, WotLK characters do not have a locked talent
+            // tree. Use only spells that the server has confirmed the player
+            // knows from the class priorities, following the old policy's
+            // class-level behavior when no talent tree is locked.
+            let mut priorities = Vec::new();
+            for tree_policy in policy.trees.values() {
+                if let Some(families) = tree_policy.power_policies.get(&power_type) {
+                    for family in families {
+                        if !priorities.contains(family) {
+                            priorities.push(*family);
+                        }
+                    }
+                }
+            }
+            (!priorities.is_empty()).then_some(priorities)
+        }
+    };
+    let Some(priorities) = priorities else {
         return deferred("combat_resource_type_mismatch");
     };
     if power == 0 {
@@ -89,7 +111,7 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     }
 
     for family_id in priorities {
-        let Some(spell) = crate::combat::spells::family_spells(*family_id).and_then(|spells| {
+        let Some(spell) = crate::combat::spells::family_spells(family_id).and_then(|spells| {
             spells
                 .iter()
                 .find(|spell| snapshot.state.capabilities.spells.contains(spell))
@@ -114,6 +136,17 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     } else {
         CombatDecision::Melee { target }
     }
+}
+
+fn player_is_pre_specialization(snapshot: &Snapshot) -> bool {
+    snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|player| snapshot.state.entities.0.get(&player))
+        .and_then(|player| player.level)
+        .is_some_and(|level| level < 10)
 }
 
 /// Convert the policy decision to the one shared action shape used by every engine combat path.
