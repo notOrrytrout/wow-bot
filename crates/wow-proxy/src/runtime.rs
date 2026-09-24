@@ -100,6 +100,18 @@ pub struct ManagedLane {
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
+#[derive(Clone)]
+struct MovementMirror {
+    sequence: u64,
+    epoch: u64,
+    frame: crate::framing::ServerFrame,
+}
+
+fn invalidate_movement_mirror(epoch: &mut u64, updates: &watch::Sender<Option<MovementMirror>>) {
+    *epoch = epoch.wrapping_add(1).max(1);
+    updates.send_replace(None);
+}
+
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
@@ -709,6 +721,10 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     let mut canonical_flags: u32 = 0;
     let mut movement_clock = MovementClock::default();
     let mut last_bot_visual: Option<(WorldPosition, u32, std::time::Instant)> = None;
+    let (movement_mirror_tx, mut movement_mirror_rx) = watch::channel(None::<MovementMirror>);
+    let mut movement_mirror_sequence = 0_u64;
+    let mut movement_mirror_epoch = 1_u64;
+    let mut last_mirrored_sequence = 0_u64;
     let mut bot_loot_target: Option<EntityId> = None;
     let mut last_bot_cast: Option<(u32, Option<EntityId>, std::time::Instant)> = None;
     let (mut dr, mut dw) = downstream.into_split();
@@ -752,6 +768,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         // A non-echoed start/turn/jump/facing opcode is actual player intent.
                         tracing::info!(account=%account_name, opcode=frame.opcode, "explicit player movement intent observed; taking locomotion from bot");
                         last_bot_visual = None;
+                        invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
                         let _ = account.session_tx.send(SessionMessage::PlayerMovement { at: now }).await;
                     } else if bot_locomotion_recent {
                         // AzerothCore intentionally does not echo the mover's movement
@@ -786,6 +803,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         let mission_id = MissionId(account.mission_counter.fetch_add(1, Ordering::Relaxed));
                         match crate::commands::parse_local(text, family, true, mission_id) {
                             Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::On))) => {
+                                invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
                                 match account.session_tx.send(SessionMessage::BotOn).await {
                                     Ok(()) => {
                                         tracing::info!(account=%account_name, command=".bot on", "bot automation enabled");
@@ -796,6 +814,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                 continue;
                             }
                             Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::Off))) => {
+                                invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
                                 match account.session_tx.send(SessionMessage::BotOff).await {
                                     Ok(()) => {
                                         tracing::info!(account=%account_name, command=".bot off", "bot automation disabled");
@@ -806,6 +825,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                 continue;
                             }
                             Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::Mission(mission)))) => {
+                                invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
                                 let description = format!("{:?}", mission.intent);
                                 match account.supervisor_tx.send(SupervisorCommand::ReplaceMission { lane: account.config.lane, mission }).await {
                                     Ok(()) => {
@@ -902,10 +922,14 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                     }
                                     last_bot_visual = Some((position, frame.opcode, std::time::Instant::now()));
                                     if let Ok(opcode) = u16::try_from(frame.opcode) {
-                                        let visual = crate::framing::ServerFrame { opcode, body: frame.body.clone() };
-                                        if let Err(error) = write_server_frame(&mut dw, &mut down_enc, &visual).await {
-                                            break Err(error);
-                                        }
+                                        movement_mirror_sequence = movement_mirror_sequence.wrapping_add(1).max(1);
+                                        movement_mirror_tx.send_replace(Some(MovementMirror {
+                                            sequence: movement_mirror_sequence,
+                                            epoch: movement_mirror_epoch,
+                                            frame: crate::framing::ServerFrame { opcode, body: frame.body.clone() },
+                                        }));
+                                    } else {
+                                        tracing::warn!(account=%account_name, opcode=frame.opcode, "bot movement opcode cannot be represented for the client mirror");
                                     }
                                 }
                             }
@@ -916,6 +940,38 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(account=%account_name, skipped=n, "gameplay command bus lagged"),
                     Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
+            mirror = movement_mirror_rx.changed() => {
+                match mirror {
+                    Ok(()) => {
+                        let update = movement_mirror_rx.borrow_and_update().clone();
+                        if let Some(update) = update {
+                            if update.epoch != movement_mirror_epoch {
+                                last_mirrored_sequence = last_mirrored_sequence.max(update.sequence);
+                                tracing::debug!(account=%account_name, sequence=update.sequence, update_epoch=update.epoch, current_epoch=movement_mirror_epoch, "discarded movement mirror from an old control epoch");
+                                continue;
+                            }
+                            if update.sequence <= last_mirrored_sequence {
+                                tracing::debug!(account=%account_name, sequence=update.sequence, last_mirrored_sequence, "discarded stale bot movement mirror update");
+                                continue;
+                            }
+                            if update.sequence > last_mirrored_sequence.saturating_add(1) {
+                                tracing::warn!(account=%account_name, skipped=update.sequence - last_mirrored_sequence - 1, sequence=update.sequence, "movement mirror fell behind; sending the latest bot position");
+                            }
+                            if let Err(error) = write_server_frame(&mut dw, &mut down_enc, &update.frame)
+                                .await
+                                .with_context(|| format!("failed to mirror bot movement update {} to the player client", update.sequence))
+                            {
+                                tracing::error!(account=%account_name, sequence=update.sequence, %error, "player movement mirror failed; closing this world bridge for safe reconnect");
+                                break Err(error);
+                            }
+                            last_mirrored_sequence = update.sequence;
+                        }
+                    }
+                    Err(_) => {
+                        break Err(anyhow::anyhow!("bot movement mirror channel closed while the world bridge was active"));
+                    }
                 }
             }
             server = read_server_frame(&mut ur, &mut up_dec) => {

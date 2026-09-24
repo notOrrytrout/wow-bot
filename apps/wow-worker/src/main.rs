@@ -157,13 +157,17 @@ async fn main() -> Result<()> {
         .parent()
         .context("maps directory has no AzerothCore runtime root")?;
     let mmaps_dir = runtime_root.join("mmaps");
+    // Keep the existing navmesh step planner. Smaller 100 ms steps preserve
+    // normal ground-run speed while giving the client frequent position updates.
     let movement_controller =
-        wow_navigation::MovementController::new_with_mmaps(terrain, &mmaps_dir).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to initialize Detour/MMAP navigation at {}: {e:?}",
-                mmaps_dir.display()
-            )
-        })?;
+        wow_navigation::MovementController::new_with_mmaps(terrain, &mmaps_dir)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to initialize Detour/MMAP navigation at {}: {e:?}",
+                    mmaps_dir.display()
+                )
+            })?
+            .with_maximum_step(0.7);
     let engine = LaneEngine::new(initial_state(&args), lane_rx, proxy_tx)
         .with_movement_controller(movement_controller)
         .with_diagnostics(diagnostics.clone());

@@ -41,6 +41,8 @@ const TURN_IN_SEARCH_RANGE: f32 = 5.0;
 const QUEST_SEARCH_ARRIVAL_RANGE: f32 = 18.0;
 const QUEST_TOOL_SEARCH_RANGE: f32 = 12.0;
 const MAX_INTERACTION_RETRIES: usize = 512;
+const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(250);
+const MOVEMENT_STEP_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 enum PendingQuestAction {
@@ -201,12 +203,17 @@ impl LaneEngine {
     }
 
     pub async fn run(mut self) {
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut mission_tick = tokio::time::interval(ENGINE_TICK_INTERVAL);
+        mission_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut movement_tick = tokio::time::interval(MOVEMENT_STEP_INTERVAL);
+        movement_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = tick.tick() => {
+                _ = mission_tick.tick() => {
                     if !self.tick_mission().await { break; }
+                }
+                _ = movement_tick.tick() => {
+                    if self.pending_movement.is_some() && !self.tick_movement().await { break; }
                 }
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break; };
@@ -825,7 +832,7 @@ impl LaneEngine {
         }
         if movement
             .last_step
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(225))
+            .is_some_and(|at| at.elapsed() < MOVEMENT_STEP_INTERVAL)
         {
             self.pending_movement = Some(movement);
             return true;

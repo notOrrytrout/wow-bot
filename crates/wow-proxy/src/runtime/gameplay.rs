@@ -101,6 +101,10 @@ fn timestamp_is_after_or_equal(candidate: u32, previous: u32) -> bool {
     candidate == previous || timestamp_is_after(candidate, previous)
 }
 
+fn movement_pose_is_finite(position: WorldPosition) -> bool {
+    position.point.is_finite() && position.orientation.is_finite()
+}
+
 pub(super) fn parse_time_sync_response(body: &[u8]) -> Option<(u32, u32)> {
     let counter = u32::from_le_bytes(body.get(..4)?.try_into().ok()?);
     let client_time_ms = u32::from_le_bytes(body.get(4..8)?.try_into().ok()?);
@@ -342,6 +346,9 @@ pub(super) fn encode_gameplay_command(
                 .ok_or_else(|| "facing requested before player GUID is authoritative".to_owned())?;
             let mut position = current
                 .ok_or_else(|| "facing requested before canonical position is known".to_owned())?;
+            if !movement_pose_is_finite(position) {
+                return Err("facing requested from an invalid canonical position".into());
+            }
             if !orientation.is_finite() {
                 return Err("facing orientation is invalid".into());
             }
@@ -391,6 +398,9 @@ pub(super) fn encode_gameplay_command(
             let mut position = current.ok_or_else(|| {
                 "movement requested before canonical position is known".to_owned()
             })?;
+            if !movement_pose_is_finite(position) {
+                return Err("movement requested from an invalid canonical position".into());
+            }
             if !destination.is_finite() {
                 return Err("movement destination is invalid".into());
             }
@@ -426,6 +436,9 @@ pub(super) fn encode_gameplay_command(
             let position = current.ok_or_else(|| {
                 "stop movement requested before canonical position is known".to_owned()
             })?;
+            if !movement_pose_is_finite(position) {
+                return Err("stop movement requested from an invalid canonical position".into());
+            }
             let movement_time = movement_clock.next_timestamp();
             let flags = base_movement_flags & !0x0000_0001_u32;
             let body = encode_simple_movement(
