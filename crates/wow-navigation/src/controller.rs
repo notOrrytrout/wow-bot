@@ -74,12 +74,7 @@ pub struct MovementController {
 
 impl MovementController {
     pub fn new(terrain: TerrainSampler) -> Self {
-        Self {
-            terrain,
-            maximum_step: 1.5,
-            navigation: None,
-            route: Arc::new(Mutex::new(None)),
-        }
+        Self::with_navigation(terrain, None)
     }
 
     pub fn new_with_mmaps(
@@ -88,12 +83,16 @@ impl MovementController {
     ) -> Result<Self, NavigationError> {
         let navigation = NavigationData::new(mmaps_dir.as_ref())
             .map_err(|_| NavigationError::MissingNavigationData)?;
-        Ok(Self {
+        Ok(Self::with_navigation(terrain, Some(Arc::new(navigation))))
+    }
+
+    fn with_navigation(terrain: TerrainSampler, navigation: Option<Arc<NavigationData>>) -> Self {
+        Self {
             terrain,
             maximum_step: 1.5,
-            navigation: Some(Arc::new(navigation)),
+            navigation,
             route: Arc::new(Mutex::new(None)),
-        })
+        }
     }
 
     pub fn with_maximum_step(mut self, value: f32) -> Self {
