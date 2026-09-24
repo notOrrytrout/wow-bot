@@ -4,7 +4,7 @@ use std::{
     sync::OnceLock,
     time::{Duration, Instant},
 };
-use wow_domain::{EntityId, time::Millis};
+use wow_domain::{EntityId, WorldPosition, time::Millis};
 use wow_state::Snapshot;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -103,6 +103,13 @@ pub fn decide_next(
             reason: "player_moving",
         };
     }
+    let player_position = snapshot
+        .state
+        .entities
+        .0
+        .get(&player)
+        .and_then(|entity| entity.position)
+        .or(snapshot.state.position.player);
 
     for family in catalog()
         .policies
@@ -131,7 +138,7 @@ pub fn decide_next(
                 if !snapshot.state.auras.by_entity.contains_key(&member.entity) {
                     continue;
                 }
-                if !party_member_nearby(snapshot, player, member.entity) {
+                if !party_member_nearby(snapshot, player_position, member.entity) {
                     continue;
                 }
                 if has_same_or_better(snapshot, member.entity, family, desired.strength) {
@@ -226,14 +233,11 @@ fn has_same_or_better(
         .any(|ranked| active.contains(&ranked.spell) && ranked.strength >= desired_strength)
 }
 
-fn party_member_nearby(snapshot: &Snapshot, player: EntityId, member: EntityId) -> bool {
-    let player_pos = snapshot
-        .state
-        .entities
-        .0
-        .get(&player)
-        .and_then(|entity| entity.position)
-        .or(snapshot.state.position.player);
+fn party_member_nearby(
+    snapshot: &Snapshot,
+    player_pos: Option<WorldPosition>,
+    member: EntityId,
+) -> bool {
     let member_pos = snapshot
         .state
         .entities
