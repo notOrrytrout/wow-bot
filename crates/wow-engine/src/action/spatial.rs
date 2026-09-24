@@ -3,6 +3,8 @@ use std::f32::consts::{PI, TAU};
 const MELEE_FACING_TOLERANCE: f32 = PI / 6.0;
 const INTERACTION_FACING_TOLERANCE: f32 = PI / 4.0;
 const CAST_FACING_TOLERANCE: f32 = PI / 9.0;
+const INTERACTION_MAX_RANGE: f32 = 5.0;
+const INTERACTION_APPROACH_RANGE: f32 = 4.0;
 const NPC_FRONT_STANDOFF: f32 = 3.0;
 const NPC_FRONT_TOLERANCE: f32 = 1.5;
 const MOB_REAR_STANDOFF: f32 = 3.0;
@@ -65,26 +67,25 @@ pub fn profile(command: &GameplayCommand) -> Option<SpatialProfile> {
         | GameplayCommand::CastGameObject { target, .. }
         | GameplayCommand::Loot(target)
         | GameplayCommand::Gather(target)
-        | GameplayCommand::EnterVehicle(target) => (
-            *target,
-            0.0,
-            5.0,
-            4.0,
-            Some(INTERACTION_FACING_TOLERANCE),
-            true,
-        ),
-        GameplayCommand::UseItem {
+        | GameplayCommand::EnterVehicle(target)
+        | GameplayCommand::UseItem {
             target: Some(target),
             ..
         }
         | GameplayCommand::UseItemInstance {
             target: Some(target),
             ..
-        } => (
+        }
+        | GameplayCommand::AcceptQuest { giver: target, .. }
+        | GameplayCommand::TurnInQuest { giver: target, .. }
+        | GameplayCommand::RequestQuestReward { giver: target, .. }
+        | GameplayCommand::ChooseQuestReward { giver: target, .. }
+        | GameplayCommand::VendorBuy { vendor: target, .. }
+        | GameplayCommand::VendorSell { vendor: target, .. } => (
             *target,
             0.0,
-            5.0,
-            4.0,
+            INTERACTION_MAX_RANGE,
+            INTERACTION_APPROACH_RANGE,
             Some(INTERACTION_FACING_TOLERANCE),
             true,
         ),
@@ -109,19 +110,6 @@ pub fn profile(command: &GameplayCommand) -> Option<SpatialProfile> {
             MOB_CAST_MAX_RANGE,
             MOB_CAST_APPROACH_RANGE,
             Some(CAST_FACING_TOLERANCE),
-            true,
-        ),
-        GameplayCommand::AcceptQuest { giver: target, .. }
-        | GameplayCommand::TurnInQuest { giver: target, .. }
-        | GameplayCommand::RequestQuestReward { giver: target, .. }
-        | GameplayCommand::ChooseQuestReward { giver: target, .. }
-        | GameplayCommand::VendorBuy { vendor: target, .. }
-        | GameplayCommand::VendorSell { vendor: target, .. } => (
-            *target,
-            0.0,
-            5.0,
-            4.0,
-            Some(INTERACTION_FACING_TOLERANCE),
             true,
         ),
         _ => return None,
