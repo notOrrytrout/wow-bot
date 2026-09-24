@@ -7,6 +7,7 @@ use std::{
 use tokio::sync::mpsc;
 use wow_control_proto::WorkerToProxy;
 use wow_domain::*;
+use wow_infra::logging::structured::{DiagnosticLogger, DiagnosticStream};
 use wow_policy::questing::{
     objectives::{ObjectiveResolution, resolve as resolve_objective, resolve_with_exclusions},
     tasks::{QuestWorkId, QuestWorkKey, QuestWorkRuntime},
@@ -118,6 +119,7 @@ pub struct LaneEngine {
     last_wait_reason: Option<String>,
     last_dispatch: DispatchOutcome,
     movement_controller: Option<wow_navigation::MovementController>,
+    diagnostics: Option<DiagnosticLogger>,
     credited_quest_targets: BTreeSet<(u32, usize, EntityId)>,
     los_blocked: BTreeSet<EntityId>,
     los_attempts: BTreeMap<EntityId, u8>,
@@ -161,6 +163,7 @@ impl LaneEngine {
             last_wait_reason: None,
             last_dispatch: DispatchOutcome::Rejected,
             movement_controller: None,
+            diagnostics: None,
             credited_quest_targets: BTreeSet::new(),
             los_blocked: BTreeSet::new(),
             los_attempts: BTreeMap::new(),
@@ -183,6 +186,17 @@ impl LaneEngine {
     ) -> Self {
         self.movement_controller = Some(controller);
         self
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: DiagnosticLogger) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    fn diagnostic(&self, stream: DiagnosticStream, record_type: &str, fields: serde_json::Value) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.record(stream, self.state.lane, record_type, fields);
+        }
     }
 
     pub async fn run(mut self) {
@@ -330,6 +344,14 @@ impl LaneEngine {
                 let delta = reduce(&mut self.state.authoritative, o);
                 if !delta.changed.is_empty() {
                     tracing::debug!(lane=?self.state.lane, revision=?delta.revision, changed=?delta.changed, "authoritative state updated");
+                    self.diagnostic(
+                        DiagnosticStream::Transition,
+                        "authoritative_state_changed",
+                        serde_json::json!({
+                            "revision": format!("{:?}", delta.revision),
+                            "domains": format!("{:?}", delta.changed),
+                        }),
+                    );
                 }
             }
             LaneMessage::ReplaceMission(m) => {
@@ -350,16 +372,64 @@ impl LaneEngine {
                 self.behind_retry_cast_allowed.clear();
                 self.last_wait_reason = None;
                 tracing::info!(lane=?self.state.lane, mission=?self.state.mission.intent, revision=?self.state.mission_revision, "mission installed in lane engine");
+                self.diagnostic(
+                    DiagnosticStream::Transition,
+                    "mission_installed",
+                    serde_json::json!({
+                        "mission_id": self.state.mission.id.0,
+                        "mission_kind": match &self.state.mission.intent {
+                            MissionIntent::Idle => "idle",
+                            MissionIntent::Quest => "quest",
+                            MissionIntent::Gather { .. } => "gather",
+                            MissionIntent::Grind { .. } => "grind",
+                            MissionIntent::Battleground { .. } => "battleground",
+                            MissionIntent::Party { .. } => "party",
+                            MissionIntent::Raid { .. } => "raid",
+                            MissionIntent::Goal { .. } => "goal",
+                        },
+                        "revision": format!("{:?}", self.state.mission_revision),
+                    }),
+                );
             }
-            LaneMessage::SetPause(p) => self.state.pause = p,
+            LaneMessage::SetPause(p) => {
+                if self.state.pause != p {
+                    self.state.pause = p;
+                    self.diagnostic(
+                        DiagnosticStream::Transition,
+                        "pause_reasons_changed",
+                        serde_json::json!({"pause_reasons": format!("{p:?}")}),
+                    );
+                }
+            }
             LaneMessage::UpdatePause { set, clear } => {
+                let previous = self.state.pause;
                 self.state.pause.insert(set);
                 self.state.pause.remove(clear);
+                if self.state.pause != previous {
+                    self.diagnostic(
+                        DiagnosticStream::Transition,
+                        "pause_reasons_changed",
+                        serde_json::json!({
+                            "previous": format!("{previous:?}"),
+                            "current": format!("{:?}", self.state.pause),
+                        }),
+                    );
+                }
             }
             LaneMessage::SetActivation(stage) => {
                 if self.state.activation != stage {
+                    let previous = self.state.activation;
                     self.state.activation = stage;
                     self.state.permission_revision = self.state.permission_revision.next();
+                    self.diagnostic(
+                        DiagnosticStream::Transition,
+                        "activation_stage_changed",
+                        serde_json::json!({
+                            "previous": format!("{previous:?}"),
+                            "current": format!("{stage:?}"),
+                            "permission_revision": format!("{:?}", self.state.permission_revision),
+                        }),
+                    );
                 }
             }
             LaneMessage::Ownership {
@@ -374,12 +444,26 @@ impl LaneEngine {
                 } else {
                     self.state.pause.insert(PauseReasons::PLAYER_CONTROL)
                 }
+                self.diagnostic(
+                    DiagnosticStream::Transition,
+                    "ownership_changed",
+                    serde_json::json!({
+                        "generation": generation.get(),
+                        "movement_epoch": movement.get(),
+                        "bot_allowed": bot_allowed,
+                    }),
+                );
             }
             LaneMessage::MovementFence(epoch) => {
                 if self.state.movement_epoch != epoch {
                     self.state.movement_epoch = epoch;
                     self.pending_movement = None;
                     self.pending_quest_action = None;
+                    self.diagnostic(
+                        DiagnosticStream::Transition,
+                        "movement_fence_changed",
+                        serde_json::json!({"movement_epoch": epoch.get()}),
+                    );
                 }
             }
             LaneMessage::Propose(a) => {
@@ -809,6 +893,16 @@ impl LaneEngine {
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
         {
             tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, mover=?self.state.authoritative.control.mover, "movement operation progress");
+            self.diagnostic(
+                DiagnosticStream::MovementHeartbeat,
+                "movement_progress",
+                serde_json::json!({
+                    "work_id": movement.work.id.0,
+                    "locomotion": format!("{locomotion:?}"),
+                    "remaining": distance,
+                    "mover_controlled": controlled_mover,
+                }),
+            );
             movement.last_progress_log = Some(Instant::now());
         }
         if distance <= movement.acceptable_range {
@@ -845,12 +939,35 @@ impl LaneEngine {
             None => Err(wow_navigation::NavigationError::MissingNavigationData),
         };
         let next = match step_result {
-            Ok(Some(step)) => step.next,
+            Ok(Some(step)) => {
+                self.diagnostic(
+                    DiagnosticStream::Navigation,
+                    "movement_step_selected",
+                    serde_json::json!({
+                        "work_id": movement.work.id.0,
+                        "locomotion": format!("{locomotion:?}"),
+                        "remaining": distance,
+                        "purpose": format!("{:?}", movement.purpose),
+                        "step_remaining": step.remaining,
+                    }),
+                );
+                step.next
+            }
             Ok(None) => {
                 self.pending_movement = Some(movement);
                 return true;
             }
             Err(error) => {
+                self.diagnostic(
+                    DiagnosticStream::Navigation,
+                    "movement_step_rejected",
+                    serde_json::json!({
+                        "work_id": movement.work.id.0,
+                        "locomotion": format!("{locomotion:?}"),
+                        "purpose": format!("{:?}", movement.purpose),
+                        "reason": format!("{error:?}"),
+                    }),
+                );
                 self.waiting(format!("movement step rejected: {error:?}"));
                 self.pending_movement = Some(movement);
                 return true;

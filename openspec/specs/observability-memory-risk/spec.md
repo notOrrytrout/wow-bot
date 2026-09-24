@@ -32,11 +32,16 @@ The system SHALL avoid holding broad fleet synchronization while performing slow
 - **THEN** unrelated bot lanes are not intentionally blocked on that file I/O through a fleet-wide lock
 
 ### Requirement: High-frequency diagnostics are bounded
-The system SHALL throttle, aggregate, or otherwise bound high-frequency diagnostics.
+The system SHALL throttle, aggregate, or otherwise bound high-frequency diagnostics. Structured runtime diagnostics SHALL use bounded nonblocking queues so slow log storage does not block bot work.
 
 #### Scenario: Movement heartbeat is stable
 - **WHEN** high-frequency movement state remains materially unchanged
 - **THEN** logging does not grow without bound from redundant per-tick messages
+
+#### Scenario: Structured diagnostic storage falls behind
+- **WHEN** a diagnostic queue is full
+- **THEN** the runtime drops diagnostic records and reports the drop total
+- **AND** the bot continues its work without waiting for the log writer
 
 ### Requirement: Configurable persistent memory
 The system SHALL honor whether persistent memory is required or optional and SHALL not fabricate persistence when storage is unavailable.

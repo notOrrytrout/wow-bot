@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -28,6 +28,7 @@ use wow_infra::config::{
     app::{AccountConfig, AppConfig},
     data_dir::AppPaths,
 };
+use wow_infra::logging::structured::{DiagnosticStream, diagnostic_path};
 use wow_proxy::runtime::{ManagedLane, ProxyAccountConfig, ProxyRuntimeConfig};
 
 #[derive(Clone)]
@@ -153,6 +154,14 @@ async fn main() -> Result<()> {
     let app_paths = AppPaths::discover().map_err(anyhow::Error::msg)?;
     app_paths.ensure().map_err(anyhow::Error::msg)?;
     let runtime_log = init_logging(&app_paths)?;
+    let run_id = format!(
+        "{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        std::process::id()
+    );
     tracing::info!(runtime_log=%runtime_log.display(), action_logs=%app_paths.logs.display(), "logging initialized");
     let config_path = args
         .config
@@ -239,6 +248,8 @@ async fn main() -> Result<()> {
                 WorkerGeneration(1),
                 &config.runtime.control_bind,
                 &runtime_paths.maps,
+                &app_paths.logs,
+                &run_id,
             )
             .await?,
         ));
@@ -282,6 +293,7 @@ async fn main() -> Result<()> {
         max_pre_auth_connections_per_ip: config.proxy.max_pre_auth_connections_per_ip,
         warden_client_image: config.proxy.warden_client_image.clone(),
         log_dir: app_paths.logs.clone(),
+        run_id,
     };
     let mut proxy_task = tokio::spawn(wow_proxy::runtime::run(proxy, managed));
 
@@ -882,6 +894,8 @@ async fn spawn_worker(
     generation: WorkerGeneration,
     control: &str,
     maps_dir: &Path,
+    log_dir: &Path,
+    run_id: &str,
 ) -> Result<Child> {
     tracing::info!(%lane, worker=%path.display(), "starting worker process");
     let mut child = Command::new(path)
@@ -894,9 +908,16 @@ async fn spawn_worker(
         .arg(control)
         .arg("--maps-dir")
         .arg(maps_dir)
+        .env("WOW_BOT_RUN_ID", run_id)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .envs(DiagnosticStream::WORKER.into_iter().filter_map(|stream| {
+            Some((
+                stream.worker_env_key()?,
+                diagnostic_path(log_dir, stream, lane),
+            ))
+        }))
         .spawn()
         .with_context(|| format!("start worker {}", path.display()))?;
 

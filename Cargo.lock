@@ -2360,6 +2360,7 @@ name = "wow-bot-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2397,11 +2398,13 @@ dependencies = [
 name = "wow-engine"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
  "wow-control-proto",
  "wow-domain",
+ "wow-infra",
  "wow-navigation",
  "wow-policy",
  "wow-state",
@@ -2449,11 +2452,13 @@ dependencies = [
  "anyhow",
  "md-5",
  "serde",
+ "serde_json",
  "sha1",
  "tokio",
  "tracing",
  "wow-control-proto",
  "wow-domain",
+ "wow-infra",
  "wow-state",
  "wow-tentacli-adapter",
  "wow_login_messages",

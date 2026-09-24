@@ -50,6 +50,28 @@ A high-volume or failing lane SHALL NOT require a fleet-wide proxy restart merel
 - **THEN** diagnostics remain attributable to that lane
 - **AND** unrelated listener lifecycle remains independent
 
+### Requirement: Structured runtime diagnostics use bounded per-lane streams
+The runtime SHALL write metadata-only JSONL records to per-lane navigation,
+movement-heartbeat, transition, network, proxy-session, and proxy-movement
+streams under the bot-owned log directory. Worker and proxy records SHALL use
+the same writer schema and write rules. Each record SHALL include a record type,
+format version, Unix timestamp in milliseconds, per-run per-file sequence, run ID, and
+lane ID. Each stream SHALL include a run-start record. A bounded nonblocking
+queue SHALL drop diagnostics rather than block gameplay when the writer falls
+behind, and it SHALL report dropped-record totals. These records SHALL NOT
+include credentials, chat text, Warden contents, or raw packet bodies.
+
+#### Scenario: Supervisor starts workers for two lanes
+- **THEN** each lane receives separate files for its four worker streams and
+  two proxy streams
+- **AND** each stream records a run-start event that identifies the supervisor run
+- **AND** records from workers and proxy use the same common fields
+
+#### Scenario: Structured log storage is slow or unavailable
+- **THEN** gameplay and proxy work do not wait for disk I/O
+- **AND** a full queue drops diagnostic records and reports the drop total
+- **AND** failure to open or write one stream does not stop runtime execution
+
 ### Requirement: Runtime diagnostics are persisted in bot-owned storage
 The supervisor SHALL write normal runtime diagnostics to a persistent file under the bot-owned log directory while also emitting them to the interactive console.
 

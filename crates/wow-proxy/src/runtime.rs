@@ -42,6 +42,7 @@ use wow_domain::{
     AccountId, EntityId, GameplayCommand, LaneId, Mission, MissionId, WorkerGeneration,
     WorldPosition,
 };
+use wow_infra::logging::structured::{DiagnosticLogger, DiagnosticStream, diagnostic_path};
 use wow_login_messages::Message as _;
 use wow_login_messages::{
     all::ProtocolVersion,
@@ -76,6 +77,7 @@ pub struct ProxyRuntimeConfig {
     pub max_pre_auth_connections: usize,
     pub max_pre_auth_connections_per_ip: usize,
     pub log_dir: PathBuf,
+    pub run_id: String,
     pub warden_client_image: Option<PathBuf>,
 }
 
@@ -280,8 +282,29 @@ struct SharedRuntime {
 }
 
 pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<()> {
+    let diagnostic_files = lanes.iter().flat_map(|lane| {
+        DiagnosticStream::PROXY.into_iter().map(|stream| {
+            (
+                stream,
+                lane.config.lane,
+                diagnostic_path(&config.log_dir, stream, lane.config.lane),
+            )
+        })
+    });
+    let diagnostics = DiagnosticLogger::new(config.run_id.clone(), diagnostic_files);
+    let mut session_actors = Vec::new();
     let mut accounts = HashMap::new();
     for lane in lanes {
+        for stream in DiagnosticStream::PROXY {
+            diagnostics.record(
+                stream,
+                lane.config.lane,
+                "run_started",
+                serde_json::json!({
+                    "process_id": std::process::id(),
+                }),
+            );
+        }
         let (session_tx, session_rx) = mpsc::channel(256);
         let (command_tx, mut command_rx) = mpsc::channel(256);
         let (command_bus, _) = broadcast::channel(256);
@@ -290,16 +313,17 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
         let state =
             ConfiguredSessionState::new(lane.config.account, lane.config.lane, lane.config.worker);
         let supervisor_for_runtime = lane.supervisor_tx.clone();
-        tokio::spawn(
+        session_actors.push(tokio::spawn(
             ConfiguredSessionActor {
                 state,
                 rx: session_rx,
                 worker_tx: lane.worker_tx,
                 upstream_tx: command_tx.clone(),
                 supervisor_tx: lane.supervisor_tx,
+                diagnostics: diagnostics.clone(),
             }
             .run(),
-        );
+        ));
         let session = session_tx.clone();
         tokio::spawn(async move {
             let mut worker_rx = lane.worker_rx;
@@ -354,6 +378,12 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
     for account in shared.accounts.values() {
         let _ = account.session_tx.send(SessionMessage::Shutdown).await;
     }
+    for actor in session_actors {
+        if let Err(error) = actor.await {
+            tracing::warn!(%error, "configured session actor stopped unexpectedly during proxy shutdown");
+        }
+    }
+    diagnostics.flush();
     Ok(())
 }
 

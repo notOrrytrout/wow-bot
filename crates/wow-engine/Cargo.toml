@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 wow-control-proto.workspace = true
 wow-domain.workspace = true
+wow-infra.workspace = true
 wow-navigation.workspace = true
 wow-policy.workspace = true
 wow-state.workspace = true
@@ -14,5 +15,6 @@ wow-state.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
 [lints]
 workspace = true

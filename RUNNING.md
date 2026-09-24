@@ -107,6 +107,12 @@ The default locations are:
 ```text
 <repo>/wow-bot-data/logs/wow-bot.log
 <repo>/wow-bot-data/logs/action-<ACCOUNT>-<timestamp>.jsonl
+<repo>/wow-bot-data/logs/navigation/<LANE_ID>.jsonl
+<repo>/wow-bot-data/logs/movement-heartbeats/<LANE_ID>.jsonl
+<repo>/wow-bot-data/logs/transitions/<LANE_ID>.jsonl
+<repo>/wow-bot-data/logs/network/<LANE_ID>.jsonl
+<repo>/wow-bot-data/logs/proxy/sessions/<LANE_ID>.jsonl
+<repo>/wow-bot-data/logs/proxy/movement/<LANE_ID>.jsonl
 ```
 
 If `WOW_BOT_HOME` is set, the log directory is `$WOW_BOT_HOME/logs/` instead.
@@ -114,6 +120,35 @@ If `WOW_BOT_HOME` is set, the log directory is `$WOW_BOT_HOME/logs/` instead.
 Configured-account chat commands such as `.bot on`, `.bot off`, `.bot status`, `.log start`, `.log stop`, `.log status`, and `.log mark` are consumed by the proxy and are not forwarded to AzerothCore. Each recognized command is printed to the supervisor console and written to `wow-bot.log`.
 
 `.log start` creates a per-account JSONL packet/action trace in the same log directory. The console prints the exact path. `.log status` prints whether action logging is active and its path. `.log stop` closes the trace and prints its path.
+
+The supervisor also enables six metadata-only JSONL diagnostic streams. Each
+stream has a separate file for each lane ID. Worker processes receive their four
+file paths through internal environment settings. The proxy uses the two paths
+under `proxy/`:
+
+- `navigation/<LANE_ID>.jsonl` records selected movement steps and navigation
+  rejections.
+- `movement-heartbeats/<LANE_ID>.jsonl` records bounded movement progress
+  heartbeats.
+- `transitions/<LANE_ID>.jsonl` records authoritative state, mission,
+  activation, pause, ownership, and movement-fence changes.
+- `network/<LANE_ID>.jsonl` records worker control connection results, action
+  transport results, and session-state messages. It does not record every
+  packet.
+- `proxy/sessions/<LANE_ID>.jsonl` records upstream session and worker-action
+  outcomes.
+- `proxy/movement/<LANE_ID>.jsonl` records movement ownership and command
+  outcomes.
+
+Every record has `record_type`, `format_version`, `unix_ms`, `sequence`, `run_id`,
+and `lane` fields. `unix_ms` is a Unix timestamp in milliseconds. `sequence`
+increases within each file for each run. `run_id` is shared by the supervisor, workers, and
+proxy during one supervisor run. Event-specific fields contain identifiers,
+state flags, outcomes, durations, and reason labels. They do not contain
+credentials, chat text, Warden contents, or raw packet bodies. Record calls use
+a bounded nonblocking queue; a full queue drops diagnostics and reports the
+drop count in the runtime log. Navigation and movement heartbeat streams flush
+the first record and then in batches. Other streams flush every record.
 
 ## Quest command visibility
 

@@ -11,6 +11,7 @@ use wow_engine::{
     activity::ActivityArbiter,
     lane::{LaneEngine, LaneMessage, LaneState},
 };
+use wow_infra::logging::structured::{DiagnosticLogger, DiagnosticStream};
 use wow_state::AuthoritativeState;
 
 #[derive(Debug)]
@@ -88,9 +89,41 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = args()?;
-    let stream = TcpStream::connect(&args.control)
-        .await
-        .with_context(|| format!("failed to connect worker control socket {}", args.control))?;
+    let run_id = env::var("WOW_BOT_RUN_ID").unwrap_or_else(|_| "unknown-run".into());
+    let diagnostics = DiagnosticLogger::worker_from_env(run_id, args.lane);
+    for stream in DiagnosticStream::WORKER {
+        diagnostics.record(
+            stream,
+            args.lane,
+            "run_started",
+            serde_json::json!({
+                "process_id": std::process::id(),
+            }),
+        );
+    }
+    let stream = match TcpStream::connect(&args.control).await {
+        Ok(stream) => {
+            diagnostics.record(
+                DiagnosticStream::Network,
+                args.lane,
+                "control_connected",
+                serde_json::json!({"generation": args.generation.get()}),
+            );
+            stream
+        }
+        Err(error) => {
+            diagnostics.record(
+                DiagnosticStream::Network,
+                args.lane,
+                "control_connect_failed",
+                serde_json::json!({"error_kind": format!("{:?}", error.kind())}),
+            );
+            diagnostics.flush();
+            return Err(error).with_context(|| {
+                format!("failed to connect worker control socket {}", args.control)
+            });
+        }
+    };
     stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
 
@@ -132,7 +165,8 @@ async fn main() -> Result<()> {
             )
         })?;
     let engine = LaneEngine::new(initial_state(&args), lane_rx, proxy_tx)
-        .with_movement_controller(movement_controller);
+        .with_movement_controller(movement_controller)
+        .with_diagnostics(diagnostics.clone());
     let engine_task = tokio::spawn(engine.run());
 
     let lane = args.lane;
@@ -194,6 +228,15 @@ async fn main() -> Result<()> {
             SupervisorWire::Proxy(ProxyToWorker::Shutdown) => break,
             SupervisorWire::Proxy(ProxyToWorker::ActionResult { action, result }) => {
                 tracing::info!(?action, ?result, "gameplay action transport result");
+                diagnostics.record(
+                    DiagnosticStream::Network,
+                    lane,
+                    "action_transport_result",
+                    serde_json::json!({
+                        "action_id": action.get(),
+                        "accepted": matches!(result, wow_control_proto::ActionTransportResult::Accepted),
+                    }),
+                );
             }
             SupervisorWire::Proxy(ProxyToWorker::SessionState {
                 connected,
@@ -203,6 +246,15 @@ async fn main() -> Result<()> {
                     connected,
                     in_world,
                     "configured session state received from proxy"
+                );
+                diagnostics.record(
+                    DiagnosticStream::Network,
+                    lane,
+                    "session_state_received",
+                    serde_json::json!({
+                        "connected": connected,
+                        "in_world": in_world,
+                    }),
                 );
                 // A live socket is not proof of an entered character world. Wait for
                 // SMSG_LOGIN_VERIFY_WORLD from AzerothCore before creating EnteredWorld.
@@ -265,8 +317,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    diagnostics.record(
+        DiagnosticStream::Network,
+        lane,
+        "control_connection_closed",
+        serde_json::json!({"generation": generation.get()}),
+    );
     let _ = lane_tx.send(LaneMessage::Shutdown).await;
     engine_task.await?;
     writer_task.abort();
+    diagnostics.flush();
     Ok(())
 }

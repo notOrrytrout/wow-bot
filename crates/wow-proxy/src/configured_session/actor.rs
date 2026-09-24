@@ -10,6 +10,7 @@ use wow_control_proto::{
     WorkerToProxy,
 };
 use wow_domain::{GameplayCommand, PauseReasons};
+use wow_infra::logging::structured::{DiagnosticLogger, DiagnosticStream};
 use wow_state::ProtocolObservation;
 
 pub enum SessionMessage {
@@ -45,6 +46,7 @@ pub struct ConfiguredSessionActor {
     pub worker_tx: mpsc::Sender<ProxyToWorker>,
     pub upstream_tx: mpsc::Sender<GameplayCommand>,
     pub supervisor_tx: mpsc::Sender<SupervisorCommand>,
+    pub diagnostics: DiagnosticLogger,
 }
 
 impl ConfiguredSessionActor {
@@ -78,6 +80,14 @@ impl ConfiguredSessionActor {
             }
             SessionMessage::PlayerDetached { connection } => {
                 let final_connection = self.state.player.detach(connection);
+                self.diagnostics.record(
+                    DiagnosticStream::ProxySession,
+                    self.state.lane,
+                    "player_detached",
+                    serde_json::json!({
+                        "final_connection": final_connection,
+                    }),
+                );
                 if final_connection {
                     self.state.upstream_connected = false;
                     self.state.world_authoritative = false;
@@ -103,6 +113,16 @@ impl ConfiguredSessionActor {
                 let owner = self.state.ownership.snapshot();
                 tracing::info!(lane=?self.state.lane, generation=?owner.generation, movement_epoch=?owner.movement_epoch, idle_resume_ms=self.state.player.idle_window.as_millis(), "player movement temporarily took locomotion; bot resume armed");
                 self.publish_ownership().await;
+                self.diagnostics.record(
+                    DiagnosticStream::ProxyMovement,
+                    self.state.lane,
+                    "player_movement_takeover",
+                    serde_json::json!({
+                        "generation": owner.generation.get(),
+                        "movement_epoch": owner.movement_epoch.get(),
+                        "idle_resume_ms": self.state.player.idle_window.as_millis() as u64,
+                    }),
+                );
                 false
             }
             SessionMessage::ChannelActivity { until } => {
@@ -142,6 +162,15 @@ impl ConfiguredSessionActor {
                             self.state.player.resumed();
                             let owner = self.state.ownership.snapshot();
                             tracing::info!(lane=?self.state.lane, generation=?owner.generation, movement_epoch=?owner.movement_epoch, "player idle window elapsed; bot ownership resumed");
+                            self.diagnostics.record(
+                                DiagnosticStream::ProxyMovement,
+                                self.state.lane,
+                                "bot_movement_resumed",
+                                serde_json::json!({
+                                    "generation": owner.generation.get(),
+                                    "movement_epoch": owner.movement_epoch.get(),
+                                }),
+                            );
                             self.publish_ownership().await;
                         }
                         Ok(()) => {
@@ -158,17 +187,40 @@ impl ConfiguredSessionActor {
                 false
             }
             SessionMessage::UpstreamConnected(value) => {
+                let changed = self.state.upstream_connected != value;
                 self.state.upstream_connected = value;
                 if !value {
                     self.state.world_authoritative = false;
                 }
                 self.publish_session_state().await;
+                if changed {
+                    self.diagnostics.record(
+                        DiagnosticStream::ProxySession,
+                        self.state.lane,
+                        "upstream_connection_changed",
+                        serde_json::json!({
+                            "connected": value,
+                        }),
+                    );
+                }
                 false
             }
             SessionMessage::WorldAuthoritative(value) => {
+                let changed = self.state.world_authoritative != value;
                 self.state.world_authoritative = value;
                 self.publish_session_state().await;
                 tracing::info!(lane=?self.state.lane, connected=self.state.upstream_connected, in_world=value, "configured world authority state changed");
+                if changed {
+                    self.diagnostics.record(
+                        DiagnosticStream::ProxySession,
+                        self.state.lane,
+                        "world_authority_changed",
+                        serde_json::json!({
+                            "connected": self.state.upstream_connected,
+                            "in_world": value,
+                        }),
+                    );
+                }
                 false
             }
             SessionMessage::Observation(observation) => {
@@ -185,6 +237,12 @@ impl ConfiguredSessionActor {
     async fn attach_player(&mut self, connection: u64) -> bool {
         self.state.player.attach(connection);
         let paused = self.update_player_pause(true).await.is_ok();
+        self.diagnostics.record(
+            DiagnosticStream::ProxySession,
+            self.state.lane,
+            "player_attached",
+            serde_json::json!({"pause_committed": paused}),
+        );
         if paused {
             self.state.player.bot_off();
             self.state.ownership.player_attached_manual_off();
@@ -211,6 +269,15 @@ impl ConfiguredSessionActor {
                             reason: format!("{error:?}"),
                         },
                     };
+                self.diagnostics.record(
+                    DiagnosticStream::ProxySession,
+                    self.state.lane,
+                    "worker_action_transport",
+                    serde_json::json!({
+                        "action_id": id.get(),
+                        "accepted": matches!(result, ActionTransportResult::Accepted),
+                    }),
+                );
                 let _ = self
                     .worker_tx
                     .send(ProxyToWorker::ActionResult { action: id, result })
@@ -227,10 +294,19 @@ impl ConfiguredSessionActor {
                 epoch, destination, ..
             } => {
                 let owner = self.state.ownership.snapshot();
-                if owner.permits(ClientKind::Bot)
+                let accepted = owner.permits(ClientKind::Bot)
                     && owner.movement_epoch == epoch
-                    && destination.is_finite()
-                {
+                    && destination.is_finite();
+                self.diagnostics.record(
+                    DiagnosticStream::ProxyMovement,
+                    self.state.lane,
+                    "bot_movement_command",
+                    serde_json::json!({
+                        "movement_epoch": epoch.get(),
+                        "accepted": accepted,
+                    }),
+                );
+                if accepted {
                     let _ = self
                         .upstream_tx
                         .send(GameplayCommand::MoveTo(destination))
@@ -240,7 +316,17 @@ impl ConfiguredSessionActor {
             }
             WorkerToProxy::StopMovement { epoch, .. } => {
                 let owner = self.state.ownership.snapshot();
-                if owner.permits(ClientKind::Bot) && owner.movement_epoch == epoch {
+                let accepted = owner.permits(ClientKind::Bot) && owner.movement_epoch == epoch;
+                self.diagnostics.record(
+                    DiagnosticStream::ProxyMovement,
+                    self.state.lane,
+                    "bot_stop_movement_command",
+                    serde_json::json!({
+                        "movement_epoch": epoch.get(),
+                        "accepted": accepted,
+                    }),
+                );
+                if accepted {
                     let _ = self.upstream_tx.send(GameplayCommand::StopMovement).await;
                 }
                 false
@@ -268,6 +354,15 @@ impl ConfiguredSessionActor {
     }
 
     async fn publish_session_state(&self) {
+        self.diagnostics.record(
+            DiagnosticStream::ProxySession,
+            self.state.lane,
+            "session_state_published",
+            serde_json::json!({
+                "connected": self.state.upstream_connected,
+                "in_world": self.state.world_authoritative,
+            }),
+        );
         let _ = self
             .worker_tx
             .send(ProxyToWorker::SessionState {
@@ -279,6 +374,17 @@ impl ConfiguredSessionActor {
 
     async fn publish_ownership(&self) {
         let owner = self.state.ownership.snapshot();
+        self.diagnostics.record(
+            DiagnosticStream::ProxyMovement,
+            self.state.lane,
+            "ownership_published",
+            serde_json::json!({
+                "generation": owner.generation.get(),
+                "movement_epoch": owner.movement_epoch.get(),
+                "bot_allowed": owner.bot_allowed(),
+                "player_present": owner.player_present(),
+            }),
+        );
         let _ = self
             .worker_tx
             .send(ProxyToWorker::OwnershipChanged(WireOwnership {
@@ -297,6 +403,10 @@ mod tests {
     use std::time::Duration;
     use wow_domain::{AccountId, LaneId, WorkerGeneration};
 
+    fn test_diagnostics() -> DiagnosticLogger {
+        DiagnosticLogger::new("test", Vec::new())
+    }
+
     #[tokio::test]
     async fn older_player_disconnect_preserves_newer_world_session() {
         let (_, rx) = mpsc::channel(8);
@@ -309,6 +419,7 @@ mod tests {
             worker_tx,
             upstream_tx,
             supervisor_tx,
+            diagnostics: test_diagnostics(),
         };
         actor
             .handle(SessionMessage::PlayerAttached { connection: 1 })
@@ -349,6 +460,7 @@ mod tests {
             worker_tx,
             upstream_tx,
             supervisor_tx,
+            diagnostics: test_diagnostics(),
         };
         let moved_at = Instant::now();
         actor.state.upstream_connected = true;
@@ -390,6 +502,7 @@ mod tests {
             worker_tx,
             upstream_tx,
             supervisor_tx,
+            diagnostics: test_diagnostics(),
         };
         let moved_at = Instant::now();
         actor.state.upstream_connected = true;
