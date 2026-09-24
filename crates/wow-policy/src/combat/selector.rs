@@ -1,23 +1,31 @@
 use serde::Deserialize;
 use std::{collections::BTreeMap, sync::OnceLock};
-use wow_domain::{EntityId, time::Millis};
+use wow_domain::{EntityId, GameplayCommand, time::Millis};
 use wow_state::Snapshot;
 
 #[derive(Clone, Debug, Deserialize)]
 struct CombatCatalog {
-    classes: BTreeMap<u8, Vec<SpellFamily>>,
+    format_version: u32,
+    classes: BTreeMap<u8, ClassPolicy>,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+struct ClassPolicy {
+    trees: BTreeMap<u8, TreePolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TreePolicy {
+    power_policies: BTreeMap<u8, Vec<SpellFamily>>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct SpellFamily {
-    #[serde(rename = "root")]
-    _root: u32,
-    spells: Vec<RankedSpell>,
+    #[serde(rename = "name")]
+    _name: String,
+    spells: Vec<u32>,
 }
-#[derive(Clone, Copy, Debug, Deserialize)]
-struct RankedSpell {
-    rank: u32,
-    spell: u32,
-}
+
 #[derive(Clone, Debug, Deserialize)]
 struct WandCatalog {
     wand_items: Vec<u32>,
@@ -25,12 +33,17 @@ struct WandCatalog {
 
 static COMBAT: OnceLock<CombatCatalog> = OnceLock::new();
 static WANDS: OnceLock<WandCatalog> = OnceLock::new();
+
 fn combat_catalog() -> &'static CombatCatalog {
     COMBAT.get_or_init(|| {
-        serde_json::from_str(include_str!("../../data/combat-spells.json"))
-            .expect("combat spell catalog")
+        let catalog: CombatCatalog =
+            serde_json::from_str(include_str!("../../data/combat-priorities.json"))
+                .expect("combat priority catalog");
+        assert_eq!(catalog.format_version, 1);
+        catalog
     })
 }
+
 fn wand_catalog() -> &'static WandCatalog {
     WANDS.get_or_init(|| {
         serde_json::from_str(include_str!("../../data/wands.json")).expect("wand catalog")
@@ -45,63 +58,141 @@ pub enum CombatDecision {
     Deferred { reason: &'static str },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CombatAction {
+    pub command: GameplayCommand,
+    pub cycle: std::time::Duration,
+}
+
 pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     let Some(class_id) = snapshot.state.capabilities.class_id else {
-        return CombatDecision::Deferred {
-            reason: "class_not_authoritative",
-        };
+        return deferred("class_not_authoritative");
     };
-    let caster = matches!(class_id, 5 | 8 | 9);
-    if !caster {
+    let Some(tree) = snapshot.state.capabilities.specialization_tree else {
+        return deferred("specialization_not_authoritative");
+    };
+    let Some(policy) = combat_catalog()
+        .classes
+        .get(&class_id)
+        .and_then(|class| class.trees.get(&tree))
+    else {
+        return deferred("class_specialization_policy_unavailable");
+    };
+    let Some((power_type, power)) = player_power(snapshot) else {
+        return deferred("combat_resource_state_unknown");
+    };
+    let Some(priorities) = policy.power_policies.get(&power_type) else {
+        return deferred("combat_resource_type_mismatch");
+    };
+    if power == 0 {
+        if is_wand_caster(class_id) {
+            return oom_fallback(snapshot, target);
+        }
         return CombatDecision::Melee { target };
     }
 
-    if let Some(spell) = highest_known_offensive_spell(snapshot, class_id) {
-        if !is_oom(snapshot) {
-            if crate::combat::readiness::check_spell_readiness(
-                snapshot,
-                spell,
-                Some(target),
-                Millis::wall_clock_now().0,
-            )
-            .is_ok()
-            {
-                return CombatDecision::Cast { spell, target };
-            }
-        }
-    }
-
-    if has_equipped_wand(snapshot) {
-        // Shoot (Wand) in 3.3.5a. The server validates the equipped ranged weapon.
-        return CombatDecision::Wand { target };
-    }
-
-    if is_oom(snapshot) && !snapshot.state.inventory.equipment_authoritative {
-        return CombatDecision::Deferred {
-            reason: "oom_but_ranged_slot_not_authoritative",
+    for family in priorities {
+        let Some(spell) = family
+            .spells
+            .iter()
+            .find(|spell| snapshot.state.capabilities.spells.contains(spell))
+            .copied()
+        else {
+            continue;
         };
-    }
-    if is_oom(snapshot) {
-        CombatDecision::Melee { target }
-    } else {
-        CombatDecision::Deferred {
-            reason: "caster_has_mana_but_no_known_offensive_spell",
+        if crate::combat::readiness::check_spell_readiness(
+            snapshot,
+            spell,
+            Some(target),
+            Millis::wall_clock_now().0,
+        )
+        .is_ok()
+        {
+            return CombatDecision::Cast { spell, target };
         }
+    }
+
+    if is_wand_caster(class_id) && is_oom(snapshot) {
+        oom_fallback(snapshot, target)
+    } else if is_wand_caster(class_id) {
+        deferred("caster_has_no_ready_known_offensive_spell")
+    } else {
+        CombatDecision::Melee { target }
     }
 }
 
+/// Convert the policy decision to the one shared action shape used by every engine combat path.
+pub fn select_action(snapshot: &Snapshot, target: EntityId) -> Result<CombatAction, &'static str> {
+    match select(snapshot, target) {
+        CombatDecision::Cast { spell, target } => Ok(CombatAction {
+            command: GameplayCommand::Cast {
+                spell,
+                target: Some(target),
+            },
+            cycle: std::time::Duration::from_secs(3),
+        }),
+        CombatDecision::Wand { target } => Ok(CombatAction {
+            command: GameplayCommand::Cast {
+                spell: 5019,
+                target: Some(target),
+            },
+            cycle: std::time::Duration::from_secs(12),
+        }),
+        CombatDecision::Melee { target } => Ok(CombatAction {
+            command: GameplayCommand::Attack(target),
+            cycle: std::time::Duration::from_secs(12),
+        }),
+        CombatDecision::Deferred { reason } => Err(reason),
+    }
+}
+
+pub fn supported_class_trees() -> impl Iterator<Item = (u8, u8, Vec<(u8, u32)>)> {
+    combat_catalog()
+        .classes
+        .iter()
+        .flat_map(|(&class, policy)| {
+            policy.trees.iter().filter_map(move |(&tree, tree_policy)| {
+                let power_profiles: Vec<_> = tree_policy
+                    .power_policies
+                    .iter()
+                    .filter_map(|(&power_type, priorities)| {
+                        priorities
+                            .first()
+                            .and_then(|family| family.spells.first())
+                            .map(|spell| (power_type, *spell))
+                    })
+                    .collect();
+                (!power_profiles.is_empty()).then_some((class, tree, power_profiles))
+            })
+        })
+}
+
+fn player_power(snapshot: &Snapshot) -> Option<(u8, u32)> {
+    let player = snapshot.state.session.character_guid.map(EntityId)?;
+    let entity = snapshot.state.entities.0.get(&player)?;
+    Some((entity.power_type?, entity.power?.0))
+}
+
+fn is_wand_caster(class_id: u8) -> bool {
+    matches!(class_id, 5 | 8 | 9)
+}
+
+fn oom_fallback(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
+    if has_equipped_wand(snapshot) {
+        return CombatDecision::Wand { target };
+    }
+    if !snapshot.state.inventory.equipment_authoritative {
+        return deferred("oom_but_ranged_slot_not_authoritative");
+    }
+    CombatDecision::Melee { target }
+}
+
+fn deferred(reason: &'static str) -> CombatDecision {
+    CombatDecision::Deferred { reason }
+}
+
 pub fn is_oom(snapshot: &Snapshot) -> bool {
-    let Some(player) = snapshot.state.session.character_guid.map(EntityId) else {
-        return false;
-    };
-    snapshot
-        .state
-        .entities
-        .0
-        .get(&player)
-        .filter(|entity| entity.power_type == Some(0))
-        .and_then(|entity| entity.power)
-        .is_some_and(|(current, _)| current == 0)
+    player_power(snapshot).is_some_and(|(power_type, current)| power_type == 0 && current == 0)
 }
 
 pub fn has_equipped_wand(snapshot: &Snapshot) -> bool {
@@ -112,45 +203,36 @@ pub fn has_equipped_wand(snapshot: &Snapshot) -> bool {
         .is_some_and(|item| wand_catalog().wand_items.binary_search(&item).is_ok())
 }
 
-fn highest_known_offensive_spell(snapshot: &Snapshot, class_id: u8) -> Option<u32> {
-    combat_catalog()
-        .classes
-        .get(&class_id)?
-        .iter()
-        .flat_map(|family| family.spells.iter())
-        .filter(|ranked| snapshot.state.capabilities.spells.contains(&ranked.spell))
-        .max_by_key(|ranked| (ranked.rank, ranked.spell))
-        .map(|ranked| ranked.spell)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wow_state::{
-        AuthoritativeState,
-        entities::{EntityKind, EntityState},
-    };
+    use wow_state::{AuthoritativeState, entities::EntityState};
 
-    fn caster_state(class_id: u8, mana: u32) -> AuthoritativeState {
+    fn state(
+        class_id: u8,
+        tree: u8,
+        power_type: u8,
+        power: u32,
+        target: EntityId,
+    ) -> AuthoritativeState {
         let mut state = AuthoritativeState::default();
         state.session.in_world = true;
         state.session.character_guid = Some(1);
         state.capabilities.class_id = Some(class_id);
+        state.capabilities.specialization_tree = Some(tree);
         state.entities.0.insert(
             EntityId(1),
             EntityState {
                 id: EntityId(1),
-                kind: EntityKind::Player,
-                power: Some((mana, 100)),
-                power_type: Some(0),
+                power_type: Some(power_type),
+                power: Some((power, 100)),
                 ..Default::default()
             },
         );
         state.entities.0.insert(
-            EntityId(9),
+            target,
             EntityState {
-                id: EntityId(9),
-                kind: EntityKind::Unit,
+                id: target,
                 ..Default::default()
             },
         );
@@ -158,48 +240,71 @@ mod tests {
     }
 
     #[test]
-    fn warlock_prefers_shadow_bolt_while_mana_available() {
-        let mut state = caster_state(9, 100);
-        state.capabilities.spells.extend([686, 695]);
-        assert_eq!(
-            select(&Snapshot::from_state(&state), EntityId(9)),
-            CombatDecision::Cast {
-                spell: 695,
-                target: EntityId(9)
+    fn every_wotlk_class_and_tree_has_a_grounded_ready_priority() {
+        let entries: Vec<_> = supported_class_trees().collect();
+        assert_eq!(entries.len(), 30);
+        for (class_id, tree, profiles) in entries {
+            for (power_type, spell) in profiles {
+                let target = EntityId(9);
+                let mut state = state(class_id, tree, power_type, 100, target);
+                state.capabilities.spells.insert(spell);
+                assert_eq!(
+                    select(&Snapshot::from_state(&state), target),
+                    CombatDecision::Cast { spell, target },
+                    "class={class_id}, tree={tree}, power={power_type}"
+                );
             }
-        );
+        }
     }
+
     #[test]
-    fn oom_caster_prefers_wand_to_melee() {
-        let mut state = caster_state(9, 0);
-        state.inventory.equipment_authoritative = true;
-        state.inventory.equipped_ranged_item = Some(5207);
+    fn specialization_resource_and_spell_readiness_fail_closed() {
+        let target = EntityId(9);
+        let mut no_tree = state(8, 0, 0, 100, target);
+        no_tree.capabilities.specialization_tree = None;
         assert_eq!(
-            select(&Snapshot::from_state(&state), EntityId(9)),
-            CombatDecision::Wand {
-                target: EntityId(9)
-            }
+            select(&Snapshot::from_state(&no_tree), target),
+            deferred("specialization_not_authoritative")
         );
-    }
-    #[test]
-    fn oom_caster_without_wand_may_melee() {
-        let mut state = caster_state(8, 0);
-        state.inventory.equipment_authoritative = true;
+
+        let mut unknown_power = state(8, 0, 0, 100, target);
+        unknown_power
+            .entities
+            .0
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .power = None;
         assert_eq!(
-            select(&Snapshot::from_state(&state), EntityId(9)),
-            CombatDecision::Melee {
-                target: EntityId(9)
-            }
+            select(&Snapshot::from_state(&unknown_power), target),
+            deferred("combat_resource_state_unknown")
         );
-    }
-    #[test]
-    fn oom_caster_waits_until_ranged_slot_is_authoritative() {
-        let state = caster_state(9, 0);
+
+        let mut no_spell = state(8, 0, 0, 100, target);
         assert_eq!(
-            select(&Snapshot::from_state(&state), EntityId(9)),
-            CombatDecision::Deferred {
-                reason: "oom_but_ranged_slot_not_authoritative"
-            }
+            select(&Snapshot::from_state(&no_spell), target),
+            deferred("caster_has_no_ready_known_offensive_spell")
+        );
+
+        let spell = supported_class_trees()
+            .find(|(class, tree, _)| (*class, *tree) == (8, 0))
+            .unwrap()
+            .2[0]
+            .1;
+        no_spell.capabilities.spells.insert(spell);
+        no_spell
+            .capabilities
+            .spell_cooldowns
+            .insert(spell, u64::MAX);
+        assert_eq!(
+            select(&Snapshot::from_state(&no_spell), target),
+            deferred("caster_has_no_ready_known_offensive_spell")
+        );
+
+        no_spell.entities.0.get_mut(&EntityId(1)).unwrap().power = Some((0, 100));
+        no_spell.inventory.equipment_authoritative = true;
+        assert_eq!(
+            select(&Snapshot::from_state(&no_spell), target),
+            CombatDecision::Melee { target }
         );
     }
 }

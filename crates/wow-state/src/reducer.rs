@@ -267,7 +267,33 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
         }
         ProtocolObservation::PlayerClass { class_id } => {
             state.capabilities.class_id = Some(class_id);
-            delta.changed.push("capabilities".into());
+            state.capabilities.specialization_tree =
+                crate::talents::active_tree(Some(class_id), &state.capabilities.active_talents);
+            delta
+                .changed
+                .extend(["capabilities".into(), "specialization".into()]);
+        }
+        ProtocolObservation::PlayerTalents {
+            group_count,
+            active_group,
+            talents,
+        } => {
+            let valid = group_count.is_some_and(|count| (1..=2).contains(&count))
+                && active_group.is_some_and(|group| group_count.is_some_and(|count| group < count));
+            state.capabilities.talent_group_count = valid.then_some(group_count).flatten();
+            state.capabilities.active_talent_group = valid.then_some(active_group).flatten();
+            state.capabilities.active_talents = if valid { talents } else { Vec::new() };
+            state.capabilities.specialization_tree = valid
+                .then(|| {
+                    crate::talents::active_tree(
+                        state.capabilities.class_id,
+                        &state.capabilities.active_talents,
+                    )
+                })
+                .flatten();
+            delta
+                .changed
+                .extend(["capabilities".into(), "specialization".into()]);
         }
         ProtocolObservation::AuraSnapshot { entity, auras } => {
             state.auras.by_entity.insert(
@@ -486,5 +512,41 @@ mod tests {
             },
         );
         assert_eq!(s.inventory.bot_loot_generation, 2);
+    }
+
+    #[test]
+    fn talent_tree_resolves_when_class_and_active_talents_are_authoritative() {
+        let mut state = AuthoritativeState::default();
+        reduce(
+            &mut state,
+            ProtocolObservation::PlayerTalents {
+                group_count: Some(2),
+                active_group: Some(1),
+                talents: vec![
+                    crate::capabilities::TalentRank {
+                        talent_id: 74,
+                        rank: 1,
+                    },
+                    crate::capabilities::TalentRank {
+                        talent_id: 27,
+                        rank: 3,
+                    },
+                ],
+            },
+        );
+        assert_eq!(state.capabilities.specialization_tree, None);
+        reduce(&mut state, ProtocolObservation::PlayerClass { class_id: 8 });
+        assert_eq!(state.capabilities.active_talent_group, Some(1));
+        assert_eq!(state.capabilities.specialization_tree, Some(1));
+
+        reduce(
+            &mut state,
+            ProtocolObservation::PlayerTalents {
+                group_count: None,
+                active_group: None,
+                talents: Vec::new(),
+            },
+        );
+        assert_eq!(state.capabilities.specialization_tree, None);
     }
 }

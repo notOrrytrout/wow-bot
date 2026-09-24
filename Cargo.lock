@@ -2466,6 +2466,7 @@ name = "wow-state"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "wow-domain",
 ]
 
@@ -2478,6 +2479,7 @@ dependencies = [
  "tracing",
  "wow-control-proto",
  "wow-domain",
+ "wow-state",
 ]
 
 [[package]]

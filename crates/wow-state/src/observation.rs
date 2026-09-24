@@ -123,6 +123,11 @@ pub enum ProtocolObservation {
     PlayerClass {
         class_id: u8,
     },
+    PlayerTalents {
+        group_count: Option<u8>,
+        active_group: Option<u8>,
+        talents: Vec<crate::capabilities::TalentRank>,
+    },
     AuraSnapshot {
         entity: EntityId,
         auras: Vec<crate::auras::AuraInstance>,

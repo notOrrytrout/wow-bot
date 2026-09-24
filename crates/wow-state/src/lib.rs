@@ -16,6 +16,7 @@ pub mod quests;
 pub mod reducer;
 pub mod session;
 pub mod snapshot;
+pub mod talents;
 pub use authoritative::*;
 pub use delta::*;
 pub use observation::*;

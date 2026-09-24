@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use tentacli::{
@@ -12,9 +15,11 @@ use tentacli::{
 };
 use tokio::sync::RwLock;
 use wow_domain::{EntityId, WorldPosition};
-use wow_state::ProtocolObservation;
+use wow_state::{ProtocolObservation, capabilities::TalentRank};
 
 use crate::objects::object_to_entity;
+
+const SMSG_TALENTS_INFO: u16 = 0x04c0;
 
 /// Stateful bridge around Tentacli's WotLK ObjectProcessor.
 ///
@@ -93,6 +98,15 @@ impl ObjectObservationRuntime {
         }
 
         let mut observations = Vec::new();
+        if opcode == SMSG_TALENTS_INFO
+            && let Some((group_count, active_group, talents)) = parse_player_talents_info(body)
+        {
+            observations.push(ProtocolObservation::PlayerTalents {
+                group_count,
+                active_group,
+                talents,
+            });
+        }
         let mut current = BTreeMap::new();
         {
             let guard = self.context.read().await;
@@ -411,9 +425,133 @@ pub fn login_verify_world(body: &[u8], character_guid: u64) -> Option<ProtocolOb
         })
 }
 
+/// Parse AzerothCore's player SMSG_TALENTS_INFO payload. Pet packets use marker 1
+/// and are ignored. A malformed player packet emits unknown talent data so stale
+/// specialization state cannot remain active.
+fn parse_player_talents_info(body: &[u8]) -> Option<(Option<u8>, Option<u8>, Vec<TalentRank>)> {
+    if body.first().copied()? != 0 {
+        return None;
+    }
+    let invalid = || Some((None, None, Vec::new()));
+    let mut reader = TalentPacketReader::new(&body[1..]);
+    let Some(_unspent_points) = reader.u32() else {
+        return invalid();
+    };
+    let Some(group_count) = reader.u8() else {
+        return invalid();
+    };
+    let Some(active_group) = reader.u8() else {
+        return invalid();
+    };
+    if !(1..=2).contains(&group_count) || active_group >= group_count {
+        return invalid();
+    }
+
+    let mut active_talents = None;
+    for group in 0..group_count {
+        let Some(count) = reader.u8().map(usize::from) else {
+            return invalid();
+        };
+        if count > 150 {
+            return invalid();
+        }
+        let mut talents = Vec::with_capacity(count);
+        let mut talent_ids = BTreeSet::new();
+        for _ in 0..count {
+            let (Some(talent_id), Some(rank)) = (reader.u32(), reader.u8()) else {
+                return invalid();
+            };
+            if talent_id == 0 || rank >= 5 || !talent_ids.insert(talent_id) {
+                return invalid();
+            }
+            talents.push(TalentRank { talent_id, rank });
+        }
+        let Some(glyph_count) = reader.u8().map(usize::from) else {
+            return invalid();
+        };
+        if glyph_count > 6 {
+            return invalid();
+        }
+        for _ in 0..glyph_count {
+            if reader.u16().is_none() {
+                return invalid();
+            }
+        }
+        if group == active_group {
+            active_talents = Some(talents);
+        }
+    }
+    if !reader.is_empty() {
+        return invalid();
+    }
+    Some((
+        Some(group_count),
+        Some(active_group),
+        active_talents.unwrap_or_default(),
+    ))
+}
+
+struct TalentPacketReader<'a> {
+    body: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> TalentPacketReader<'a> {
+    fn new(body: &'a [u8]) -> Self {
+        Self { body, offset: 0 }
+    }
+
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let end = self.offset.checked_add(N)?;
+        let bytes = self.body.get(self.offset..end)?.try_into().ok()?;
+        self.offset = end;
+        Some(bytes)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take::<1>()?[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take()?))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.body.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn talent_group(talents: &[(u32, u8)], glyphs: &[u16]) -> Vec<u8> {
+        let mut body = vec![talents.len() as u8];
+        for (talent_id, rank) in talents {
+            body.extend_from_slice(&talent_id.to_le_bytes());
+            body.push(*rank);
+        }
+        body.push(glyphs.len() as u8);
+        for glyph in glyphs {
+            body.extend_from_slice(&glyph.to_le_bytes());
+        }
+        body
+    }
+
+    fn player_talents_packet(active: u8, groups: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = vec![0];
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.push(groups.len() as u8);
+        body.push(active);
+        for group in groups {
+            body.extend_from_slice(group);
+        }
+        body
+    }
 
     #[test]
     fn parses_azerothcore_login_verify_world_layout() {
@@ -431,5 +569,87 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_active_talent_group_from_single_and_dual_spec_packets() {
+        let single = player_talents_packet(0, &[talent_group(&[(74, 2)], &[123, 456])]);
+        assert_eq!(
+            parse_player_talents_info(&single),
+            Some((
+                Some(1),
+                Some(0),
+                vec![TalentRank {
+                    talent_id: 74,
+                    rank: 2,
+                }]
+            ))
+        );
+
+        let dual = player_talents_packet(
+            1,
+            &[
+                talent_group(&[(74, 1)], &[]),
+                talent_group(&[(27, 3), (26, 0)], &[7]),
+            ],
+        );
+        let active_first = player_talents_packet(
+            0,
+            &[
+                talent_group(&[(74, 1)], &[]),
+                talent_group(&[(27, 3), (26, 0)], &[7]),
+            ],
+        );
+        assert_eq!(
+            parse_player_talents_info(&active_first),
+            Some((
+                Some(2),
+                Some(0),
+                vec![TalentRank {
+                    talent_id: 74,
+                    rank: 1,
+                }]
+            ))
+        );
+        assert_eq!(
+            parse_player_talents_info(&dual),
+            Some((
+                Some(2),
+                Some(1),
+                vec![
+                    TalentRank {
+                        talent_id: 27,
+                        rank: 3,
+                    },
+                    TalentRank {
+                        talent_id: 26,
+                        rank: 0,
+                    }
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn truncated_or_invalid_player_talents_are_reported_as_unknown() {
+        assert_eq!(
+            parse_player_talents_info(&[0]),
+            Some((None, None, Vec::new()))
+        );
+        assert_eq!(
+            parse_player_talents_info(&player_talents_packet(0, &[vec![1, 74, 0]])),
+            Some((None, None, Vec::new()))
+        );
+        let mut invalid_active = player_talents_packet(2, &[talent_group(&[], &[])]);
+        assert_eq!(
+            parse_player_talents_info(&invalid_active),
+            Some((None, None, Vec::new()))
+        );
+        invalid_active = player_talents_packet(0, &[talent_group(&[(0, 0)], &[])]);
+        assert_eq!(
+            parse_player_talents_info(&invalid_active),
+            Some((None, None, Vec::new()))
+        );
+        assert_eq!(parse_player_talents_info(&[1, 0, 0, 0, 0]), None);
     }
 }

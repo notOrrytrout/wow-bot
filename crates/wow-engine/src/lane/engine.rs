@@ -460,35 +460,7 @@ impl LaneEngine {
         }) {
             return true;
         }
-        let snapshot = Snapshot::from_state(&self.state.authoritative);
-        let command = match wow_policy::combat::selector::select(&snapshot, target) {
-            wow_policy::combat::selector::CombatDecision::Cast { spell, target } => {
-                tracing::info!(lane=?self.state.lane, spell, ?target, "survival combat selected caster spell for authoritative attacker");
-                GameplayCommand::Cast {
-                    spell,
-                    target: Some(target),
-                }
-            }
-            wow_policy::combat::selector::CombatDecision::Wand { target } => {
-                tracing::info!(lane=?self.state.lane, ?target, spell=5019_u32, "survival combat selected wand for authoritative attacker");
-                GameplayCommand::Cast {
-                    spell: 5019,
-                    target: Some(target),
-                }
-            }
-            wow_policy::combat::selector::CombatDecision::Melee { target } => {
-                tracing::info!(lane=?self.state.lane, ?target, "survival combat selected melee for authoritative attacker");
-                GameplayCommand::Attack(target)
-            }
-            wow_policy::combat::selector::CombatDecision::Deferred { reason } => {
-                self.waiting(format!(
-                    "survival combat against {target} deferred: {reason}"
-                ));
-                return true;
-            }
-        };
-        self.last_survival_action = Some((target, Instant::now()));
-        self.propose_recovery(command).await
+        self.dispatch_combat_target(target, true).await
     }
 
     fn player_is_dead(&self) -> bool {
@@ -1064,7 +1036,7 @@ impl LaneEngine {
                     target,
                 });
                 tracing::info!(lane=?self.state.lane, quest, objective, ?target, "quest scheduler grounded creature objective from live object state");
-                return self.dispatch_combat_target(target).await;
+                return self.dispatch_combat_target(target, false).await;
             }
             ObjectiveResolution::GroundedGameObject { objective, target } => {
                 self.set_work(QuestWorkKey::InteractObjective {
@@ -1282,7 +1254,7 @@ impl LaneEngine {
                         .await;
                 }
                 tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler engaging grounded quest-item source through shared combat selector");
-                return self.dispatch_combat_target(target).await;
+                return self.dispatch_combat_target(target, false).await;
             }
             ObjectiveResolution::GroundedItemGameObject { item, target } => {
                 self.set_work(QuestWorkKey::CollectItem { quest, item });
@@ -1866,43 +1838,28 @@ impl LaneEngine {
         }
     }
 
-    async fn dispatch_combat_target(&mut self, target: EntityId) -> bool {
+    async fn dispatch_combat_target(&mut self, target: EntityId, recovery: bool) -> bool {
         let snapshot = Snapshot::from_state(&self.state.authoritative);
-        match wow_policy::combat::selector::select(&snapshot, target) {
-            wow_policy::combat::selector::CombatDecision::Cast { spell, target } => {
-                tracing::info!(lane=?self.state.lane, spell, ?target, "shared combat selector chose caster spell");
-                self.dispatch_quest_semantic(
-                    GameplayCommand::Cast {
-                        spell,
-                        target: Some(target),
-                    },
-                    self.combat_pending(target, Duration::from_secs(3)),
-                )
-                .await
+        let selected = match wow_policy::combat::selector::select_action(&snapshot, target) {
+            Ok(selected) => selected,
+            Err(reason) => {
+                let source = if recovery { "survival" } else { "quest" };
+                self.waiting(format!(
+                    "{source} combat against {target} deferred: {reason}"
+                ));
+                return true;
             }
-            wow_policy::combat::selector::CombatDecision::Wand { target } => {
-                tracing::info!(lane=?self.state.lane, ?target, spell=5019_u32, "shared combat selector chose wand shoot because caster is OOM");
-                self.dispatch_quest_semantic(
-                    GameplayCommand::Cast {
-                        spell: 5019,
-                        target: Some(target),
-                    },
-                    self.combat_pending(target, Duration::from_secs(12)),
-                )
-                .await
-            }
-            wow_policy::combat::selector::CombatDecision::Melee { target } => {
-                tracing::info!(lane=?self.state.lane, ?target, "shared combat selector chose melee fallback");
-                self.dispatch_quest_semantic(
-                    GameplayCommand::Attack(target),
-                    self.combat_pending(target, Duration::from_secs(12)),
-                )
-                .await
-            }
-            wow_policy::combat::selector::CombatDecision::Deferred { reason } => {
-                self.waiting(format!("combat against {target} deferred: {reason}"));
-                true
-            }
+        };
+        tracing::info!(lane=?self.state.lane, ?target, recovery, command=?selected.command, "shared combat selector chose action");
+        if recovery {
+            self.last_survival_action = Some((target, Instant::now()));
+            self.propose_recovery(selected.command).await
+        } else {
+            self.dispatch_quest_semantic(
+                selected.command,
+                self.combat_pending(target, selected.cycle),
+            )
+            .await
         }
     }
 
@@ -2450,6 +2407,84 @@ fn should_supersede_search_movement(purpose: MovementPurpose, live_target_availa
 mod tests {
     use super::*;
     use crate::activity::ActivityArbiter;
+
+    fn combat_engine() -> (LaneEngine, mpsc::Receiver<WorkerToProxy>) {
+        let (_lane_tx, lane_rx) = mpsc::channel(1);
+        let (proxy_tx, proxy_rx) = mpsc::channel(4);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.position.player = Some(wow_domain::WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        authoritative.capabilities.class_id = Some(1);
+        authoritative.capabilities.specialization_tree = Some(0);
+        authoritative.entities.0.insert(
+            EntityId(1),
+            wow_state::entities::EntityState {
+                id: EntityId(1),
+                kind: wow_state::entities::EntityKind::Player,
+                position: authoritative.position.player,
+                power_type: Some(1),
+                power: Some((20, 100)),
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            EntityId(9),
+            wow_state::entities::EntityState {
+                id: EntityId(9),
+                kind: wow_state::entities::EntityKind::Unit,
+                hostile: true,
+                position: Some(wow_domain::WorldPosition {
+                    map: 0,
+                    point: Vec3::new(2.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let state = LaneState {
+            lane: LaneId(1),
+            worker: WorkerGeneration(1),
+            ownership: OwnershipGeneration::ZERO,
+            movement_epoch: MovementEpoch::ZERO,
+            mission: Mission::quest(MissionId(9)),
+            mission_revision: MissionRevision::ZERO,
+            permission_revision: PermissionRevision::ZERO,
+            pause: PauseReasons::empty(),
+            activation: ActivationStage::Act,
+            authoritative,
+            activity: ActivityArbiter::default(),
+        };
+        (LaneEngine::new(state, lane_rx, proxy_tx), proxy_rx)
+    }
+
+    #[tokio::test]
+    async fn quest_and_survival_combat_share_selection_and_action_validation() {
+        let target = EntityId(9);
+        let (mut quest_engine, mut quest_proxy) = combat_engine();
+        assert!(quest_engine.dispatch_combat_target(target, false).await);
+        let WorkerToProxy::Action(quest_action) = quest_proxy.recv().await.unwrap() else {
+            panic!("expected validated quest combat action")
+        };
+        assert_eq!(quest_action.command(), &GameplayCommand::Attack(target));
+        assert_eq!(quest_action.origin(), PlanOrigin::SystemPolicy);
+        assert!(matches!(
+            quest_engine.pending_quest_action,
+            Some(PendingQuestAction::Combat { target: pending, .. }) if pending == target
+        ));
+
+        let (mut survival_engine, mut survival_proxy) = combat_engine();
+        assert!(survival_engine.dispatch_combat_target(target, true).await);
+        let WorkerToProxy::Action(survival_action) = survival_proxy.recv().await.unwrap() else {
+            panic!("expected validated survival combat action")
+        };
+        assert_eq!(survival_action.command(), quest_action.command());
+        assert_eq!(survival_action.origin(), PlanOrigin::Recovery);
+    }
 
     #[tokio::test]
     async fn world_exit_discards_pending_work_and_keeps_mission() {
