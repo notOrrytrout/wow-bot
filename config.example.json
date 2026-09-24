@@ -1,7 +1,7 @@
 {
-  "setup_complete": true,
+  "setup_complete": false,
   "runtime": {
-    "data_dir": "wow-bot-data",
+    "data_dir": "data",
     "control_bind": "127.0.0.1:7878",
     "worker_queue": 256,
     "handshake_timeout_ms": 10000,
@@ -25,17 +25,17 @@
     "world_bind": "0.0.0.0:8086",
     "transparent_world_bind": "0.0.0.0:8088",
     "advertise_host": "127.0.0.1",
-    "warden_client_image": "/path/to/Wow.exe",
     "max_pre_auth_connections": 128,
-    "max_pre_auth_connections_per_ip": 8
+    "max_pre_auth_connections_per_ip": 8,
+    "warden_client_image": null
   },
   "accounts": [
     {
       "lane": 1,
       "account": 1,
-      "account_name": "BOTACCOUNT",
-      "password": "CHANGE_ME",
-      "character": "Botcharacter",
+      "account_name": "YOUR_ACCOUNT",
+      "password": "REPLACE_WITH_ACCOUNT_PASSWORD",
+      "character": "YOUR_CHARACTER",
       "enabled": true
     }
   ]
