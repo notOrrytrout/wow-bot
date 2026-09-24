@@ -1,6 +1,6 @@
 use super::static_hints;
 use std::collections::BTreeSet;
-use wow_domain::{EntityId, Vec3};
+use wow_domain::{EntityId, Vec3, WorldPosition};
 use wow_state::{
     Snapshot,
     entities::{EntityKind, EntityState},
@@ -105,6 +105,7 @@ pub fn resolve_with_exclusions(
             if current < target_def.required {
                 if let Some(entity) = nearest_live_target(
                     snapshot,
+                    player,
                     target_def.kind,
                     rule.entry,
                     true,
@@ -146,7 +147,7 @@ pub fn resolve_with_exclusions(
     if snapshot.state.control.mover.is_none() {
         let tool_entries = static_hints::quest_tool_entries(quest);
         if !tool_entries.is_empty() {
-            if let Some(entity) = nearest_live_gameobject_entry(snapshot, &tool_entries) {
+            if let Some(entity) = nearest_live_gameobject_entry(snapshot, player, &tool_entries) {
                 return ObjectiveResolution::GroundedQuestTool {
                     target: entity.id,
                     activation_spell: static_hints::quest_tool_activation_spell(quest),
@@ -168,9 +169,15 @@ pub fn resolve_with_exclusions(
         if current >= target.required {
             continue;
         }
-        if let Some(entity) =
-            nearest_live_target(snapshot, target.kind, target.entry, true, index, excluded)
-        {
+        if let Some(entity) = nearest_live_target(
+            snapshot,
+            player,
+            target.kind,
+            target.entry,
+            true,
+            index,
+            excluded,
+        ) {
             if let Some(rule) = static_hints::quest_spell_rule(quest, target.kind, target.entry) {
                 return rule
                     .spells
@@ -213,7 +220,7 @@ pub fn resolve_with_exclusions(
                 },
             };
         }
-        if let Some(destination) = poi_destination(snapshot, definition) {
+        if let Some(destination) = poi_destination(player, definition) {
             return ObjectiveResolution::SearchArea {
                 objective: index,
                 destination,
@@ -248,6 +255,7 @@ pub fn resolve_with_exclusions(
             for (kind, entry) in &source_entries {
                 if let Some(entity) = nearest_live_target(
                     snapshot,
+                    player,
                     *kind,
                     *entry,
                     false,
@@ -285,22 +293,24 @@ pub fn resolve_with_exclusions(
 
 fn nearest_live_gameobject_entry<'a>(
     snapshot: &'a Snapshot,
+    player: Option<WorldPosition>,
     entries: &[u32],
 ) -> Option<&'a EntityState> {
-    nearest_live_entity(snapshot, |entity| {
+    nearest_live_entity(snapshot, player, |entity| {
         entity.kind == EntityKind::GameObject && entries.contains(&entity.entry)
     })
 }
 
 fn nearest_live_target<'a>(
     snapshot: &'a Snapshot,
+    player: Option<WorldPosition>,
     kind: QuestTargetKind,
     entry: u32,
     require_alive: bool,
     objective: usize,
     excluded: &BTreeSet<(usize, EntityId)>,
 ) -> Option<&'a EntityState> {
-    nearest_live_entity(snapshot, |entity| {
+    nearest_live_entity(snapshot, player, |entity| {
         entity.entry == entry
             && match kind {
                 QuestTargetKind::Creature => entity.kind == EntityKind::Unit,
@@ -313,9 +323,10 @@ fn nearest_live_target<'a>(
 
 fn nearest_live_entity(
     snapshot: &Snapshot,
+    player: Option<WorldPosition>,
     matches: impl Fn(&EntityState) -> bool,
 ) -> Option<&EntityState> {
-    let player = snapshot.state.position.player?;
+    let player = player?;
     snapshot
         .state
         .entities
@@ -330,8 +341,8 @@ fn nearest_live_entity(
         .map(|(_, entity)| entity)
 }
 
-fn poi_destination(snapshot: &Snapshot, definition: &QuestDefinition) -> Option<Vec3> {
-    let player = snapshot.state.position.player?;
+fn poi_destination(player: Option<WorldPosition>, definition: &QuestDefinition) -> Option<Vec3> {
+    let player = player?;
     let map = definition.poi_map?;
     if map != player.map {
         return None;
