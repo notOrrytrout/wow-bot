@@ -379,8 +379,16 @@ fn item_owned_by(
 }
 
 fn item_stack_count(object: &tentacli::plugins::wow::wotlk::realm::object::Object) -> Option<u32> {
-    match object.item_fields.get(&ItemField::StackCount) {
-        Some(FieldValue::Integer(value)) if *value > 0 => u32::try_from(*value).ok(),
+    object
+        .item_fields
+        .get(&ItemField::StackCount)
+        .and_then(field_u32)
+        .filter(|count| *count > 0)
+}
+
+fn field_u32(value: &FieldValue) -> Option<u32> {
+    match value {
+        FieldValue::Integer(value) => u32::try_from(*value).ok(),
         _ => None,
     }
 }
@@ -404,17 +412,12 @@ fn quest_journal(
         let quest = row
             .first()
             .and_then(Option::as_ref)
-            .and_then(|value| match value {
-                FieldValue::Integer(value) if *value > 0 => u32::try_from(*value).ok(),
-                _ => None,
-            });
+            .and_then(field_u32)
+            .filter(|quest| *quest > 0);
         let state = row
             .get(1)
             .and_then(Option::as_ref)
-            .and_then(|value| match value {
-                FieldValue::Integer(value) => u32::try_from(*value).ok(),
-                _ => None,
-            })
+            .and_then(field_u32)
             .unwrap_or_default();
         let pair = |index: usize| -> (u32, u32) {
             row.get(index)
@@ -601,6 +604,13 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn field_u32_shares_checked_integer_conversion() {
+        assert_eq!(field_u32(&FieldValue::Integer(12)), Some(12));
+        assert_eq!(field_u32(&FieldValue::Integer(-1)), None);
+        assert_eq!(field_u32(&FieldValue::Bytes(12)), None);
     }
 
     #[test]
