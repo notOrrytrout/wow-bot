@@ -136,6 +136,8 @@ pub struct LaneEngine {
     post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
     last_recovery_action: Option<Instant>,
     last_survival_action: Option<(EntityId, Instant)>,
+    fishing_cast_at: Option<Instant>,
+    fishing_retry_after: Option<Instant>,
 }
 
 impl LaneEngine {
@@ -180,6 +182,8 @@ impl LaneEngine {
             post_combat_loot: None,
             last_recovery_action: None,
             last_survival_action: None,
+            fishing_cast_at: None,
+            fishing_retry_after: None,
         }
     }
 
@@ -540,6 +544,14 @@ impl LaneEngine {
         match self.state.mission.intent.clone() {
             MissionIntent::Idle => true,
             MissionIntent::Quest => self.tick_quest().await,
+            MissionIntent::Gather { resource } => {
+                if resource.eq_ignore_ascii_case("fishing") {
+                    self.tick_fishing().await
+                } else {
+                    self.tick_gather(&resource).await
+                }
+            }
+            MissionIntent::Grind { creature } => self.tick_grind(&creature).await,
             MissionIntent::Party { .. } | MissionIntent::Raid { .. } => {
                 self.tick_group_encounter().await
             }
@@ -550,6 +562,143 @@ impl LaneEngine {
                 true
             }
         }
+    }
+
+    async fn tick_gather(&mut self, resource: &str) -> bool {
+        if !self
+            .state
+            .mission
+            .permissions
+            .contains(PermissionSet::GATHER)
+        {
+            self.waiting("gather mission is not authorized".into());
+            return true;
+        }
+        let state = &self.state.authoritative;
+        if resource.trim().is_empty() {
+            self.waiting(
+                "gather mission is waiting for an authorized resource and capability".into(),
+            );
+            return true;
+        }
+        let target = state
+            .entities
+            .0
+            .values()
+            .filter(|entity| {
+                entity.interactable
+                    && matches!(entity.kind, wow_state::entities::EntityKind::GameObject)
+            })
+            .filter(|entity| wow_policy::gathering::targets::matches_resource(entity, resource))
+            .min_by_key(|entity| entity.id);
+        if let Some(target) = target {
+            return self
+                .propose_command(GameplayCommand::Gather(target.id), false)
+                .await;
+        }
+        self.waiting(format!("waiting for an observed {resource} resource"));
+        true
+    }
+
+    async fn tick_fishing(&mut self) -> bool {
+        if !self
+            .state
+            .mission
+            .permissions
+            .contains(PermissionSet::GATHER)
+            || !self.state.authoritative.capabilities.can_fish
+        {
+            self.waiting(
+                "fishing is waiting for authoritative fishing permission and capability".into(),
+            );
+            return true;
+        }
+        let now = Instant::now();
+        let player = self
+            .state
+            .authoritative
+            .session
+            .character_guid
+            .map(EntityId);
+        if let Some(cast_at) = self.fishing_cast_at {
+            let bobber = player.and_then(|player| {
+                self.state.authoritative.entities.0.values().find(|entity| {
+                    entity.kind == wow_state::entities::EntityKind::GameObject
+                        && entity
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.to_ascii_lowercase().contains("bobber"))
+                        && entity.target == Some(player)
+                })
+            });
+            if let Some(bobber) = bobber {
+                self.fishing_cast_at = None;
+                self.fishing_retry_after = Some(now + Duration::from_secs(3));
+                return self
+                    .propose_command(GameplayCommand::Gather(bobber.id), false)
+                    .await;
+            }
+            if now.duration_since(cast_at) >= Duration::from_secs(20) {
+                self.fishing_cast_at = None;
+                self.fishing_retry_after = Some(now + Duration::from_secs(5));
+                self.waiting("fishing attempt timed out; retry is delayed".into());
+            } else {
+                self.waiting("waiting for an owned fishing bobber".into());
+            }
+            return true;
+        }
+        if self.fishing_retry_after.is_some_and(|retry| now < retry) {
+            self.waiting("fishing attempt is in its retry delay".into());
+            return true;
+        }
+        if player.is_none() || self.state.authoritative.position.player.is_none() {
+            self.waiting(
+                "fishing is waiting for authoritative player identity and position".into(),
+            );
+            return true;
+        }
+        self.fishing_cast_at = Some(now);
+        self.propose_command(GameplayCommand::Fish, false).await
+    }
+
+    async fn tick_grind(&mut self, creature: &str) -> bool {
+        if !self
+            .state
+            .mission
+            .permissions
+            .contains(PermissionSet::COMBAT)
+        {
+            self.waiting("grind mission is not authorized".into());
+            return true;
+        }
+        let state = &self.state.authoritative;
+        if creature.trim().is_empty() || self.player_is_dead() {
+            self.waiting("grind mission is waiting for a valid living-player target".into());
+            return true;
+        }
+        let target = state
+            .entities
+            .0
+            .values()
+            .filter(|entity| {
+                entity.hostile
+                    && !entity.is_dead()
+                    && matches!(entity.kind, wow_state::entities::EntityKind::Unit)
+            })
+            .filter(|entity| {
+                entity
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case(creature.trim()))
+            })
+            .min_by_key(|entity| entity.id);
+        if let Some(target) = target {
+            return self
+                .propose_command(GameplayCommand::Attack(target.id), false)
+                .await;
+        }
+        self.waiting(format!("waiting for an observed {creature} target"));
+        true
     }
 
     async fn tick_group_encounter(&mut self) -> bool {
@@ -2667,6 +2816,92 @@ mod tests {
         };
         assert_eq!(survival_action.command(), quest_action.command());
         assert_eq!(survival_action.origin(), PlanOrigin::Recovery);
+    }
+
+    #[tokio::test]
+    async fn gather_and_grind_dispatch_only_matching_authorized_observations() {
+        let mut state = wow_state::AuthoritativeState::default();
+        state.session.in_world = true;
+        state.entities.0.insert(
+            EntityId(21),
+            wow_state::entities::EntityState {
+                id: EntityId(21),
+                kind: wow_state::entities::EntityKind::GameObject,
+                name: Some("Copper Vein".into()),
+                interactable: true,
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut rx) = test_engine(
+            Mission::gather(MissionId(1), " copper vein "),
+            state.clone(),
+        );
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = rx.recv().await.unwrap() else {
+            panic!("expected gather action")
+        };
+        assert_eq!(action.command(), &GameplayCommand::Gather(EntityId(21)));
+
+        state.entities.0.insert(
+            EntityId(22),
+            wow_state::entities::EntityState {
+                id: EntityId(22),
+                kind: wow_state::entities::EntityKind::Unit,
+                name: Some("Wolf".into()),
+                hostile: true,
+                health: Some((10, 10)),
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut rx) = test_engine(Mission::grind(MissionId(2), "wolf"), state);
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = rx.recv().await.unwrap() else {
+            panic!("expected grind action")
+        };
+        assert_eq!(action.command(), &GameplayCommand::Attack(EntityId(22)));
+    }
+
+    #[tokio::test]
+    async fn gather_authority_and_fishing_capability_gates_prevent_actions() {
+        let mut state = wow_state::AuthoritativeState::default();
+        state.session.in_world = true;
+        let (mut engine, mut rx) =
+            test_engine(Mission::gather(MissionId(1), "Fishing"), state.clone());
+        engine.state.mission.permissions = PermissionSet::MOVE;
+        assert!(engine.tick_mission().await);
+        assert!(rx.try_recv().is_err());
+        engine.state.mission.permissions = PermissionSet::GATHER;
+        engine.state.authoritative.capabilities.can_fish = true;
+        engine.state.authoritative.session.character_guid = Some(1);
+        engine.state.authoritative.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = rx.recv().await.unwrap() else {
+            panic!("expected fish cast")
+        };
+        assert_eq!(action.command(), &GameplayCommand::Fish);
+        engine.state.authoritative.entities.0.insert(
+            EntityId(31),
+            wow_state::entities::EntityState {
+                id: EntityId(31),
+                kind: wow_state::entities::EntityKind::GameObject,
+                name: Some("Fishing Bobber".into()),
+                target: Some(EntityId(1)),
+                ..Default::default()
+            },
+        );
+        // The owned bobber is used after the cast attempt enters its wait phase.
+        engine.fishing_cast_at = Some(Instant::now() - Duration::from_secs(1));
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = rx.recv().await.unwrap() else {
+            panic!("expected owned bobber use")
+        };
+        assert_eq!(action.command(), &GameplayCommand::Gather(EntityId(31)));
+        assert!(engine.tick_mission().await);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
