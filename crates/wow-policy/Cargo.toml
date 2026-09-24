@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 wow-domain.workspace = true
 wow-state.workspace = true
+wow-infra.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

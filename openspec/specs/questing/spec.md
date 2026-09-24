@@ -58,6 +58,11 @@ A runnable quest mission SHALL be connected end-to-end from proxy command routin
 - **AND** an eligible offer may be accepted through a typed quest action
 - **AND** repeated accept attempts are bounded while awaiting server evidence
 
+#### Scenario: Quest giver returns an empty list
+- **WHEN** the server returns a valid quest-giver list with zero offers
+- **THEN** the response is recorded for that live giver
+- **AND** the scheduler waits before it opens that giver again
+
 ### Requirement: Static quest knowledge is combined with live evidence
 Static AzerothCore-derived quest knowledge MAY nominate likely quest sources, objective areas, or interaction targets, but the runtime SHALL combine those hints with live authoritative object/quest evidence before committing an interaction or claiming current presence.
 
@@ -111,6 +116,20 @@ When quest work reaches a server POI or generated static spawn/search hint and n
 - **AND** no authoritative matching entity is visible
 - **THEN** movement stops
 - **AND** the quest work reports that it is waiting for live target evidence
+
+#### Scenario: Search area has multiple static spawn hints
+- **GIVEN** no matching live authoritative entity is visible at the nearest hint
+- **WHEN** the character reaches that hint
+- **THEN** the scheduler tries the next nearby distinct hint, up to its bounded candidate limit
+- **AND** it waits before repeating the same candidate set when no candidate has a live target
+
+### Requirement: Quest object use waits for progress evidence
+The scheduler SHALL wait for authoritative objective progress, required inventory progress, a controlled-mover change, or target disappearance after a quest object-use action. An unresolved use SHALL receive an increasing bounded retry delay.
+
+#### Scenario: Quest game object gives no progress
+- **WHEN** the server does not report objective or item progress after a game-object use
+- **THEN** the scheduler does not use that object again immediately
+- **AND** it logs the baseline and current authoritative progress before a delayed retry
 
 ### Requirement: Quest turn-in follows authoritative reward dialogs
 Quest completion SHALL follow AzerothCore's authoritative turn-in dialog progression. `CMSG_QUESTGIVER_COMPLETE_QUEST` alone SHALL NOT be treated as successful reward completion.
