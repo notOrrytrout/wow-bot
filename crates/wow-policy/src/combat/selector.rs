@@ -1,10 +1,6 @@
 use serde::Deserialize;
-use std::{
-    collections::BTreeMap,
-    sync::OnceLock,
-    time::{SystemTime, UNIX_EPOCH},
-};
-use wow_domain::EntityId;
+use std::{collections::BTreeMap, sync::OnceLock};
+use wow_domain::{EntityId, Millis};
 use wow_state::Snapshot;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -66,7 +62,7 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
                 snapshot,
                 spell,
                 Some(target),
-                wall_clock_ms(),
+                Millis::wall_clock_now().0,
             )
             .is_ok()
             {
@@ -92,13 +88,6 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
             reason: "caster_has_mana_but_no_known_offensive_spell",
         }
     }
-}
-
-fn wall_clock_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 pub fn is_oom(snapshot: &Snapshot) -> bool {

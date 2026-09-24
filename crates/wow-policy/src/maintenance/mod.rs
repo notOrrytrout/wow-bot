@@ -2,9 +2,9 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     sync::OnceLock,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
-use wow_domain::EntityId;
+use wow_domain::{EntityId, Millis};
 use wow_state::Snapshot;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -167,7 +167,7 @@ fn cast_decision(
         snapshot,
         spell,
         Some(target),
-        wall_clock_ms(),
+        Millis::wall_clock_now().0,
     ) {
         return Some(MaintenanceDecision::Deferred {
             family: family.family.clone(),
@@ -181,12 +181,6 @@ fn cast_decision(
     })
 }
 
-fn wall_clock_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 fn readiness_reason(reason: crate::combat::readiness::SpellUnavailableReason) -> &'static str {
     use crate::combat::readiness::SpellUnavailableReason::*;
     match reason {
