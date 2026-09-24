@@ -111,14 +111,14 @@ pub(super) fn encode_gameplay_command(
         GameplayCommand::Interact(entity) => Ok(Some((
             ClientFrame {
                 opcode: CMSG_QUESTGIVER_HELLO,
-                body: entity.0.to_le_bytes().to_vec(),
+                body: raw_guid_body(entity),
             },
             None,
         ))),
         GameplayCommand::UseGameObject(entity) => Ok(Some((
             ClientFrame {
                 opcode: CMSG_GAMEOBJ_USE,
-                body: entity.0.to_le_bytes().to_vec(),
+                body: raw_guid_body(entity),
             },
             None,
         ))),
@@ -142,7 +142,7 @@ pub(super) fn encode_gameplay_command(
             body.push(backpack_slot);
             body.push(cast_count);
             body.extend_from_slice(&spell.to_le_bytes());
-            body.extend_from_slice(&item_guid.0.to_le_bytes());
+            append_raw_guid(&mut body, item_guid);
             body.extend_from_slice(&0_u32.to_le_bytes()); // glyph index
             body.push(0); // cast flags
             match target {
@@ -163,14 +163,14 @@ pub(super) fn encode_gameplay_command(
         GameplayCommand::Attack(entity) => Ok(Some((
             ClientFrame {
                 opcode: CMSG_ATTACKSWING,
-                body: entity.0.to_le_bytes().to_vec(),
+                body: raw_guid_body(entity),
             },
             None,
         ))),
         GameplayCommand::Loot(entity) => Ok(Some((
             ClientFrame {
                 opcode: CMSG_LOOT,
-                body: entity.0.to_le_bytes().to_vec(),
+                body: raw_guid_body(entity),
             },
             None,
         ))),
@@ -264,7 +264,7 @@ pub(super) fn encode_gameplay_command(
         GameplayCommand::ReclaimCorpse { player } => Ok(Some((
             ClientFrame {
                 opcode: 0x01D2,
-                body: player.0.to_le_bytes().to_vec(),
+                body: raw_guid_body(player),
             },
             None,
         ))),
@@ -347,12 +347,22 @@ fn encode_cast_spell(spell: u32, target: Option<EntityId>, target_flag: u32) -> 
 
 fn encode_questgiver_request(giver: EntityId, quest: u32, trailing_value: Option<u32>) -> Vec<u8> {
     let mut body = Vec::with_capacity(if trailing_value.is_some() { 16 } else { 12 });
-    body.extend_from_slice(&giver.0.to_le_bytes());
+    append_raw_guid(&mut body, giver);
     body.extend_from_slice(&quest.to_le_bytes());
     if let Some(value) = trailing_value {
         body.extend_from_slice(&value.to_le_bytes());
     }
     body
+}
+
+fn raw_guid_body(guid: EntityId) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    append_raw_guid(&mut body, guid);
+    body
+}
+
+fn append_raw_guid(body: &mut Vec<u8>, guid: EntityId) {
+    body.extend_from_slice(&guid.0.to_le_bytes());
 }
 
 pub(super) fn push_packed_guid(body: &mut Vec<u8>, guid: EntityId) {
