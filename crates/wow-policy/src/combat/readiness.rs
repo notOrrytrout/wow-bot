@@ -109,7 +109,7 @@ pub fn check_spell_readiness(
     check_reagents(snapshot, metadata)?;
     check_equipment(snapshot, metadata)?;
     check_form(player, metadata)?;
-    check_aura_requirements(snapshot, player_id, target, metadata)?;
+    check_aura_requirements(snapshot, player_id, player, target, metadata)?;
     if metadata.requirements.spell_focus != 0 || metadata.requirements.target_creature_type != 0 {
         return Err(SpellUnavailableReason::UnsupportedRequirement);
     }
@@ -408,16 +408,11 @@ fn check_form(
 fn check_aura_requirements(
     snapshot: &Snapshot,
     player: EntityId,
+    player_state: &EntityState,
     target: Option<EntityId>,
     spell: &crate::combat::spells::SpellMetadata,
 ) -> Result<(), SpellUnavailableReason> {
     let requirements = &spell.requirements;
-    let player_state = snapshot
-        .state
-        .entities
-        .0
-        .get(&player)
-        .ok_or(SpellUnavailableReason::UnknownState)?;
     if requirements.caster_aura_state != 0 || requirements.caster_aura_state_not != 0 {
         let state = player_state
             .aura_state
