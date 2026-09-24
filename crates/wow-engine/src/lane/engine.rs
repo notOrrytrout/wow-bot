@@ -37,6 +37,7 @@ enum MovementPurpose {
 }
 
 const TURN_IN_SEARCH_RANGE: f32 = 5.0;
+const QUEST_SEARCH_ARRIVAL_RANGE: f32 = 18.0;
 
 #[derive(Clone, Debug)]
 enum PendingQuestAction {
@@ -711,6 +712,18 @@ impl LaneEngine {
         });
     }
 
+    fn queue_search_movement(&mut self, destination: Vec3, work: QuestWorkRuntime) {
+        self.queue_movement(
+            destination,
+            QUEST_SEARCH_ARRIVAL_RANGE,
+            None,
+            None,
+            PlanOrigin::SystemPolicy,
+            work,
+            MovementPurpose::SearchArea,
+        );
+    }
+
     async fn tick_movement(&mut self) -> bool {
         let Some(mut movement) = self.pending_movement.take() else {
             return true;
@@ -1337,7 +1350,7 @@ impl LaneEngine {
                     .player
                     .map(|player| player.point);
                 let arrived =
-                    current_pos.is_some_and(|position| position.distance(destination) <= 18.0);
+                    current_pos.is_some_and(|position| quest_search_arrived(position, destination));
                 let candidates =
                     bounded_candidates(alternatives, current_pos.unwrap_or(destination));
                 let Some(destination) =
@@ -1347,15 +1360,7 @@ impl LaneEngine {
                     return true;
                 };
                 tracing::info!(lane=?self.state.lane, quest, objective, work_id=?work.id, %source, x=destination.x, y=destination.y, "quest scheduler starting bounded objective-area travel");
-                self.queue_movement(
-                    destination,
-                    18.0,
-                    None,
-                    None,
-                    PlanOrigin::SystemPolicy,
-                    work,
-                    MovementPurpose::SearchArea,
-                );
+                self.queue_search_movement(destination, work);
                 return true;
             }
             ObjectiveResolution::ItemCollection {
@@ -1377,7 +1382,7 @@ impl LaneEngine {
                     candidates
                         .iter()
                         .copied()
-                        .filter(|point| position.distance(*point) <= 18.0)
+                        .filter(|point| quest_search_arrived(position, *point))
                         .min_by(|a, b| position.distance(*a).total_cmp(&position.distance(*b)))
                 });
                 let Some(destination) =
@@ -1388,15 +1393,7 @@ impl LaneEngine {
                 };
                 if reached_destination != Some(destination) {
                     tracing::info!(lane=?self.state.lane, quest, item, current, required, work_id=?work.id, x=destination.x, y=destination.y, "quest item objective using AzerothCore loot-source search hint");
-                    self.queue_movement(
-                        destination,
-                        18.0,
-                        None,
-                        None,
-                        PlanOrigin::SystemPolicy,
-                        work,
-                        MovementPurpose::SearchArea,
-                    );
+                    self.queue_search_movement(destination, work);
                 }
                 return true;
             }
@@ -2442,6 +2439,9 @@ fn search_point_key(point: Vec3) -> (u32, u32, u32) {
 fn turn_in_search_arrived(player: Vec3, destination: Vec3) -> bool {
     (destination.x - player.x).hypot(destination.y - player.y) <= TURN_IN_SEARCH_RANGE
 }
+fn quest_search_arrived(player: Vec3, destination: Vec3) -> bool {
+    player.distance(destination) <= QUEST_SEARCH_ARRIVAL_RANGE
+}
 fn should_supersede_search_movement(purpose: MovementPurpose, live_target_available: bool) -> bool {
     purpose == MovementPurpose::SearchArea && live_target_available
 }
@@ -2782,5 +2782,18 @@ mod tests {
         assert_eq!(candidates.len(), 5);
         assert_eq!(candidates[0], Vec3::new(1.0, 0.0, 0.0));
         assert!(!candidates.contains(&Vec3::new(300.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn quest_search_arrival_uses_the_movement_range() {
+        let origin = Vec3::new(0.0, 0.0, 0.0);
+        assert!(quest_search_arrived(
+            origin,
+            Vec3::new(QUEST_SEARCH_ARRIVAL_RANGE, 0.0, 0.0)
+        ));
+        assert!(!quest_search_arrived(
+            origin,
+            Vec3::new(QUEST_SEARCH_ARRIVAL_RANGE + 0.1, 0.0, 0.0)
+        ));
     }
 }

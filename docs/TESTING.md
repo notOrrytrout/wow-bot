@@ -116,6 +116,7 @@ The OpenSpec now treats duplicate deterministic mechanics as a quality defect. D
 - quest gathering/loot uses the shared gather/loot mechanics;
 - quest inventory progress uses the shared authoritative inventory-counting helpers;
 - quest live-target selection uses the shared deterministic target selector with typed filters;
+- quest objective and item-source searches use one arrival range and shared search movement setup; turn-in search keeps its separate range;
 - ordinary and controlled-unit casts use the shared action-validation and WotLK cast encoder with typed mover context;
 - fixed-slot quest objective comparison, hint lookup, and turn-in dialog progression are reusable helpers used both before and after movement/replanning.
 
