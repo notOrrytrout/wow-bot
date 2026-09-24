@@ -84,8 +84,7 @@ pub fn decide_next(
         .entities
         .0
         .get(&player)
-        .and_then(|entity| entity.health)
-        .is_some_and(|(health, _)| health == 0)
+        .is_some_and(wow_state::entities::EntityState::is_dead)
     {
         return MaintenanceDecision::Deferred {
             family: "life".into(),

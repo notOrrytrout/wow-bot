@@ -478,8 +478,7 @@ impl LaneEngine {
             .entities
             .0
             .get(&player)
-            .and_then(|entity| entity.health)
-            .is_some_and(|(health, _)| health == 0)
+            .is_some_and(wow_state::entities::EntityState::is_dead)
     }
 
     async fn tick_death_recovery(&mut self) -> bool {
