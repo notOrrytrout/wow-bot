@@ -71,239 +71,302 @@ impl ActionValidator {
             return ValidationOutcome::NeedsFacing(facing);
         }
 
-        match &action.command {
-            GameplayCommand::MoveTo(point) if !point.is_finite() => {
-                return reject("bad_position", "movement destination is invalid", false);
-            }
-            GameplayCommand::FaceDirection { orientation } if !orientation.is_finite() => {
-                return reject("bad_orientation", "facing orientation is invalid", false);
-            }
-            GameplayCommand::Attack(entity)
-                if !snapshot.state.entities.0.get(entity).is_some_and(|e| {
-                    e.hostile
-                        || active_quest_creature_target(snapshot, e.entry)
-                        || active_quest_item_source(snapshot, e.entry)
-                        || wow_policy::combat::engagement::is_attacking_player_or_group(
-                            snapshot, *entity,
-                        )
-                }) =>
-            {
-                return reject(
-                    "combat_authority",
-                    "target is not an authoritative hostile, active quest target, or engaged survival attacker",
-                    false,
-                );
-            }
-            GameplayCommand::Interact(entity)
-            | GameplayCommand::UseGameObject(entity)
-            | GameplayCommand::CastGameObject { target: entity, .. }
-            | GameplayCommand::Loot(entity)
-            | GameplayCommand::Gather(entity)
-            | GameplayCommand::EnterVehicle(entity)
-                if !snapshot.state.entities.0.contains_key(entity) =>
-            {
-                return reject("unknown_entity", "target is not authoritative", true);
-            }
-            GameplayCommand::Cast { spell, target } => {
-                if !snapshot.state.capabilities.spells.contains(spell)
-                    && !(*spell == 5019
-                        && wow_policy::combat::selector::has_equipped_wand(snapshot))
-                {
-                    return reject(
-                        "unknown_spell",
-                        "spell is not an authoritative known capability or equipped-wand Shoot",
-                        false,
-                    );
-                }
-                if target
-                    .as_ref()
-                    .is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity))
-                {
-                    return reject("unknown_entity", "spell target is not authoritative", true);
-                }
-            }
-            GameplayCommand::MaintainBuff { spell, target } => {
-                if !snapshot.state.capabilities.spells.contains(spell) {
-                    return reject(
-                        "unknown_spell",
-                        "maintenance spell is not an authoritative known capability",
-                        false,
-                    );
-                }
-                let self_guid = snapshot.state.session.character_guid.map(EntityId);
-                if Some(*target) != self_guid && !snapshot.state.entities.0.contains_key(target) {
-                    return reject(
-                        "unknown_entity",
-                        "maintenance target is not authoritative",
-                        true,
-                    );
-                }
-            }
-            GameplayCommand::Fish if !snapshot.state.capabilities.can_fish => {
-                return reject(
-                    "cannot_fish",
-                    "fishing capability is not authoritative",
-                    false,
-                );
-            }
-            GameplayCommand::UseItem { item, target } => {
-                if !snapshot.state.inventory.has(*item, 1) {
-                    return reject("missing_item", "item is no longer present", false);
-                }
-                if target
-                    .as_ref()
-                    .is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity))
-                {
-                    return reject("unknown_entity", "item target is not authoritative", true);
-                }
-            }
-            GameplayCommand::UseItemInstance {
-                item,
-                item_guid,
-                backpack_slot,
-                target,
-                ..
-            } => {
-                let matches = snapshot
-                    .state
-                    .inventory
-                    .instances
-                    .get(item_guid)
-                    .is_some_and(|instance| {
-                        instance.item == *item
-                            && instance.backpack_slot == *backpack_slot
-                            && instance.count > 0
-                    });
-                if !matches {
-                    return reject(
-                        "stale_item_instance",
-                        "item slot/GUID is no longer authoritative",
-                        true,
-                    );
-                }
-                if target
-                    .as_ref()
-                    .is_some_and(|entity| !snapshot.state.entities.0.contains_key(entity))
-                {
-                    return reject("unknown_entity", "item target is not authoritative", true);
-                }
-            }
-            GameplayCommand::AcceptQuest { quest, giver } => {
-                if !snapshot.state.entities.0.contains_key(giver) {
-                    return reject(
-                        "unknown_quest_giver",
-                        "quest giver is not authoritative",
-                        true,
-                    );
-                }
-                if snapshot.state.quests.active.contains_key(quest)
-                    || snapshot.state.quests.completed.contains(quest)
-                {
-                    return reject(
-                        "quest_not_available",
-                        "quest is already active or complete",
-                        false,
-                    );
-                }
-            }
-            GameplayCommand::TurnInQuest { quest, giver }
-            | GameplayCommand::RequestQuestReward { quest, giver }
-            | GameplayCommand::ChooseQuestReward { quest, giver, .. } => {
-                if !snapshot.state.entities.0.contains_key(giver) {
-                    return reject(
-                        "unknown_quest_giver",
-                        "quest giver is not authoritative",
-                        true,
-                    );
-                }
-                if !snapshot
-                    .state
-                    .quests
-                    .active
-                    .get(quest)
-                    .is_some_and(|q| q.complete)
-                {
-                    return reject(
-                        "quest_not_complete",
-                        "authoritative quest state is not complete",
-                        true,
-                    );
-                }
-            }
-            GameplayCommand::VendorBuy { vendor, .. }
-            | GameplayCommand::VendorSell { vendor, .. }
-                if snapshot.state.inventory.vendor != Some(*vendor) =>
-            {
-                return reject(
-                    "vendor_not_open",
-                    "vendor interaction is not currently authoritative",
-                    true,
-                );
-            }
-            GameplayCommand::VendorSell { item, count, .. }
-                if !snapshot.state.inventory.has(*item, *count) =>
-            {
-                return reject(
-                    "missing_item",
-                    "sale item quantity is no longer present",
-                    false,
-                );
-            }
-            GameplayCommand::TradeAccept { generation, .. }
-                if snapshot.state.inventory.trade.generation != *generation
-                    || !snapshot.state.inventory.trade.open =>
-            {
-                return reject("stale_trade", "trade generation changed", true);
-            }
-            GameplayCommand::TradeAccept {
-                gift_only: true, ..
-            } if !snapshot.state.inventory.trade.our_items.is_empty()
-                || snapshot.state.inventory.trade.our_money != 0 =>
-            {
-                return reject(
-                    "not_clear_gift",
-                    "gift acceptance would send reciprocal assets",
-                    false,
-                );
-            }
-            GameplayCommand::AuctionBuy {
-                query_generation,
-                listing_id,
-                max_buyout,
-            } => {
-                if snapshot.state.inventory.auction.query_generation != *query_generation {
-                    return reject("stale_auction", "auction query generation changed", true);
-                }
-                let Some(listing) = snapshot.state.inventory.auction.listings.get(listing_id)
-                else {
-                    return reject(
-                        "listing_missing",
-                        "auction listing is no longer current",
-                        true,
-                    );
-                };
-                if listing.buyout > *max_buyout || listing.buyout > snapshot.state.inventory.money {
-                    return reject(
-                        "auction_price",
-                        "listing exceeds authorized buyout or current funds",
-                        false,
-                    );
-                }
-            }
-            GameplayCommand::MailTake {
-                mailbox_generation,
-                mail_id,
-            } => {
-                if snapshot.state.inventory.mailbox.generation != *mailbox_generation
-                    || !snapshot.state.inventory.mailbox.mails.contains_key(mail_id)
-                {
-                    return reject("stale_mail", "mailbox contents changed", true);
-                }
-            }
-            _ => {}
+        if let Err(outcome) = validate_command(snapshot, &action.command) {
+            return outcome;
         }
         send(action)
     }
+}
+
+fn validate_command(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+) -> Result<(), ValidationOutcome> {
+    validate_spatial_command(snapshot, command)?;
+    validate_quest_command(snapshot, command)?;
+    validate_economy_command(snapshot, command)
+}
+
+fn validate_spatial_command(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+) -> Result<(), ValidationOutcome> {
+    match command {
+        GameplayCommand::MoveTo(point) if !point.is_finite() => {
+            return Err(reject(
+                "bad_position",
+                "movement destination is invalid",
+                false,
+            ));
+        }
+        GameplayCommand::FaceDirection { orientation } if !orientation.is_finite() => {
+            return Err(reject(
+                "bad_orientation",
+                "facing orientation is invalid",
+                false,
+            ));
+        }
+        GameplayCommand::Attack(entity)
+            if !snapshot.state.entities.0.get(entity).is_some_and(|e| {
+                e.hostile
+                    || active_quest_creature_target(snapshot, e.entry)
+                    || active_quest_item_source(snapshot, e.entry)
+                    || wow_policy::combat::engagement::is_attacking_player_or_group(
+                        snapshot, *entity,
+                    )
+            }) =>
+        {
+            return Err(reject(
+                "combat_authority",
+                "target is not an authoritative hostile, active quest target, or engaged survival attacker",
+                false,
+            ));
+        }
+        GameplayCommand::Interact(entity)
+        | GameplayCommand::UseGameObject(entity)
+        | GameplayCommand::CastGameObject { target: entity, .. }
+        | GameplayCommand::Loot(entity)
+        | GameplayCommand::Gather(entity)
+        | GameplayCommand::EnterVehicle(entity)
+            if !has_entity(snapshot, *entity) =>
+        {
+            return Err(reject(
+                "unknown_entity",
+                "target is not authoritative",
+                true,
+            ));
+        }
+        GameplayCommand::Cast { spell, target } => {
+            if !snapshot.state.capabilities.spells.contains(spell)
+                && !(*spell == 5019 && wow_policy::combat::selector::has_equipped_wand(snapshot))
+            {
+                return Err(reject(
+                    "unknown_spell",
+                    "spell is not an authoritative known capability or equipped-wand Shoot",
+                    false,
+                ));
+            }
+            if !optional_target_is_authoritative(snapshot, target) {
+                return Err(reject(
+                    "unknown_entity",
+                    "spell target is not authoritative",
+                    true,
+                ));
+            }
+        }
+        GameplayCommand::MaintainBuff { spell, target } => {
+            if !snapshot.state.capabilities.spells.contains(spell) {
+                return Err(reject(
+                    "unknown_spell",
+                    "maintenance spell is not an authoritative known capability",
+                    false,
+                ));
+            }
+            let self_guid = snapshot.state.session.character_guid.map(EntityId);
+            if Some(*target) != self_guid && !has_entity(snapshot, *target) {
+                return Err(reject(
+                    "unknown_entity",
+                    "maintenance target is not authoritative",
+                    true,
+                ));
+            }
+        }
+        GameplayCommand::Fish if !snapshot.state.capabilities.can_fish => {
+            return Err(reject(
+                "cannot_fish",
+                "fishing capability is not authoritative",
+                false,
+            ));
+        }
+        GameplayCommand::UseItem { item, target } => {
+            if !snapshot.state.inventory.has(*item, 1) {
+                return Err(reject("missing_item", "item is no longer present", false));
+            }
+            if !optional_target_is_authoritative(snapshot, target) {
+                return Err(reject(
+                    "unknown_entity",
+                    "item target is not authoritative",
+                    true,
+                ));
+            }
+        }
+        GameplayCommand::UseItemInstance {
+            item,
+            item_guid,
+            backpack_slot,
+            target,
+            ..
+        } => {
+            let matches = snapshot
+                .state
+                .inventory
+                .instances
+                .get(item_guid)
+                .is_some_and(|instance| {
+                    instance.item == *item
+                        && instance.backpack_slot == *backpack_slot
+                        && instance.count > 0
+                });
+            if !matches {
+                return Err(reject(
+                    "stale_item_instance",
+                    "item slot/GUID is no longer authoritative",
+                    true,
+                ));
+            }
+            if !optional_target_is_authoritative(snapshot, target) {
+                return Err(reject(
+                    "unknown_entity",
+                    "item target is not authoritative",
+                    true,
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_quest_command(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+) -> Result<(), ValidationOutcome> {
+    match command {
+        GameplayCommand::AcceptQuest { quest, giver } => {
+            if !has_entity(snapshot, *giver) {
+                return Err(reject(
+                    "unknown_quest_giver",
+                    "quest giver is not authoritative",
+                    true,
+                ));
+            }
+            if snapshot.state.quests.active.contains_key(quest)
+                || snapshot.state.quests.completed.contains(quest)
+            {
+                return Err(reject(
+                    "quest_not_available",
+                    "quest is already active or complete",
+                    false,
+                ));
+            }
+        }
+        GameplayCommand::TurnInQuest { quest, giver }
+        | GameplayCommand::RequestQuestReward { quest, giver }
+        | GameplayCommand::ChooseQuestReward { quest, giver, .. } => {
+            if !has_entity(snapshot, *giver) {
+                return Err(reject(
+                    "unknown_quest_giver",
+                    "quest giver is not authoritative",
+                    true,
+                ));
+            }
+            if !snapshot
+                .state
+                .quests
+                .active
+                .get(quest)
+                .is_some_and(|q| q.complete)
+            {
+                return Err(reject(
+                    "quest_not_complete",
+                    "authoritative quest state is not complete",
+                    true,
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_economy_command(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+) -> Result<(), ValidationOutcome> {
+    match command {
+        GameplayCommand::VendorBuy { vendor, .. } | GameplayCommand::VendorSell { vendor, .. }
+            if snapshot.state.inventory.vendor != Some(*vendor) =>
+        {
+            return Err(reject(
+                "vendor_not_open",
+                "vendor interaction is not currently authoritative",
+                true,
+            ));
+        }
+        GameplayCommand::VendorSell { item, count, .. }
+            if !snapshot.state.inventory.has(*item, *count) =>
+        {
+            return Err(reject(
+                "missing_item",
+                "sale item quantity is no longer present",
+                false,
+            ));
+        }
+        GameplayCommand::TradeAccept { generation, .. }
+            if snapshot.state.inventory.trade.generation != *generation
+                || !snapshot.state.inventory.trade.open =>
+        {
+            return Err(reject("stale_trade", "trade generation changed", true));
+        }
+        GameplayCommand::TradeAccept {
+            gift_only: true, ..
+        } if !snapshot.state.inventory.trade.our_items.is_empty()
+            || snapshot.state.inventory.trade.our_money != 0 =>
+        {
+            return Err(reject(
+                "not_clear_gift",
+                "gift acceptance would send reciprocal assets",
+                false,
+            ));
+        }
+        GameplayCommand::AuctionBuy {
+            query_generation,
+            listing_id,
+            max_buyout,
+        } => {
+            if snapshot.state.inventory.auction.query_generation != *query_generation {
+                return Err(reject(
+                    "stale_auction",
+                    "auction query generation changed",
+                    true,
+                ));
+            }
+            let Some(listing) = snapshot.state.inventory.auction.listings.get(listing_id) else {
+                return Err(reject(
+                    "listing_missing",
+                    "auction listing is no longer current",
+                    true,
+                ));
+            };
+            if listing.buyout > *max_buyout || listing.buyout > snapshot.state.inventory.money {
+                return Err(reject(
+                    "auction_price",
+                    "listing exceeds authorized buyout or current funds",
+                    false,
+                ));
+            }
+        }
+        GameplayCommand::MailTake {
+            mailbox_generation,
+            mail_id,
+        } => {
+            if snapshot.state.inventory.mailbox.generation != *mailbox_generation
+                || !snapshot.state.inventory.mailbox.mails.contains_key(mail_id)
+            {
+                return Err(reject("stale_mail", "mailbox contents changed", true));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn optional_target_is_authoritative(snapshot: &Snapshot, target: &Option<EntityId>) -> bool {
+    target.is_none_or(|entity| has_entity(snapshot, entity))
+}
+
+fn has_entity(snapshot: &Snapshot, entity: EntityId) -> bool {
+    snapshot.state.entities.0.contains_key(&entity)
 }
 
 fn send(action: ProposedAction) -> ValidationOutcome {
