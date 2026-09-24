@@ -101,36 +101,31 @@ fn unit_integer_array(object: &Object, field: UnitField) -> Option<[i32; 7]> {
     let Some(FieldValue::IntegerArray(values)) = object.unit_fields.get(&field) else {
         return None;
     };
-    values
-        .iter()
-        .copied()
-        .collect::<Option<Vec<_>>>()?
-        .try_into()
-        .ok()
+    complete_array::<7, _, _>(values, Some)
 }
 
 fn unit_float_array(object: &Object, field: UnitField) -> Option<[f32; 7]> {
     let Some(FieldValue::FloatArray(values)) = object.unit_fields.get(&field) else {
         return None;
     };
-    values
-        .iter()
-        .copied()
-        .collect::<Option<Vec<_>>>()?
-        .try_into()
-        .ok()
+    complete_array::<7, _, _>(values, Some)
 }
 
 fn unit_unsigned_array<const N: usize>(object: &Object, field: UnitField) -> Option<[u32; N]> {
     let Some(FieldValue::IntegerArray(values)) = object.unit_fields.get(&field) else {
         return None;
     };
+    complete_array::<N, _, _>(values, |value| u32::try_from(value).ok())
+}
+
+fn complete_array<const N: usize, T: Copy, U>(
+    values: &[Option<T>],
+    convert: impl Fn(T) -> Option<U>,
+) -> Option<[U; N]> {
     values
         .iter()
         .copied()
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .map(|value| u32::try_from(value).ok())
+        .map(|value| value.and_then(&convert))
         .collect::<Option<Vec<_>>>()?
         .try_into()
         .ok()
@@ -143,5 +138,26 @@ pub fn upsert_object(
 ) -> ProtocolObservation {
     ProtocolObservation::EntityUpsert {
         entity: object_to_entity(object, names, map_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_array;
+
+    #[test]
+    fn complete_array_checks_presence_length_and_conversion() {
+        assert_eq!(
+            complete_array::<3, _, _>(&[Some(1), Some(2), Some(3)], Some),
+            Some([1, 2, 3])
+        );
+        assert!(complete_array::<3, _, _>(&[Some(1), None, Some(3)], Some).is_none());
+        assert!(complete_array::<2, _, _>(&[Some(1), Some(2), Some(3)], Some).is_none());
+        assert_eq!(
+            complete_array::<2, _, _>(&[Some(1_i32), Some(-1)], |value| {
+                u32::try_from(value).ok()
+            }),
+            None
+        );
     }
 }
