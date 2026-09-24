@@ -449,6 +449,7 @@ pub(super) fn quest_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObserv
     const SMSG_QUESTGIVER_QUEST_LIST: u32 = 0x0185;
     const SMSG_QUESTGIVER_REQUEST_ITEMS: u32 = 0x018B;
     const SMSG_QUESTGIVER_OFFER_REWARD: u32 = 0x018D;
+    const SMSG_QUESTGIVER_QUEST_COMPLETE: u32 = 0x018F;
     const SMSG_QUESTGIVER_STATUS_MULTIPLE: u32 = 0x0418;
     const SMSG_QUEST_QUERY_RESPONSE: u32 = 0x005D;
     match opcode {
@@ -457,6 +458,14 @@ pub(super) fn quest_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObserv
         SMSG_QUESTGIVER_QUEST_LIST => parse_quest_list(body),
         SMSG_QUESTGIVER_REQUEST_ITEMS => parse_quest_request_items(body).into_iter().collect(),
         SMSG_QUESTGIVER_OFFER_REWARD => parse_quest_offer_reward(body).into_iter().collect(),
+        SMSG_QUESTGIVER_QUEST_COMPLETE => body
+            .get(..4)
+            .and_then(|quest| <[u8; 4]>::try_from(quest).ok())
+            .map(|quest| ProtocolObservation::QuestCompleted {
+                quest: u32::from_le_bytes(quest),
+            })
+            .into_iter()
+            .collect(),
         SMSG_QUEST_QUERY_RESPONSE => parse_quest_query_response(body).into_iter().collect(),
         _ => Vec::new(),
     }

@@ -339,7 +339,8 @@ impl LaneEngine {
                     }
                 }
                 if let ProtocolObservation::QuestTurnInDialog { quest, .. }
-                | ProtocolObservation::QuestRemoved { quest } = &o
+                | ProtocolObservation::QuestRemoved { quest }
+                | ProtocolObservation::QuestCompleted { quest } = &o
                 {
                     if self
                         .pending_turn_in
