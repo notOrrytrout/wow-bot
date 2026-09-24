@@ -567,12 +567,6 @@ impl LaneEngine {
             MissionIntent::Party { .. } | MissionIntent::Raid { .. } => {
                 self.tick_group_encounter().await
             }
-            other => {
-                self.waiting(format!(
-                    "mission scheduler for {other:?} is not implemented yet"
-                ));
-                true
-            }
         }
     }
 
