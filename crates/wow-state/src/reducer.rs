@@ -20,6 +20,12 @@ fn advance_loot_generation(state: &mut AuthoritativeState, ownership: crate::Loo
     }
 }
 
+fn record_quest_completion(state: &mut AuthoritativeState, quest: u32) {
+    if !state.quests.completed.contains(&quest) {
+        state.quests.completed.push(quest);
+    }
+}
+
 fn mark_entity_changed(delta: &mut StateDelta, entity: EntityId, sections: &[&str]) {
     delta.touched_entities.push(entity);
     delta
@@ -287,16 +293,14 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 .is_some_and(|progress| progress.complete);
             state.quests.active.remove(&quest);
             state.quests.turn_in.remove(&quest);
-            if was_turning_in && was_complete && !state.quests.completed.contains(&quest) {
-                state.quests.completed.push(quest);
+            if was_turning_in && was_complete {
+                record_quest_completion(state, quest);
             }
             delta.changed.push("quests".into());
         }
         ProtocolObservation::QuestCompleted { quest } => {
             state.quests.active.remove(&quest);
-            if !state.quests.completed.contains(&quest) {
-                state.quests.completed.push(quest);
-            }
+            record_quest_completion(state, quest);
             delta.changed.push("quests".into());
         }
         ProtocolObservation::SpellKnown { spell } => {
@@ -428,8 +432,39 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{entities::EntityState, inventory::InventoryItemInstance};
+    use crate::{
+        entities::EntityState,
+        inventory::InventoryItemInstance,
+        quests::{QuestProgress, QuestTurnInDialog, QuestTurnInStage},
+    };
     use wow_domain::{EntityId, Vec3, WorldPosition};
+
+    #[test]
+    fn quest_completion_events_share_unique_recording() {
+        let mut state = AuthoritativeState::default();
+        state.quests.active.insert(
+            42,
+            QuestProgress {
+                complete: true,
+                objectives: vec![1],
+            },
+        );
+        state.quests.turn_in.insert(
+            42,
+            QuestTurnInDialog {
+                giver: EntityId(7),
+                stage: QuestTurnInStage::RequestItems { can_complete: true },
+            },
+        );
+
+        reduce(&mut state, ProtocolObservation::QuestRemoved { quest: 42 });
+        reduce(
+            &mut state,
+            ProtocolObservation::QuestCompleted { quest: 42 },
+        );
+
+        assert_eq!(state.quests.completed, vec![42]);
+    }
 
     #[test]
     fn leaving_world_removes_session_evidence_before_reentry() {
