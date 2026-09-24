@@ -12,4 +12,19 @@ impl Millis {
             .unwrap_or(Duration::ZERO);
         Self(value.as_millis().min(u128::from(u64::MAX)) as u64)
     }
+
+    pub const fn saturating_add(self, duration_ms: u64) -> Self {
+        Self(self.0.saturating_add(duration_ms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Millis;
+
+    #[test]
+    fn saturating_add_caps_at_millisecond_limit() {
+        assert_eq!(Millis(12).saturating_add(30), Millis(42));
+        assert_eq!(Millis(u64::MAX - 1).saturating_add(2), Millis(u64::MAX));
+    }
 }

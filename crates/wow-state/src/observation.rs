@@ -37,6 +37,20 @@ pub enum ProtocolObservation {
         reason: u8,
         target: Option<EntityId>,
     },
+    CastStarted {
+        caster: EntityId,
+        spell: u32,
+        started_at_ms: u64,
+        ends_at_ms: u64,
+    },
+    CastFinished {
+        caster: EntityId,
+        spell: u32,
+    },
+    CastUpdated {
+        caster: EntityId,
+        ends_at_ms: u64,
+    },
     CorpseLocation {
         position: Option<WorldPosition>,
     },

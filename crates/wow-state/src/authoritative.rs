@@ -5,7 +5,16 @@ use crate::{
     session::SessionState,
 };
 use serde::{Deserialize, Serialize};
-use wow_domain::StateRevision;
+use std::collections::BTreeMap;
+use wow_domain::{EntityId, StateRevision};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveCastState {
+    pub spell: u32,
+    pub started_at_ms: u64,
+    pub ends_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AuthoritativeState {
     pub auras: AuraState,
@@ -21,4 +30,6 @@ pub struct AuthoritativeState {
     pub capabilities: CapabilityState,
     pub control: ControlState,
     pub desync: DesyncState,
+    #[serde(default)]
+    pub active_casts: BTreeMap<EntityId, ActiveCastState>,
 }

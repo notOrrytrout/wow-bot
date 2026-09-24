@@ -55,6 +55,56 @@ mod tests {
             ProtocolObservation::SpellGlobalCooldown { spell: 123, .. }
         ));
     }
+
+    #[test]
+    fn cast_start_and_channel_packets_share_millisecond_deadlines() {
+        let spell = 133u32;
+        let duration = 1_500u32;
+
+        let mut spell_start = vec![0, 1, 0x34, 1];
+        spell_start.extend_from_slice(&spell.to_le_bytes());
+        spell_start.extend_from_slice(&0u32.to_le_bytes());
+        spell_start.extend_from_slice(&duration.to_le_bytes());
+        let ProtocolObservation::CastStarted {
+            caster,
+            spell: observed_spell,
+            started_at_ms,
+            ends_at_ms,
+        } = parse_spell_start(&spell_start).expect("valid spell start")
+        else {
+            panic!("spell start observation expected")
+        };
+        assert_eq!(caster, EntityId(0x34));
+        assert_eq!(observed_spell, spell);
+        assert_eq!(ends_at_ms - started_at_ms, u64::from(duration));
+        assert!(parse_spell_start(&spell_start[..spell_start.len() - 1]).is_none());
+
+        let mut channel_start = vec![1, 0x34];
+        channel_start.extend_from_slice(&spell.to_le_bytes());
+        channel_start.extend_from_slice(&duration.to_le_bytes());
+        let ProtocolObservation::CastStarted {
+            started_at_ms,
+            ends_at_ms,
+            ..
+        } = parse_channel_start(&channel_start).expect("valid channel start")
+        else {
+            panic!("channel start observation expected")
+        };
+        assert_eq!(ends_at_ms - started_at_ms, u64::from(duration));
+
+        let mut channel_update = vec![1, 0x34];
+        channel_update.extend_from_slice(&duration.to_le_bytes());
+        assert!(matches!(
+            parse_channel_update(&channel_update),
+            Some(ProtocolObservation::CastUpdated { caster: EntityId(0x34), ends_at_ms })
+                if ends_at_ms > 0
+        ));
+        channel_update[2..].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            parse_channel_update(&channel_update),
+            Some(ProtocolObservation::CastUpdated { ends_at_ms: 0, .. })
+        ));
+    }
 }
 
 pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation> {
@@ -63,6 +113,10 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
     const SMSG_AURA_UPDATE_ALL: u32 = 0x0495;
     const SMSG_AURA_UPDATE: u32 = 0x0496;
     const SMSG_SPELL_COOLDOWN: u32 = 0x0134;
+    const SMSG_SPELL_START: u32 = 0x0131;
+    const SMSG_SPELL_GO: u32 = 0x0132;
+    const MSG_CHANNEL_START: u32 = 0x0139;
+    const MSG_CHANNEL_UPDATE: u32 = 0x013A;
     const SMSG_RESYNC_RUNES: u32 = 0x0487;
     const SMSG_UPDATE_COMBO_POINTS: u32 = 0x039D;
     const MSG_CORPSE_QUERY: u32 = 0x0216;
@@ -80,6 +134,10 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_AURA_UPDATE_ALL => parse_aura_update_all(body).into_iter().collect(),
         SMSG_AURA_UPDATE => parse_aura_update(body).into_iter().collect(),
         SMSG_SPELL_COOLDOWN => parse_spell_cooldowns(body),
+        SMSG_SPELL_START => parse_spell_start(body).into_iter().collect(),
+        SMSG_SPELL_GO => parse_spell_go(body).into_iter().collect(),
+        MSG_CHANNEL_START => parse_channel_start(body).into_iter().collect(),
+        MSG_CHANNEL_UPDATE => parse_channel_update(body).into_iter().collect(),
         SMSG_RESYNC_RUNES => vec![ProtocolObservation::PlayerRunes {
             runes: parse_player_runes(body),
         }],
@@ -88,6 +146,73 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_CORPSE_RECLAIM_DELAY => parse_reclaim_delay(body).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn parse_spell_start(body: &[u8]) -> Option<ProtocolObservation> {
+    let mut offset = 0usize;
+    read_packed_guid(body, &mut offset)?; // cast item or caster
+    let caster = read_packed_guid(body, &mut offset)?;
+    offset = offset.checked_add(1)?; // cast count
+    let spell = read_u32(body, &mut offset)?;
+    offset = offset.checked_add(4)?; // cast flags
+    let remaining_ms = read_u32(body, &mut offset)?;
+    cast_started(caster, spell, remaining_ms)
+}
+
+fn parse_spell_go(body: &[u8]) -> Option<ProtocolObservation> {
+    let mut offset = 0usize;
+    read_packed_guid(body, &mut offset)?; // cast item or caster
+    let caster = read_packed_guid(body, &mut offset)?;
+    offset = offset.checked_add(1)?; // cast count
+    let spell = read_u32(body, &mut offset)?;
+    (caster.0 != 0 && spell != 0).then_some(ProtocolObservation::CastFinished { caster, spell })
+}
+
+fn parse_channel_start(body: &[u8]) -> Option<ProtocolObservation> {
+    let mut offset = 0usize;
+    let caster = read_packed_guid(body, &mut offset)?;
+    let spell = read_u32(body, &mut offset)?;
+    let duration_ms = read_u32(body, &mut offset)?;
+    cast_started(caster, spell, duration_ms)
+}
+
+fn cast_started(caster: EntityId, spell: u32, duration_ms: u32) -> Option<ProtocolObservation> {
+    if caster.0 == 0 || spell == 0 || duration_ms == 0 {
+        return None;
+    }
+    let started_at_ms = Millis::wall_clock_now().0;
+    Some(ProtocolObservation::CastStarted {
+        caster,
+        spell,
+        started_at_ms,
+        ends_at_ms: Millis(started_at_ms)
+            .saturating_add(u64::from(duration_ms))
+            .0,
+    })
+}
+
+fn parse_channel_update(body: &[u8]) -> Option<ProtocolObservation> {
+    let mut offset = 0usize;
+    let caster = read_packed_guid(body, &mut offset)?;
+    let remaining_ms = read_u32(body, &mut offset)?;
+    if caster.0 == 0 {
+        return None;
+    }
+    let ends_at_ms = if remaining_ms == 0 {
+        0
+    } else {
+        Millis::wall_clock_now()
+            .saturating_add(u64::from(remaining_ms))
+            .0
+    };
+    Some(ProtocolObservation::CastUpdated { caster, ends_at_ms })
+}
+
+fn read_u32(body: &[u8], offset: &mut usize) -> Option<u32> {
+    let end = (*offset).checked_add(4)?;
+    let value = u32::from_le_bytes(body.get(*offset..end)?.try_into().ok()?);
+    *offset = end;
+    Some(value)
 }
 
 pub(super) fn parse_corpse_query(body: &[u8]) -> Option<ProtocolObservation> {
@@ -113,7 +238,7 @@ pub(super) fn parse_corpse_query(body: &[u8]) -> Option<ProtocolObservation> {
 pub(super) fn parse_reclaim_delay(body: &[u8]) -> Option<ProtocolObservation> {
     let delay = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
     Some(ProtocolObservation::CorpseReclaimDelay {
-        ready_at_ms: Millis::wall_clock_now().0.saturating_add(u64::from(delay)),
+        ready_at_ms: Millis::wall_clock_now().saturating_add(u64::from(delay)).0,
     })
 }
 
@@ -133,7 +258,7 @@ pub(super) fn parse_spell_cooldowns(body: &[u8]) -> Vec<ProtocolObservation> {
         if spell != 0 {
             out.push(ProtocolObservation::SpellCooldown {
                 spell,
-                ready_at_ms: now.saturating_add(u64::from(cooldown)),
+                ready_at_ms: Millis(now).saturating_add(u64::from(cooldown)).0,
             });
             if starts_global_cooldown {
                 out.push(ProtocolObservation::SpellGlobalCooldown {

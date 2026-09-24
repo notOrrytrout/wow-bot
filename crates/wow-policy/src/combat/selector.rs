@@ -3,6 +3,10 @@ use std::{collections::BTreeMap, sync::OnceLock};
 use wow_domain::{EntityId, GameplayCommand, time::Millis};
 use wow_state::Snapshot;
 
+const CAST_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+const DEFAULT_COMBAT_CYCLE: std::time::Duration = std::time::Duration::from_secs(3);
+const SLOW_FALLBACK_CYCLE: std::time::Duration = std::time::Duration::from_secs(12);
+
 #[derive(Clone, Debug, Deserialize)]
 struct CombatCatalog {
     format_version: u32,
@@ -116,27 +120,162 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
 
 /// Convert the policy decision to the one shared action shape used by every engine combat path.
 pub fn select_action(snapshot: &Snapshot, target: EntityId) -> Result<CombatAction, &'static str> {
+    if let Some(spell) = select_interrupt(snapshot, target) {
+        return Ok(cast_action(spell, target, CAST_POLL_INTERVAL));
+    }
+
+    if let Some((spell, heal_target)) = select_heal(snapshot) {
+        return Ok(cast_action(spell, heal_target, combat_cycle(snapshot)));
+    }
+
+    let cycle = combat_cycle(snapshot);
     match select(snapshot, target) {
-        CombatDecision::Cast { spell, target } => Ok(CombatAction {
-            command: GameplayCommand::Cast {
-                spell,
-                target: Some(target),
-            },
-            cycle: std::time::Duration::from_secs(3),
-        }),
-        CombatDecision::Wand { target } => Ok(CombatAction {
-            command: GameplayCommand::Cast {
-                spell: 5019,
-                target: Some(target),
-            },
-            cycle: std::time::Duration::from_secs(12),
-        }),
+        CombatDecision::Cast { spell, target } => Ok(cast_action(spell, target, cycle)),
+        CombatDecision::Wand { target } => Ok(cast_action(5019, target, fallback_cycle(cycle))),
         CombatDecision::Melee { target } => Ok(CombatAction {
             command: GameplayCommand::Attack(target),
-            cycle: std::time::Duration::from_secs(12),
+            cycle: fallback_cycle(cycle),
         }),
         CombatDecision::Deferred { reason } => Err(reason),
     }
+}
+
+fn cast_action(spell: u32, target: EntityId, cycle: std::time::Duration) -> CombatAction {
+    CombatAction {
+        command: GameplayCommand::Cast {
+            spell,
+            target: Some(target),
+        },
+        cycle,
+    }
+}
+
+fn fallback_cycle(cycle: std::time::Duration) -> std::time::Duration {
+    if cycle < DEFAULT_COMBAT_CYCLE {
+        cycle
+    } else {
+        SLOW_FALLBACK_CYCLE
+    }
+}
+
+fn select_interrupt(snapshot: &Snapshot, target: EntityId) -> Option<u32> {
+    let target_state = snapshot.state.entities.0.get(&target)?;
+    if !target_state.hostile || target_state.is_dead() {
+        return None;
+    }
+    let now_ms = Millis::wall_clock_now().0;
+    let cast = snapshot.state.active_casts.get(&target)?;
+    if cast.ends_at_ms <= now_ms {
+        return None;
+    }
+    let class_id = snapshot.state.capabilities.class_id?;
+    let interrupt_ids: &[u32] = match class_id {
+        1 => &[6552, 6554, 6555, 12555, 13491, 15615, 19639, 26090, 47081],
+        2 => &[31935, 48827, 48826],
+        3 => &[34490],
+        4 => &[1766, 1767, 1768, 1769, 1770],
+        5 => &[],
+        6 => &[47528, 53550],
+        7 => &[57994],
+        8 => &[2139],
+        9 => &[],
+        11 => &[],
+        _ => &[],
+    };
+    interrupt_ids.iter().copied().find(|spell| {
+        snapshot.state.capabilities.spells.contains(spell)
+            && crate::combat::readiness::check_spell_readiness(
+                snapshot,
+                *spell,
+                Some(target),
+                now_ms,
+            )
+            .is_ok()
+    })
+}
+
+fn combat_cycle(snapshot: &Snapshot) -> std::time::Duration {
+    let now_ms = Millis::wall_clock_now().0;
+    if snapshot
+        .state
+        .active_casts
+        .values()
+        .any(|cast| cast.ends_at_ms > now_ms)
+    {
+        CAST_POLL_INTERVAL
+    } else {
+        DEFAULT_COMBAT_CYCLE
+    }
+}
+
+/// Select a known direct heal for the most injured living party member or player.
+/// Dedicated healing trees keep a wider reserve; other trees heal only in an
+/// emergency. Unknown health and offline group members cannot trigger a cast.
+fn select_heal(snapshot: &Snapshot) -> Option<(u32, EntityId)> {
+    const HEAL_FAMILIES: &[(u8, &[u32])] = &[
+        (2, &[20473, 635, 19750]),  // Holy Paladin
+        (5, &[47540, 2061, 2060]),  // Priest
+        (7, &[331, 8004, 1064]),    // Shaman
+        (11, &[50464, 5185, 8936]), // Druid
+    ];
+
+    let class_id = snapshot.state.capabilities.class_id?;
+    let tree = snapshot.state.capabilities.specialization_tree;
+    let is_healer = matches!(
+        (class_id, tree),
+        (2, Some(0)) | (5, Some(0 | 1)) | (7, Some(2)) | (11, Some(2))
+    );
+    let emergency_threshold = if is_healer { 0.65 } else { 0.30 };
+    let player = snapshot.state.session.character_guid.map(EntityId)?;
+
+    let mut candidates = vec![player];
+    candidates.extend(
+        snapshot
+            .state
+            .group
+            .members
+            .iter()
+            .filter(|member| member.online && member.entity != player)
+            .map(|member| member.entity),
+    );
+
+    let target = candidates
+        .into_iter()
+        .filter_map(|entity| {
+            let health = snapshot.state.entities.0.get(&entity)?.health?;
+            if health.1 == 0 || health.0 == 0 {
+                return None;
+            }
+            let fraction = health.0 as f32 / health.1 as f32;
+            (fraction <= emergency_threshold).then_some((entity, fraction))
+        })
+        .min_by(|(left_id, left), (right_id, right)| {
+            left.total_cmp(right).then_with(|| left_id.cmp(right_id))
+        })
+        .map(|(entity, _)| entity)?;
+
+    let families = HEAL_FAMILIES
+        .iter()
+        .find(|(candidate, _)| *candidate == class_id)?
+        .1;
+    let now_ms = Millis::wall_clock_now().0;
+    families.iter().find_map(|family| {
+        crate::combat::spells::family_spells(*family)?
+            .iter()
+            .rev()
+            .find(|spell| {
+                snapshot.state.capabilities.spells.contains(spell)
+                    && crate::combat::readiness::check_spell_readiness(
+                        snapshot,
+                        **spell,
+                        Some(target),
+                        now_ms,
+                    )
+                    .is_ok()
+            })
+            .copied()
+            .map(|spell| (spell, target))
+    })
 }
 
 pub fn supported_class_trees() -> impl Iterator<Item = (u8, u8, Vec<(u8, u32)>)> {

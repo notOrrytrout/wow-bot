@@ -55,7 +55,10 @@ pub fn check_spell_readiness(
         snapshot.state.capabilities.global_cooldown_started_at_ms,
     ) && let Some(source_spell) = crate::combat::spells::metadata(source)
         && source_spell.global_cooldown.category != 0
-        && started.saturating_add(u64::from(source_spell.global_cooldown.duration_ms)) > now_ms
+        && wow_domain::time::Millis(started)
+            .saturating_add(u64::from(source_spell.global_cooldown.duration_ms))
+            .0
+            > now_ms
     {
         return Err(SpellUnavailableReason::GlobalCooldown);
     }

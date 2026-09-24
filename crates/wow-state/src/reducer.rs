@@ -91,6 +91,46 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             }
         }
         ProtocolObservation::CastFailed { .. } => {}
+        ProtocolObservation::CastStarted {
+            caster,
+            spell,
+            started_at_ms,
+            ends_at_ms,
+        } => {
+            if spell != 0 && ends_at_ms > started_at_ms {
+                state.active_casts.insert(
+                    caster,
+                    crate::ActiveCastState {
+                        spell,
+                        started_at_ms,
+                        ends_at_ms,
+                    },
+                );
+                delta.touched_entities.push(caster);
+                delta.changed.push("active_casts".into());
+            }
+        }
+        ProtocolObservation::CastFinished { caster, spell } => {
+            let matches_spell = spell == 0
+                || state
+                    .active_casts
+                    .get(&caster)
+                    .is_some_and(|active| active.spell == spell);
+            if matches_spell && state.active_casts.remove(&caster).is_some() {
+                delta.touched_entities.push(caster);
+                delta.changed.push("active_casts".into());
+            }
+        }
+        ProtocolObservation::CastUpdated { caster, ends_at_ms } => {
+            if let Some(active) = state.active_casts.get_mut(&caster) {
+                active.ends_at_ms = ends_at_ms;
+                if ends_at_ms == 0 {
+                    state.active_casts.remove(&caster);
+                }
+                delta.touched_entities.push(caster);
+                delta.changed.push("active_casts".into());
+            }
+        }
         ProtocolObservation::CorpseLocation { position } => {
             state.life.corpse = position;
             state.life.recovery_generation = state.life.recovery_generation.wrapping_add(1);
@@ -107,6 +147,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
         }
         ProtocolObservation::EntityRemoved { entity } => {
             state.entities.0.remove(&entity);
+            state.active_casts.remove(&entity);
             if state.inventory.vendor == Some(entity) {
                 state.inventory.vendor = None;
             }
