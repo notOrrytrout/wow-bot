@@ -2071,6 +2071,44 @@ mod quest_protocol_tests {
     }
 
     #[test]
+    fn parses_sanitized_azerothcore_loot_capture_fixtures() {
+        let fixtures = [
+            (
+                include_str!("../testdata/smsg_loot_response_two_items.hex"),
+                0xF130_000C_3400_834E,
+                vec![0, 1],
+            ),
+            (
+                include_str!("../testdata/smsg_loot_response_three_items.hex"),
+                0xF130_000C_3400_AA70,
+                vec![0, 1, 2],
+            ),
+        ];
+
+        for (capture, expected_guid, expected_slots) in fixtures {
+            let body = decode_hex_fixture(capture);
+            assert_eq!(body.len(), 14 + expected_slots.len() * 22);
+            let (guid, gold, slots) =
+                parse_loot_response(&body).expect("captured Wrath loot response should parse");
+            assert_eq!(guid, expected_guid);
+            assert_eq!(gold, 0);
+            assert_eq!(slots, expected_slots);
+        }
+    }
+
+    fn decode_hex_fixture(hex: &str) -> Vec<u8> {
+        let hex = hex.trim();
+        assert_eq!(hex.len() % 2, 0, "hex fixture must contain whole bytes");
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("hex is ASCII");
+                u8::from_str_radix(pair, 16).expect("fixture contains valid hex")
+            })
+            .collect()
+    }
+
+    #[test]
     fn parses_azerothcore_turn_in_dialogs() {
         let giver = 77_u64;
         let quest = 42_u32;

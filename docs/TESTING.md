@@ -9,6 +9,7 @@ cargo check --workspace --all-targets
 cargo test --workspace
 cargo clippy --workspace --all-targets
 tools/check-binrw-future-compat.sh
+python3 -m unittest discover -s tools/tests -v
 ```
 
 The workspace pins Tentacli 15.3.2 in `Cargo.toml`. If Cargo reports an adapter API mismatch after a dependency change, compare the adapter with that pinned revision before changing the runtime interfaces.

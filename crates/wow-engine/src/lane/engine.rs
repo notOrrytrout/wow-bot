@@ -2564,9 +2564,29 @@ mod tests {
     use super::*;
     use crate::activity::ActivityArbiter;
 
-    fn combat_engine() -> (LaneEngine, mpsc::Receiver<WorkerToProxy>) {
+    fn test_engine(
+        mission: Mission,
+        authoritative: wow_state::AuthoritativeState,
+    ) -> (LaneEngine, mpsc::Receiver<WorkerToProxy>) {
         let (_lane_tx, lane_rx) = mpsc::channel(1);
         let (proxy_tx, proxy_rx) = mpsc::channel(4);
+        let state = LaneState {
+            lane: LaneId(1),
+            worker: WorkerGeneration(1),
+            ownership: OwnershipGeneration::ZERO,
+            movement_epoch: MovementEpoch::ZERO,
+            mission,
+            mission_revision: MissionRevision::ZERO,
+            permission_revision: PermissionRevision::ZERO,
+            pause: PauseReasons::empty(),
+            activation: ActivationStage::Act,
+            authoritative,
+            activity: ActivityArbiter::default(),
+        };
+        (LaneEngine::new(state, lane_rx, proxy_tx), proxy_rx)
+    }
+
+    fn combat_engine() -> (LaneEngine, mpsc::Receiver<WorkerToProxy>) {
         let mut authoritative = wow_state::AuthoritativeState::default();
         authoritative.session.in_world = true;
         authoritative.session.character_guid = Some(1);
@@ -2602,20 +2622,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let state = LaneState {
-            lane: LaneId(1),
-            worker: WorkerGeneration(1),
-            ownership: OwnershipGeneration::ZERO,
-            movement_epoch: MovementEpoch::ZERO,
-            mission: Mission::quest(MissionId(9)),
-            mission_revision: MissionRevision::ZERO,
-            permission_revision: PermissionRevision::ZERO,
-            pause: PauseReasons::empty(),
-            activation: ActivationStage::Act,
-            authoritative,
-            activity: ActivityArbiter::default(),
-        };
-        (LaneEngine::new(state, lane_rx, proxy_tx), proxy_rx)
+        test_engine(Mission::quest(MissionId(9)), authoritative)
     }
 
     #[tokio::test]
@@ -2728,23 +2735,8 @@ mod tests {
 
     #[tokio::test]
     async fn world_exit_discards_pending_work_and_keeps_mission() {
-        let (_lane_tx, lane_rx) = mpsc::channel(1);
-        let (proxy_tx, _proxy_rx) = mpsc::channel(1);
         let mission = Mission::quest(MissionId(9));
-        let state = LaneState {
-            lane: LaneId(1),
-            worker: WorkerGeneration(1),
-            ownership: OwnershipGeneration::ZERO,
-            movement_epoch: MovementEpoch::ZERO,
-            mission,
-            mission_revision: MissionRevision::ZERO,
-            permission_revision: PermissionRevision::ZERO,
-            pause: PauseReasons::empty(),
-            activation: ActivationStage::Act,
-            authoritative: Default::default(),
-            activity: ActivityArbiter::default(),
-        };
-        let mut engine = LaneEngine::new(state, lane_rx, proxy_tx);
+        let (mut engine, _proxy_rx) = test_engine(mission, Default::default());
         let destination = Vec3::new(10.0, 0.0, 0.0);
         let work = QuestWorkRuntime {
             id: QuestWorkId(1),
@@ -2840,22 +2832,7 @@ mod tests {
 
     #[test]
     fn static_search_advances_after_arrival_and_waits_after_bounded_candidates() {
-        let (_lane_tx, lane_rx) = mpsc::channel(1);
-        let (proxy_tx, _proxy_rx) = mpsc::channel(1);
-        let state = LaneState {
-            lane: LaneId(1),
-            worker: WorkerGeneration(1),
-            ownership: OwnershipGeneration::ZERO,
-            movement_epoch: MovementEpoch::ZERO,
-            mission: Mission::quest(MissionId(9)),
-            mission_revision: MissionRevision::ZERO,
-            permission_revision: PermissionRevision::ZERO,
-            pause: PauseReasons::empty(),
-            activation: ActivationStage::Act,
-            authoritative: Default::default(),
-            activity: ActivityArbiter::default(),
-        };
-        let mut engine = LaneEngine::new(state, lane_rx, proxy_tx);
+        let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(9)), Default::default());
         let key = (456, 0, 0);
         let first = Vec3::new(1.0, 0.0, 0.0);
         let second = Vec3::new(2.0, 0.0, 0.0);

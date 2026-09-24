@@ -95,3 +95,43 @@ impl PlayerPresence {
         self.resume_retry_delay = Duration::from_secs(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_idle_resume_uses_virtual_time_and_caps_retry_backoff() {
+        let started = Instant::now();
+        let mut player = PlayerPresence::new(Duration::from_secs(2));
+        player.bot_on();
+        player.moved(started);
+        let mut failure_at = started + player.idle_window;
+
+        for delay in [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs) {
+            assert!(player.should_resume(failure_at));
+            player.resume_failed(failure_at);
+            let retry_at = failure_at + delay;
+            assert!(!player.should_resume(retry_at - Duration::from_millis(1)));
+            assert!(player.should_resume(retry_at));
+            failure_at = retry_at;
+        }
+    }
+
+    #[test]
+    fn new_player_movement_resets_resume_retry_delay() {
+        let started = Instant::now();
+        let mut player = PlayerPresence::new(Duration::from_secs(2));
+        player.bot_on();
+        player.moved(started);
+        let idle_deadline = started + player.idle_window;
+        player.resume_failed(idle_deadline);
+        player.moved(idle_deadline + Duration::from_secs(3));
+
+        let next_deadline = idle_deadline + Duration::from_secs(3) + player.idle_window;
+        assert!(player.should_resume(next_deadline));
+        player.resume_failed(next_deadline);
+        assert!(!player.should_resume(next_deadline + Duration::from_millis(999)));
+        assert!(player.should_resume(next_deadline + Duration::from_secs(1)));
+    }
+}
