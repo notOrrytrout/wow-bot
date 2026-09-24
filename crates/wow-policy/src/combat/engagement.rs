@@ -13,11 +13,7 @@ pub fn protected_guids(snapshot: &Snapshot) -> BTreeSet<EntityId> {
     if let Some(mover) = snapshot.state.control.mover {
         protected.insert(mover);
     }
-    for member in &snapshot.state.group.members {
-        if member.online {
-            protected.insert(member.entity);
-        }
-    }
+    protected.extend(crate::group::state::online_members_except(snapshot, None));
     protected
 }
 
@@ -102,6 +98,12 @@ mod tests {
             role: None,
             online: true,
         });
+        state.group.members.push(GroupMember {
+            entity: EntityId(3),
+            name: "offline ally".into(),
+            role: None,
+            online: false,
+        });
         state.entities.0.insert(
             EntityId(9),
             EntityState {
@@ -112,10 +114,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(is_attacking_player_or_group(
-            &Snapshot::from_state(&state),
-            EntityId(9)
-        ));
+        let snapshot = Snapshot::from_state(&state);
+        assert!(!protected_guids(&snapshot).contains(&EntityId(3)));
+        assert!(is_attacking_player_or_group(&snapshot, EntityId(9)));
     }
 
     #[test]
