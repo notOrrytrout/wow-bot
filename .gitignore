@@ -4,3 +4,4 @@
 
 # Runtime-owned configuration, credentials, logs, generated files, cache, and state.
 wow-bot-data/
+tmp/

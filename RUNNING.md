@@ -14,7 +14,7 @@ Start the supervisor:
 cargo run -p wow-bot-supervisor
 ```
 
-The normal first-run flow does not require editing JSON.
+The supervisor reads user settings from `config.toml` and account data from `bots.toml`. Keep both files beside the `wow-bot/` directory. The `bots.roster_file` path in `config.toml` can be relative to that file. Users do not need to edit JSON. The TOML files are restricted to owner access when the supervisor reads them.
 
 The supervisor stores its writable files in the repository by default:
 
@@ -24,21 +24,16 @@ The supervisor stores its writable files in the repository by default:
 
 This default is the same on Windows, macOS, and Linux. Set `WOW_BOT_HOME` to use a different bot-owned root.
 
-The bot-owned directory contains `config.json`, `logs/`, `generated/`, `cache/`, and `state/`. AzerothCore's data directory is a separate, read-only input. wow-bot must not write generated files into the AzerothCore directory.
+The bot-owned directory contains `logs/`, `generated/`, `cache/`, and `state/`. Service launch files, copied executables, and console output stay under `wow-bot/tmp/`. AzerothCore's data directory is a separate, read-only input. wow-bot must not write generated files into the AzerothCore directory.
 
-On first run, setup:
+Set these values before the first run:
 
-1. Opens a native folder picker if the AzerothCore runtime-data location is not valid. Select the directory containing non-empty `dbc/`, `maps/`, `vmaps/`, and `mmaps/` directories.
-2. Asks whether AzerothCore runs on the same computer.
-3. Asks whether WoW clients on other computers will connect to the bot server.
-4. Requests a reachable hostname/IP when remote connectivity requires one.
-5. Requests the first WoW account name, hides password entry, and optionally requests the character name.
-6. Assigns internal lane/account IDs automatically and saves the setup.
-
-Later runs reuse the saved setup.
+1. Set `data_dir` in `config.toml` to the AzerothCore runtime-data directory. It must contain non-empty `dbc/`, `maps/`, `vmaps/`, and `mmaps/` directories.
+2. Set upstream hosts, ports, and listener addresses in `config.toml`.
+3. Add accounts and bots in `bots.toml`. Each enabled bot entry starts one account session. The account password can be a value in `bots.toml` or an environment variable named by `password_env`.
 
 For headless accounts on an AzerothCore server with Warden enabled, set
-`proxy.warden_client_image` in `wow-bot-data/config.json` to the local WoW
+`proxy.warden_client_image` in `config.toml` to the local WoW
 3.3.5a `Wow.exe` path. The headless proxy uses this image to answer memory
 checks. It verifies the server's Warden module and answers its check rounds.
 An unknown module or check stops the headless session with an error.
@@ -51,10 +46,10 @@ Provide the AzerothCore data directory directly:
 cargo run -p wow-bot-supervisor -- --data-root /path/to/azerothcore/data
 ```
 
-Use a custom config location only when needed:
+Select a config location when needed:
 
 ```sh
-cargo run -p wow-bot-supervisor -- --config /path/to/config.json
+cargo run -p wow-bot-supervisor -- --config /path/to/config.toml
 ```
 
 The bot's writable root remains `<repo>/wow-bot-data` even when `--config` points elsewhere, unless `WOW_BOT_HOME` explicitly overrides it.
@@ -71,7 +66,7 @@ Set `RUST_LOG=debug` or `RUST_LOG=trace` for more diagnostics.
 
 ## macOS background service
 
-Use the repository service script to keep the supervisor running after the terminal closes. The script builds the supervisor and worker when required, writes its launchd plist under the ignored `wow-bot-data/service/` directory, and loads it only when you start it. On macOS, it copies the plist and binaries to the user temporary directory because launchd cannot open this external volume's output path or executable directly. It does not enable automatic login startup.
+Use the repository service script to keep the supervisor running after the terminal closes. The script builds the supervisor and worker when required, writes its launchd plist, binaries, and console log under the ignored `wow-bot/tmp/` directory, and loads the service only when you start it. It does not enable automatic login startup.
 
 ```sh
 ./tools/wow-bot-service.sh start
@@ -80,7 +75,7 @@ Use the repository service script to keep the supervisor running after the termi
 ./tools/wow-bot-service.sh stop
 ```
 
-The supervisor log remains at `wow-bot-data/logs/wow-bot.log`. Launchd captures stdout and stderr in the user temporary directory as `wow-bot-supervisor-<uid>.log`; macOS does not allow launchd to open an external-volume log path for this job.
+The supervisor log remains at `wow-bot-data/logs/wow-bot.log`. Launchd captures stdout and stderr at `wow-bot/tmp/logs/supervisor-console.log`.
 
 ## World-knowledge generator
 
@@ -180,7 +175,7 @@ On macOS, the supervisor uses a short-lived native AppleScript folder chooser fo
 
 ### Runtime data selection
 
-Each extracted source checkout has its own repo-local `wow-bot-data/config.json`. If that checkout does not yet contain a saved AzerothCore runtime-data path, startup prints a terminal prompt. Paste/type the directory containing `dbc/`, `maps/`, `vmaps/`, and `mmaps/`, or press Enter to open the native folder browser. The selected source directory is read-only; generated bot data stays under `wow-bot-data/`.
+The runtime uses the `data_dir` from `config.toml` as read-only AzerothCore input. The selected source directory is read-only; generated bot data stays under `wow-bot-data/`.
 
 ### Quest execution diagnostics
 

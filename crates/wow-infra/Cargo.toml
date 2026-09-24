@@ -11,6 +11,7 @@ wow-state.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 tokio.workspace = true
 tracing.workspace = true
 [lints]

@@ -25,14 +25,16 @@ Cargo fetches the Tentacli Git revision specified in `Cargo.toml` and the other 
 
 ## Quick start
 
+Keep `config.toml` and `bots.toml` beside the `wow-bot/` directory. The supervisor reads the TOML files directly; it does not require users to edit JSON.
+
 Run these commands from the repository root:
 
 ```sh
 cargo build --workspace --all-targets
-cargo run -p wow-bot-supervisor
+cargo run -p wow-bot-supervisor -- --config ../config.toml
 ```
 
-On first run, setup asks for the AzerothCore data directory, connection details, and the first account. Password entry is hidden. Later runs reuse the saved configuration.
+`config.toml` selects the roster with `bots.roster_file`. A relative roster path is resolved from the directory that contains `config.toml`. Each enabled `[[bots]]` entry starts one account session, and its account name and password come from the matching `[[accounts]]` entry in `bots.toml`.
 
 To supply the runtime-data directory directly:
 
@@ -60,18 +62,21 @@ For the initial quest smoke test, put the character near an available quest give
 
 ## Runtime files
 
-By default, writable runtime files are stored in `wow-bot-data/`:
+By default, writable runtime files are stored in `wow-bot-data/`. Service executables, launchd files, and console output are stored in `tmp/`:
 
 ```text
 wow-bot-data/
-  config.json
   logs/
   generated/
   cache/
   state/
+tmp/
+  bin-<uid>/
+  logs/
+  service/
 ```
 
-Set `WOW_BOT_HOME` to use another writable root. The main log is `wow-bot-data/logs/wow-bot.log`. The runtime directory is excluded from Git because it contains local configuration, credentials, logs, and generated data.
+Set `WOW_BOT_HOME` to use another writable root. The main log is `wow-bot-data/logs/wow-bot.log`. Runtime and temporary files are excluded from Git.
 
 The AzerothCore data directory is a separate, read-only input.
 

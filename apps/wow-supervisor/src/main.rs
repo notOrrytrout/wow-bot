@@ -163,20 +163,42 @@ async fn main() -> Result<()> {
         std::process::id()
     );
     tracing::info!(runtime_log=%runtime_log.display(), action_logs=%app_paths.logs.display(), "logging initialized");
-    let config_path = args
-        .config
-        .clone()
-        .unwrap_or_else(|| app_paths.config.clone());
-    let (mut config, created) =
-        AppConfig::load_or_create(&config_path).map_err(anyhow::Error::msg)?;
+    let config_path = args.config.clone().unwrap_or_else(|| {
+        app_paths
+            .root
+            .parent()
+            .and_then(Path::parent)
+            .map(|root| root.join("config.toml"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| app_paths.config.clone())
+    });
+    let (mut config, created, persistence_path) = if config_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+    {
+        (
+            wow_infra::config::source::load_toml(&config_path)?,
+            false,
+            app_paths.config.clone(),
+        )
+    } else {
+        let (config, created) =
+            AppConfig::load_or_create(&config_path).map_err(anyhow::Error::msg)?;
+        (config, created, config_path.clone())
+    };
     config.runtime.data_dir = app_paths.root.clone();
     if created {
         tracing::info!(config=%config_path.display(), data_root=%app_paths.root.display(), "created first-run configuration in bot-owned storage");
     }
-    ensure_runtime_data(&mut config, &config_path, args.data_root.as_deref())?;
+    if persistence_path != config_path {
+        tracing::info!(config=%config_path.display(), "loaded user TOML configuration and resolved bot roster");
+    }
+    ensure_runtime_data(&mut config, &persistence_path, args.data_root.as_deref())?;
     prepare_runtime_asset_manifest(&config, &app_paths)?;
-    ensure_interactive_setup(&mut config, &config_path, created)?;
-    config.save(&config_path).map_err(anyhow::Error::msg)?;
+    ensure_interactive_setup(&mut config, &persistence_path, created)?;
+    if persistence_path == config_path || created {
+        config.save(&persistence_path).map_err(anyhow::Error::msg)?;
+    }
     config.validate().map_err(anyhow::Error::msg)?;
     check_upstream_services(&config).await?;
     let worker_bin = resolve_worker_bin(args.worker_bin).await?;

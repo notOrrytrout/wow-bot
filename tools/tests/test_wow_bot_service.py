@@ -100,17 +100,20 @@ esac
         plist_path = self.root / "wow-bot-data/service/com.wowbot.supervisor.plist"
         with plist_path.open("rb") as source:
             job = plistlib.load(source)
-        service_bin = self.tmp_dir / f"wow-bot-bin-{os.getuid()}"
+        service_bin = self.root / "tmp" / f"bin-{os.getuid()}"
+        service_dir = self.root / "tmp" / "service"
         self.assertEqual(job["Label"], "com.wowbot.supervisor")
         self.assertEqual(job["WorkingDirectory"], str(self.root))
         self.assertEqual(
             job["ProgramArguments"],
-            [str(service_bin / "wow-bot-supervisor"), "--worker-bin", str(service_bin / "wow-bot-worker")],
+            [str(service_bin / "wow-bot-supervisor"), "--worker-bin", str(service_bin / "wow-bot-worker"), "--config", str(self.root.parent / "config.toml")],
         )
         self.assertEqual(job["EnvironmentVariables"]["WOW_BOT_HOME"], str(self.root / "wow-bot-data"))
+        self.assertEqual(job["EnvironmentVariables"]["TMPDIR"], str(self.root / "tmp"))
         self.assertEqual(job["EnvironmentVariables"]["RUST_LOG"], "info")
-        self.assertEqual(job["StandardOutPath"], str(self.tmp_dir / f"wow-bot-supervisor.{os.getuid()}.log"))
+        self.assertEqual(job["StandardOutPath"], str(self.root / "tmp/logs/supervisor-console.log"))
         self.assertEqual(job["StandardErrorPath"], job["StandardOutPath"])
+        self.assertTrue((service_dir / f"com.wowbot.supervisor.{os.getuid()}.plist").is_file())
         self.assertTrue((service_bin / "wow-bot-supervisor").is_file())
         self.assertTrue((service_bin / "wow-bot-worker").is_file())
 
