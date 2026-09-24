@@ -1,9 +1,94 @@
 use anyhow::Result;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wow_domain::{EntityId, GameplayCommand, Vec3, WorldPosition};
 use wow_srp::wrath_header::ServerEncrypterHalf;
 
 use crate::framing::{ClientFrame, ServerFrame, upstream_edge::write_server_frame};
+
+pub(super) const SMSG_TIME_SYNC_REQ_OPCODE: u16 = 0x0390;
+const CMSG_TIME_SYNC_RESP_OPCODE: u32 = 0x0391;
+
+#[derive(Debug)]
+pub(super) struct MovementClock {
+    client_time_ms: u32,
+    anchored_at: Instant,
+    last_generated: Option<u32>,
+}
+
+impl Default for MovementClock {
+    fn default() -> Self {
+        Self {
+            client_time_ms: 1,
+            anchored_at: Instant::now(),
+            last_generated: None,
+        }
+    }
+}
+
+impl MovementClock {
+    pub(super) fn current_timestamp(&self) -> u32 {
+        let current = self
+            .client_time_ms
+            .wrapping_add(self.anchored_at.elapsed().as_millis() as u32);
+        match self.last_generated {
+            Some(last) if !timestamp_is_after(current, last) => last,
+            _ => current,
+        }
+    }
+
+    pub(super) fn observe(&mut self, client_time_ms: u32) {
+        let observed = match self.last_generated {
+            Some(last) if !timestamp_is_after_or_equal(client_time_ms, last) => last,
+            _ => client_time_ms,
+        };
+        self.client_time_ms = observed;
+        self.anchored_at = Instant::now();
+        if self
+            .last_generated
+            .is_none_or(|last| timestamp_is_after(observed, last))
+        {
+            self.last_generated = Some(observed);
+        }
+    }
+
+    fn next_timestamp(&mut self) -> u32 {
+        let current = self.current_timestamp();
+        let next = match self.last_generated {
+            Some(last) if !timestamp_is_after(current, last) => last.wrapping_add(1),
+            _ => current,
+        };
+        self.last_generated = Some(next);
+        next
+    }
+}
+
+fn timestamp_is_after(candidate: u32, previous: u32) -> bool {
+    (candidate.wrapping_sub(previous) as i32) > 0
+}
+
+fn timestamp_is_after_or_equal(candidate: u32, previous: u32) -> bool {
+    candidate == previous || timestamp_is_after(candidate, previous)
+}
+
+pub(super) fn parse_time_sync_response(body: &[u8]) -> Option<(u32, u32)> {
+    let counter = u32::from_le_bytes(body.get(..4)?.try_into().ok()?);
+    let client_time_ms = u32::from_le_bytes(body.get(4..8)?.try_into().ok()?);
+    Some((counter, client_time_ms))
+}
+
+pub(super) fn parse_time_sync_request(body: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(body.get(..4)?.try_into().ok()?))
+}
+
+pub(super) fn encode_time_sync_response(counter: u32, client_time_ms: u32) -> ClientFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&counter.to_le_bytes());
+    body.extend_from_slice(&client_time_ms.to_le_bytes());
+    ClientFrame {
+        opcode: CMSG_TIME_SYNC_RESP_OPCODE,
+        body,
+    }
+}
 
 pub(super) fn parse_cast_failed(body: &[u8]) -> Option<(u8, u32, u8)> {
     // AzerothCore Spell::WriteCastResultInfo: cast_count:u8, spell:u32, reason:u8.
@@ -76,7 +161,7 @@ pub(super) fn encode_gameplay_command(
     player_guid: Option<EntityId>,
     current: Option<WorldPosition>,
     base_movement_flags: u32,
-    movement_time: &mut u32,
+    movement_clock: &mut MovementClock,
 ) -> std::result::Result<Option<(ClientFrame, Option<(WorldPosition, bool, u32, u32)>)>, String> {
     const CMSG_USE_ITEM: u32 = 0x00AB;
     const CMSG_GAMEOBJ_USE: u32 = 0x00B1;
@@ -230,12 +315,12 @@ pub(super) fn encode_gameplay_command(
                 return Err("facing orientation is invalid".into());
             }
             position.orientation = orientation.rem_euclid(std::f32::consts::TAU);
-            *movement_time = movement_time.wrapping_add(1).max(1);
+            let movement_time = movement_clock.next_timestamp();
             let flags = base_movement_flags & !0x0000_0001_u32;
             let body = encode_simple_movement(
                 guid,
                 flags,
-                *movement_time,
+                movement_time,
                 position.point,
                 position.orientation,
             );
@@ -244,7 +329,7 @@ pub(super) fn encode_gameplay_command(
                     opcode: MSG_MOVE_SET_FACING,
                     body,
                 },
-                Some((position, false, flags, *movement_time)),
+                Some((position, false, flags, movement_time)),
             )))
         }
         GameplayCommand::ReleaseSpirit => Ok(Some((
@@ -284,14 +369,14 @@ pub(super) fn encode_gameplay_command(
                 position.orientation = dy.atan2(dx);
             }
             position.point = destination;
-            *movement_time = movement_time.wrapping_add(250).max(1);
+            let movement_time = movement_clock.next_timestamp();
             // Preserve server-authoritative capabilities such as flying/disable-gravity,
             // while setting forward movement for this step.
             let flags = base_movement_flags | 0x0000_0001_u32;
             let body = encode_simple_movement(
                 guid,
                 flags,
-                *movement_time,
+                movement_time,
                 position.point,
                 position.orientation,
             );
@@ -300,7 +385,7 @@ pub(super) fn encode_gameplay_command(
                     opcode: MSG_MOVE_HEARTBEAT,
                     body,
                 },
-                Some((position, true, flags, *movement_time)),
+                Some((position, true, flags, movement_time)),
             )))
         }
         GameplayCommand::StopMovement => {
@@ -310,12 +395,12 @@ pub(super) fn encode_gameplay_command(
             let position = current.ok_or_else(|| {
                 "stop movement requested before canonical position is known".to_owned()
             })?;
-            *movement_time = movement_time.wrapping_add(1).max(1);
+            let movement_time = movement_clock.next_timestamp();
             let flags = base_movement_flags & !0x0000_0001_u32;
             let body = encode_simple_movement(
                 guid,
                 flags,
-                *movement_time,
+                movement_time,
                 position.point,
                 position.orientation,
             );
@@ -324,7 +409,7 @@ pub(super) fn encode_gameplay_command(
                     opcode: MSG_MOVE_STOP,
                     body,
                 },
-                Some((position, false, flags, *movement_time)),
+                Some((position, false, flags, movement_time)),
             )))
         }
         other => Err(format!("{other:?}")),
@@ -450,6 +535,63 @@ pub(super) fn movement_matches_bot_visual(
     point.distance(visual.point) <= 0.25
         && angular <= 0.08
         && (client_opcode == bot_opcode || client_opcode == 0x00EE)
+}
+
+#[cfg(test)]
+mod movement_clock_tests {
+    use super::*;
+
+    #[test]
+    fn generated_timestamps_use_observed_client_clock_and_stay_monotonic() {
+        let mut clock = MovementClock::default();
+        clock.observe(42_000);
+
+        let first = clock.next_timestamp();
+        let second = clock.next_timestamp();
+
+        assert!(timestamp_is_after_or_equal(first, 42_000));
+        assert!(timestamp_is_after(second, first));
+    }
+
+    #[test]
+    fn generated_timestamps_remain_monotonic_across_wrap() {
+        let mut clock = MovementClock {
+            client_time_ms: u32::MAX - 2,
+            anchored_at: Instant::now() - Duration::from_millis(5),
+            last_generated: Some(u32::MAX - 2),
+        };
+
+        let timestamp = clock.next_timestamp();
+
+        assert!(timestamp_is_after(timestamp, u32::MAX - 2));
+    }
+
+    #[test]
+    fn stale_client_sample_does_not_move_the_clock_backwards() {
+        let mut clock = MovementClock::default();
+        clock.observe(42_000);
+        let first = clock.next_timestamp();
+
+        clock.observe(10);
+        let second = clock.next_timestamp();
+
+        assert!(timestamp_is_after(second, first));
+    }
+
+    #[test]
+    fn time_sync_response_round_trips_counter_and_client_timestamp() {
+        let frame = encode_time_sync_response(7, 12_345);
+
+        assert_eq!(frame.opcode, CMSG_TIME_SYNC_RESP_OPCODE);
+        assert_eq!(parse_time_sync_response(&frame.body), Some((7, 12_345)));
+        assert_eq!(parse_time_sync_response(&frame.body[..7]), None);
+    }
+
+    #[test]
+    fn time_sync_request_reads_counter_and_rejects_short_body() {
+        assert_eq!(parse_time_sync_request(&7_u32.to_le_bytes()), Some(7));
+        assert_eq!(parse_time_sync_request(&[7, 0, 0]), None);
+    }
 }
 
 pub(super) fn is_player_movement_opcode(opcode: u32) -> bool {

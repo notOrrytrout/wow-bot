@@ -707,7 +707,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     let mut controlled_position: Option<WorldPosition> = None;
     let mut controlled_flags: u32 = 0;
     let mut canonical_flags: u32 = 0;
-    let mut movement_time: u32 = 1;
+    let mut movement_clock = MovementClock::default();
     let mut last_bot_visual: Option<(WorldPosition, u32, std::time::Instant)> = None;
     let mut bot_loot_target: Option<EntityId> = None;
     let mut last_bot_cast: Option<(u32, Option<EntityId>, std::time::Instant)> = None;
@@ -717,6 +717,12 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
         tokio::select! {
             client = read_client_frame(&mut dr, &mut down_dec) => {
                 let mut frame = match client { Ok(v)=>v, Err(e)=>break Err(e) };
+                if frame.opcode == 0x0391
+                    && let Some((counter, client_time_ms)) = parse_time_sync_response(&frame.body)
+                {
+                    movement_clock.observe(client_time_ms);
+                    tracing::debug!(account=%account_name, counter, client_time_ms, "observed client movement time synchronization response");
+                }
                 if frame.opcode == 0x003D {
                     if let Some(bytes) = frame.body.get(0..8) {
                         let guid = EntityId(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])));
@@ -765,7 +771,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                     current.orientation = orientation;
                                     canonical_position = Some(current);
                                     canonical_flags = flags;
-                                    movement_time = client_time;
+                                    movement_clock.observe(client_time);
                                     let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition { position: current, moving: flags != 0, flags, client_time })).await;
                                 }
                             }
@@ -869,7 +875,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             movement_context.mover,
                             movement_context.position,
                             movement_context.flags,
-                            &mut movement_time,
+                            &mut movement_clock,
                         ) {
                             Ok(Some((frame, movement))) => {
                                 tracing::info!(account=%account_name, opcode=frame.opcode, "bot gameplay packet transmitted");
@@ -1134,7 +1140,7 @@ async fn run_headless_world_session(
     let mut controlled_mover = None;
     let mut controlled_position = None;
     let mut controlled_flags = 0_u32;
-    let mut movement_time = 1_u32;
+    let mut movement_clock = MovementClock::default();
     let mut bot_loot_target = None;
     let mut last_bot_cast: Option<(u32, Option<EntityId>, std::time::Instant)> = None;
     let mut char_enum_requested = false;
@@ -1182,7 +1188,7 @@ async fn run_headless_world_session(
                             movement_context.mover,
                             movement_context.position,
                             movement_context.flags,
-                            &mut movement_time,
+                            &mut movement_clock,
                         ) {
                             Ok(Some((frame, movement))) => {
                                 if let Some((spell, target)) = bot_targeted_cast(&command) {
@@ -1224,6 +1230,17 @@ async fn run_headless_world_session(
             server = server_rx.recv() => {
                 let frame = server.context("headless upstream reader ended")??;
                 let opcode = u32::from(frame.opcode);
+                if frame.opcode == SMSG_TIME_SYNC_REQ_OPCODE {
+                    let counter = parse_time_sync_request(&frame.body)
+                        .context("SMSG_TIME_SYNC_REQ is missing its u32 counter")?;
+                    let response = encode_time_sync_response(
+                        counter,
+                        movement_clock.current_timestamp(),
+                    );
+                    write_client_frame(&mut writer, &mut enc, &response).await?;
+                    tracing::debug!(account=%account.config.account_name, counter, "headless movement time synchronization response sent");
+                    continue;
+                }
                 if opcode == 0x01DD {
                     if let Some(sequence) = parse_headless_pong(&frame.body) {
                         if let Some((pending, sent_at)) = pending_ping.take().filter(|(pending, _)| *pending == sequence) {
@@ -1720,7 +1737,7 @@ mod quest_protocol_tests {
 
     #[test]
     fn encodes_gameobject_spell_with_gameobject_target() {
-        let mut time = 1;
+        let mut movement_clock = MovementClock::default();
         let (frame, movement) = encode_gameplay_command(
             GameplayCommand::CastGameObject {
                 spell: 6247,
@@ -1730,7 +1747,7 @@ mod quest_protocol_tests {
             None,
             None,
             0,
-            &mut time,
+            &mut movement_clock,
         )
         .unwrap()
         .unwrap();
@@ -1749,7 +1766,7 @@ mod quest_protocol_tests {
 
     #[test]
     fn face_direction_uses_wrath_set_facing_movement_opcode() {
-        let mut time = 10;
+        let mut movement_clock = MovementClock::default();
         let current = WorldPosition {
             map: 1,
             point: Vec3::new(1.0, 2.0, 3.0),
@@ -1762,7 +1779,7 @@ mod quest_protocol_tests {
             Some(EntityId(77)),
             Some(current),
             0,
-            &mut time,
+            &mut movement_clock,
         )
         .unwrap()
         .unwrap();
@@ -1859,7 +1876,7 @@ mod quest_protocol_tests {
 
     #[test]
     fn encodes_controlled_unit_spell_with_unit_target() {
-        let mut time = 1;
+        let mut movement_clock = MovementClock::default();
         let (frame, movement) = encode_gameplay_command(
             GameplayCommand::VehicleCast {
                 spell: 51858,
@@ -1868,7 +1885,7 @@ mod quest_protocol_tests {
             Some(EntityId(28511)),
             None,
             0,
-            &mut time,
+            &mut movement_clock,
         )
         .unwrap()
         .unwrap();
@@ -2101,28 +2118,33 @@ mod quest_protocol_tests {
 
     #[test]
     fn quest_encoder_matches_azerothcore_handlers() {
-        let mut time = 1;
-        let (query, _) =
-            encode_gameplay_command(GameplayCommand::QueryQuestGivers, None, None, 0, &mut time)
-                .unwrap()
-                .unwrap();
+        let mut movement_clock = MovementClock::default();
+        let (query, _) = encode_gameplay_command(
+            GameplayCommand::QueryQuestGivers,
+            None,
+            None,
+            0,
+            &mut movement_clock,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(query.opcode, 0x0417);
         assert!(query.body.is_empty());
 
-        let mut time = 1;
+        let mut movement_clock = MovementClock::default();
         let (hello, _) = encode_gameplay_command(
             GameplayCommand::Interact(EntityId(77)),
             None,
             None,
             0,
-            &mut time,
+            &mut movement_clock,
         )
         .unwrap()
         .unwrap();
         assert_eq!(hello.opcode, 0x0184);
         assert_eq!(hello.body, 77_u64.to_le_bytes());
 
-        let mut time = 1;
+        let mut movement_clock = MovementClock::default();
         let (accept, _) = encode_gameplay_command(
             GameplayCommand::AcceptQuest {
                 quest: 42,
@@ -2131,7 +2153,7 @@ mod quest_protocol_tests {
             None,
             None,
             0,
-            &mut time,
+            &mut movement_clock,
         )
         .unwrap()
         .unwrap();
@@ -2141,7 +2163,7 @@ mod quest_protocol_tests {
         assert_eq!(&accept.body[8..12], &42_u32.to_le_bytes());
         assert_eq!(&accept.body[12..16], &0_u32.to_le_bytes());
 
-        let mut time = 1;
+        let mut movement_clock = MovementClock::default();
         let (request_reward, _) = encode_gameplay_command(
             GameplayCommand::RequestQuestReward {
                 quest: 42,
@@ -2150,7 +2172,7 @@ mod quest_protocol_tests {
             None,
             None,
             0,
-            &mut time,
+            &mut movement_clock,
         )
         .unwrap()
         .unwrap();
@@ -2158,7 +2180,7 @@ mod quest_protocol_tests {
         assert_eq!(&request_reward.body[0..8], &77_u64.to_le_bytes());
         assert_eq!(&request_reward.body[8..12], &42_u32.to_le_bytes());
 
-        let mut time = 1;
+        let mut movement_clock = MovementClock::default();
         let (choose_reward, _) = encode_gameplay_command(
             GameplayCommand::ChooseQuestReward {
                 quest: 42,
@@ -2168,7 +2190,7 @@ mod quest_protocol_tests {
             None,
             None,
             0,
-            &mut time,
+            &mut movement_clock,
         )
         .unwrap()
         .unwrap();
