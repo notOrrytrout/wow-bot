@@ -1025,24 +1025,12 @@ pub(super) fn append_polygon_surface_segment(
     let tile = tiles
         .get(polygon.tile)
         .context("navigation corridor tile is unavailable")?;
-    let distance = (end.x - start.x).hypot(end.z - start.z);
-    let steps = (distance / sample_spacing.max(0.25)).ceil().max(1.0) as usize;
-    for step in 1..=steps {
-        let ratio = step as f32 / steps as f32;
-        let x = start.x + (end.x - start.x) * ratio;
-        let z = start.z + (end.z - start.z) * ratio;
+    append_sampled_surface_segment(start, end, sample_spacing, route, |point| {
         let y = tile
-            .surface_height(polygon.polygon, x, z)
+            .surface_height(polygon.polygon, point.x, point.z)
             .context("navigation corridor sample has no walkable surface")?;
-        let surface = DetourPoint { x, y, z };
-        if route.last().is_none_or(|last| {
-            (last.x - surface.x).hypot(last.z - surface.z) > 0.01
-                || (last.y - surface.y).abs() > 0.01
-        }) {
-            route.push(surface);
-        }
-    }
-    Ok(())
+        Ok(DetourPoint { y, ..point })
+    })
 }
 
 pub(super) fn surface_point_in_polygon(
@@ -1100,17 +1088,29 @@ pub(super) fn append_corridor_surface_segment(
     sample_spacing: f32,
     route: &mut Vec<DetourPoint>,
 ) -> Result<()> {
+    append_sampled_surface_segment(start, end, sample_spacing, route, |point| {
+        corridor_surface_at_point(tiles, corridor, point)
+            .context("funnel shortcut leaves the walkable navigation corridor")
+    })
+}
+
+fn append_sampled_surface_segment(
+    start: DetourPoint,
+    end: DetourPoint,
+    sample_spacing: f32,
+    route: &mut Vec<DetourPoint>,
+    surface_at: impl Fn(DetourPoint) -> Result<DetourPoint>,
+) -> Result<()> {
     let distance = (end.x - start.x).hypot(end.z - start.z);
     let steps = (distance / sample_spacing.max(0.25)).ceil().max(1.0) as usize;
     for step in 1..=steps {
         let ratio = step as f32 / steps as f32;
-        let raw = DetourPoint {
+        let point = DetourPoint {
             x: start.x + (end.x - start.x) * ratio,
             y: start.y + (end.y - start.y) * ratio,
             z: start.z + (end.z - start.z) * ratio,
         };
-        let surface = corridor_surface_at_point(tiles, corridor, raw)
-            .context("funnel shortcut leaves the walkable navigation corridor")?;
+        let surface = surface_at(point)?;
         if route.last().is_none_or(|last| {
             (last.x - surface.x).hypot(last.z - surface.z) > 0.01
                 || (last.y - surface.y).abs() > 0.01

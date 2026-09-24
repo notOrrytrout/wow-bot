@@ -73,6 +73,14 @@ struct CachedGraph {
     graph: std::sync::Arc<RouteGraph>,
 }
 
+struct LoadedTiles {
+    tiles: Vec<DetourTile>,
+    names: Vec<String>,
+    identities: Vec<(String, u64, Option<std::time::SystemTime>)>,
+    cache_hits: usize,
+    cache_misses: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NegativeRouteEndpointKey {
     bucket: [i32; 3],
@@ -151,7 +159,7 @@ impl NavigationData {
         map_id: u32,
         points: &[[f32; 3]],
     ) -> Vec<LocalSurfaceSample> {
-        let tiles = self.cached_sensor_tiles(map_id, points);
+        let tiles = self.sensor_tiles(map_id, points);
         points
             .iter()
             .map(|point| {
@@ -223,7 +231,7 @@ impl NavigationData {
             return Err(super::NavigationError::Cancelled.into());
         }
         let started = Instant::now();
-        let tiles = self.route_sensor_tiles(map_id, points);
+        let tiles = self.sensor_tiles(map_id, points);
         let mut surfaces = Vec::with_capacity(points.len());
         let mut previous = None::<super::surface::RouteSurface>;
         let mut complete = true;
@@ -297,7 +305,7 @@ impl NavigationData {
         if !point.iter().all(|value| value.is_finite()) {
             return None;
         }
-        let tiles = self.route_sensor_tiles(surface.identity.map_id, &[point]);
+        let tiles = self.sensor_tiles(surface.identity.map_id, &[point]);
         let grid = wow_grid(point[0], point[1]).ok()?;
         let tile = tiles.get(&grid)?.as_ref()?;
         if [tile.header.x, tile.header.y, tile.header.layer] != surface.identity.tile {
@@ -319,7 +327,7 @@ impl NavigationData {
         probes: &[super::surface::SurfaceProbe],
     ) -> Vec<super::surface::SurfaceObservation> {
         let points: Vec<_> = probes.iter().map(|probe| probe.point).collect();
-        let tiles = self.route_sensor_tiles(map_id, &points);
+        let tiles = self.sensor_tiles(map_id, &points);
         probes
             .iter()
             .map(|probe| {
@@ -339,21 +347,10 @@ impl NavigationData {
         map_id: u32,
         probes: &[super::surface::SurfaceProbe],
     ) -> Vec<super::surface::SurfaceObservation> {
-        let points: Vec<_> = probes.iter().map(|probe| probe.point).collect();
-        let tiles = self.cached_sensor_tiles(map_id, &points);
-        probes
-            .iter()
-            .map(|probe| {
-                let tile = wow_grid(probe.point[0], probe.point[1])
-                    .ok()
-                    .and_then(|grid| tiles.get(&grid))
-                    .and_then(Option::as_ref);
-                super::surface::observe_indexed_surface(map_id, tile, probe)
-            })
-            .collect()
+        self.surface_candidates(map_id, probes)
     }
 
-    fn route_sensor_tiles(
+    fn sensor_tiles(
         &self,
         map_id: u32,
         points: &[[f32; 3]],
@@ -374,35 +371,6 @@ impl NavigationData {
                 // cached. The mmap directory can be rebuilt while the bot is
                 // running; returning the old Arc here would keep stale
                 // geometry in route and vision queries.
-                let tile = self
-                    .load_cached_tile(&path)
-                    .ok()
-                    .and_then(|tile| tile.parsed().ok());
-                (grid, tile)
-            })
-            .collect()
-    }
-
-    fn cached_sensor_tiles(
-        &self,
-        map_id: u32,
-        points: &[[f32; 3]],
-    ) -> HashMap<(i32, i32), Option<Arc<super::surface::IndexedTile>>> {
-        let mut grids = HashSet::new();
-        for point in points {
-            if let Ok(grid) = wow_grid(point[0], point[1]) {
-                grids.insert(grid);
-            }
-        }
-        // Validate file identity on sensor-cache hits as well as route-cache
-        // hits. Parsing remains shared by CachedTile::parsed, so this adds a
-        // metadata check without repeating geometry work.
-        grids
-            .into_iter()
-            .map(|grid @ (x, y)| {
-                let path = self
-                    .mmaps_dir
-                    .join(format!("{map_id:03}{x:02}{y:02}.mmtile"));
                 let tile = self
                     .load_cached_tile(&path)
                     .ok()
@@ -509,6 +477,58 @@ impl NavigationData {
         Ok((tile, false))
     }
 
+    fn load_tile_window(
+        &self,
+        map_id: u32,
+        x: std::ops::RangeInclusive<i32>,
+        y: std::ops::RangeInclusive<i32>,
+        params: &NavMeshParams,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<LoadedTiles> {
+        let mut loaded = LoadedTiles {
+            tiles: Vec::new(),
+            names: Vec::new(),
+            identities: Vec::new(),
+            cache_hits: 0,
+            cache_misses: 0,
+        };
+        let mut coordinates = HashSet::new();
+        for grid_x in x {
+            for grid_y in y.clone() {
+                ensure_route_not_cancelled(cancelled)?;
+                // AzerothCore filenames use mapId + gridX + gridY.
+                let path = self
+                    .mmaps_dir
+                    .join(format!("{map_id:03}{grid_x:02}{grid_y:02}.mmtile"));
+                if !path.is_file() {
+                    continue;
+                }
+                let (cached, hit) = self.load_cached_tile_with_status(&path)?;
+                if hit {
+                    loaded.cache_hits = loaded.cache_hits.saturating_add(1);
+                } else {
+                    loaded.cache_misses = loaded.cache_misses.saturating_add(1);
+                }
+                let tile = cached.parsed()?.tile.clone();
+                validate_tile_coordinates(params, &tile)?;
+                if !coordinates.insert((tile.header.x, tile.header.y, tile.header.layer)) {
+                    bail!("movement-map tile coordinates are duplicated");
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<non-utf8>")
+                    .to_owned();
+                loaded
+                    .identities
+                    .push((name.clone(), cached.identity.0, cached.identity.1));
+                loaded.names.push(name);
+                loaded.tiles.push(tile);
+            }
+        }
+        Ok(loaded)
+    }
+
     pub fn route(
         &self,
         map_id: u32,
@@ -551,49 +571,15 @@ impl NavigationData {
         }
 
         let params = self.map_params(map_id)?;
-        let mut tiles = Vec::new();
-        let mut loaded_tile_names = Vec::new();
-        let mut loaded_tile_identity = Vec::new();
-        let mut tile_cache_hits = 0usize;
-        let mut tile_cache_misses = 0usize;
-        let mut detour_coordinates = HashSet::new();
-        for grid_x in min_x..=max_x {
-            for grid_y in min_y..=max_y {
-                ensure_route_not_cancelled(cancelled)?;
-                // AzerothCore mmap tile filenames use mapId + gridX + gridY.
-                // Keep this order aligned with wow_grid(); swapping the axes loads
-                // geographically distant tiles even though their Detour payloads parse.
-                let path = self
-                    .mmaps_dir
-                    .join(format!("{map_id:03}{grid_x:02}{grid_y:02}.mmtile"));
-                if !path.is_file() {
-                    continue;
-                }
-                let (cached_tile, tile_cache_hit) = self.load_cached_tile_with_status(&path)?;
-                if tile_cache_hit {
-                    tile_cache_hits = tile_cache_hits.saturating_add(1);
-                } else {
-                    tile_cache_misses = tile_cache_misses.saturating_add(1);
-                }
-                let tile = cached_tile.parsed()?.tile.clone();
-                validate_tile_coordinates(&params, &tile)?;
-                let tile_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("<non-utf8>")
-                    .to_owned();
-                loaded_tile_names.push(tile_name.clone());
-                loaded_tile_identity.push((
-                    tile_name,
-                    cached_tile.identity.0,
-                    cached_tile.identity.1,
-                ));
-                if !detour_coordinates.insert((tile.header.x, tile.header.y, tile.header.layer)) {
-                    bail!("movement-map tile coordinates are duplicated");
-                }
-                tiles.push(tile);
-            }
-        }
+        let loaded =
+            self.load_tile_window(map_id, min_x..=max_x, min_y..=max_y, &params, cancelled)?;
+        let LoadedTiles {
+            tiles,
+            names: loaded_tile_names,
+            identities: loaded_tile_identity,
+            cache_hits: tile_cache_hits,
+            cache_misses: tile_cache_misses,
+        } = loaded;
         if tiles.is_empty() {
             bail!("no movement-map tiles are available for the route");
         }
@@ -802,25 +788,15 @@ impl NavigationData {
         let probe = route_endpoint(point)?;
         let (grid_x, grid_y) = wow_grid(point.0, point.1)?;
         let params = self.map_params(map_id)?;
-        let mut tiles = Vec::new();
-        let mut coordinates = HashSet::new();
-        for x in grid_x.saturating_sub(1).max(0)..=grid_x.saturating_add(1).min(63) {
-            for y in grid_y.saturating_sub(1).max(0)..=grid_y.saturating_add(1).min(63) {
-                ensure_route_not_cancelled(cancelled)?;
-                let path = self
-                    .mmaps_dir
-                    .join(format!("{map_id:03}{x:02}{y:02}.mmtile"));
-                if !path.is_file() {
-                    continue;
-                }
-                let tile = self.load_cached_tile(&path)?.parsed()?.tile.clone();
-                validate_tile_coordinates(&params, &tile)?;
-                if !coordinates.insert((tile.header.x, tile.header.y, tile.header.layer)) {
-                    bail!("movement-map tile coordinates are duplicated");
-                }
-                tiles.push(tile);
-            }
-        }
+        let tiles = self
+            .load_tile_window(
+                map_id,
+                grid_x.saturating_sub(1).max(0)..=grid_x.saturating_add(1).min(63),
+                grid_y.saturating_sub(1).max(0)..=grid_y.saturating_add(1).min(63),
+                &params,
+                cancelled,
+            )?
+            .tiles;
         if tiles.is_empty() {
             bail!("no movement-map tiles are available near the requested position");
         }
