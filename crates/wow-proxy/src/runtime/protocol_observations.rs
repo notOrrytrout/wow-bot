@@ -105,6 +105,29 @@ mod tests {
             Some(ProtocolObservation::CastUpdated { ends_at_ms: 0, .. })
         ));
     }
+
+    #[test]
+    fn single_and_multiple_quest_statuses_share_the_record_layout() {
+        let mut entry = 77_u64.to_le_bytes().to_vec();
+        entry.push(3);
+        assert!(matches!(
+            parse_single_quest_status(&entry),
+            Some(ProtocolObservation::QuestGiverStatus {
+                giver: EntityId(77),
+                status: 3
+            })
+        ));
+        let mut multiple = 1_u32.to_le_bytes().to_vec();
+        multiple.extend_from_slice(&entry);
+        assert!(matches!(
+            parse_multiple_quest_status(&multiple).as_slice(),
+            [ProtocolObservation::QuestGiverStatus {
+                giver: EntityId(77),
+                status: 3
+            }]
+        ));
+        assert!(parse_single_quest_status(&entry[..8]).is_none());
+    }
 }
 
 pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation> {
@@ -402,7 +425,7 @@ pub(super) fn controlled_abilities_observation(
     if opcode != SMSG_PET_SPELLS || body.len() < 58 {
         return None;
     }
-    let mover = EntityId(u64::from_le_bytes(body.get(0..8)?.try_into().ok()?));
+    let mover = read_guid(body, 0)?;
     if mover.0 == 0 {
         return None;
     }
@@ -440,9 +463,7 @@ pub(super) fn quest_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObserv
 }
 
 pub(super) fn parse_single_quest_status(body: &[u8]) -> Option<ProtocolObservation> {
-    let giver = EntityId(u64::from_le_bytes(body.get(0..8)?.try_into().ok()?));
-    let status = *body.get(8)?;
-    Some(ProtocolObservation::QuestGiverStatus { giver, status })
+    parse_quest_status_entry(body, 0)
 }
 
 pub(super) fn parse_multiple_quest_status(body: &[u8]) -> Vec<ProtocolObservation> {
@@ -456,24 +477,19 @@ pub(super) fn parse_multiple_quest_status(body: &[u8]) -> Vec<ProtocolObservatio
     let mut out = Vec::with_capacity(count);
     let mut offset = 4;
     for _ in 0..count {
-        let Some(guid_bytes) = body.get(offset..offset + 8) else {
-            break;
+        let Some(observation) = parse_quest_status_entry(body, offset) else {
+            return Vec::new();
         };
-        let giver = EntityId(u64::from_le_bytes(guid_bytes.try_into().unwrap_or([0; 8])));
-        let Some(status) = body.get(offset + 8).copied() else {
-            break;
-        };
-        out.push(ProtocolObservation::QuestGiverStatus { giver, status });
+        out.push(observation);
         offset += 9;
     }
     out
 }
 
 pub(super) fn parse_quest_list(body: &[u8]) -> Vec<ProtocolObservation> {
-    let Some(guid_bytes) = body.get(0..8) else {
+    let Some(giver) = read_guid(body, 0) else {
         return Vec::new();
     };
-    let giver = EntityId(u64::from_le_bytes(guid_bytes.try_into().unwrap_or([0; 8])));
     let mut offset = 8;
     if read_cstring(body, &mut offset).is_none() {
         return Vec::new();
@@ -516,7 +532,7 @@ pub(super) fn parse_quest_list(body: &[u8]) -> Vec<ProtocolObservation> {
 
 pub(super) fn parse_quest_request_items(body: &[u8]) -> Option<ProtocolObservation> {
     use wow_state::quests::{QuestTurnInDialog, QuestTurnInStage};
-    let giver = EntityId(u64::from_le_bytes(body.get(0..8)?.try_into().ok()?));
+    let giver = read_guid(body, 0)?;
     let quest = u32::from_le_bytes(body.get(8..12)?.try_into().ok()?);
     if body.len() < 28 {
         return None;
@@ -539,7 +555,7 @@ pub(super) fn parse_quest_request_items(body: &[u8]) -> Option<ProtocolObservati
 
 pub(super) fn parse_quest_offer_reward(body: &[u8]) -> Option<ProtocolObservation> {
     use wow_state::quests::{QuestTurnInDialog, QuestTurnInStage};
-    let giver = EntityId(u64::from_le_bytes(body.get(0..8)?.try_into().ok()?));
+    let giver = read_guid(body, 0)?;
     let quest = u32::from_le_bytes(body.get(8..12)?.try_into().ok()?);
     let mut offset = 12usize;
     let _title = read_cstring(body, &mut offset)?;
@@ -654,4 +670,17 @@ pub(super) fn read_cstring<'a>(body: &'a [u8], offset: &mut usize) -> Option<&'a
     let text = std::str::from_utf8(rest.get(..end)?).ok()?;
     *offset += end + 1;
     Some(text)
+}
+
+fn read_guid(body: &[u8], offset: usize) -> Option<EntityId> {
+    let end = offset.checked_add(8)?;
+    Some(EntityId(u64::from_le_bytes(
+        body.get(offset..end)?.try_into().ok()?,
+    )))
+}
+
+fn parse_quest_status_entry(body: &[u8], offset: usize) -> Option<ProtocolObservation> {
+    let giver = read_guid(body, offset)?;
+    let status = *body.get(offset.checked_add(8)?)?;
+    Some(ProtocolObservation::QuestGiverStatus { giver, status })
 }
