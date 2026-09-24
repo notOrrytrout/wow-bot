@@ -1145,6 +1145,7 @@ async fn run_headless_world_session(
     let mut last_bot_cast: Option<(u32, Option<EntityId>, std::time::Instant)> = None;
     let mut char_enum_requested = false;
     let mut player_login_requested = false;
+    let mut world_transfer_pending = false;
     let (server_tx, mut server_rx) = mpsc::channel(8);
     let _server_reader = AbortOnDrop(tokio::spawn(async move {
         loop {
@@ -1175,6 +1176,12 @@ async fn run_headless_world_session(
             command = commands.recv() => {
                 match command {
                     Ok(command) => {
+                        if world_transfer_pending
+                            && matches!(command, GameplayCommand::MoveTo(_) | GameplayCommand::FaceDirection { .. } | GameplayCommand::StopMovement)
+                        {
+                            tracing::debug!(account=%account.config.account_name, ?command, "discarded locomotion command during world transfer");
+                            continue;
+                        }
                         let movement_context = gameplay_movement_context(
                             controlled_mover,
                             controlled_position,
@@ -1230,6 +1237,10 @@ async fn run_headless_world_session(
             server = server_rx.recv() => {
                 let frame = server.context("headless upstream reader ended")??;
                 let opcode = u32::from(frame.opcode);
+                if opcode == 0x003F {
+                    world_transfer_pending = true;
+                    tracing::info!(account=%account.config.account_name, "headless world transfer started");
+                }
                 if frame.opcode == SMSG_TIME_SYNC_REQ_OPCODE {
                     let counter = parse_time_sync_request(&frame.body)
                         .context("SMSG_TIME_SYNC_REQ is missing its u32 counter")?;
@@ -1240,6 +1251,42 @@ async fn run_headless_world_session(
                     write_client_frame(&mut writer, &mut enc, &response).await?;
                     tracing::debug!(account=%account.config.account_name, counter, "headless movement time synchronization response sent");
                     continue;
+                }
+                if opcode == 0x00C7
+                    && let Some((mover, flags, point, orientation)) = parse_server_near_teleport(&frame.body)
+                    && (player_guid == Some(mover) || controlled_mover == Some(mover))
+                {
+                    let mut body = Vec::with_capacity(17);
+                    push_packed_guid(&mut body, mover);
+                    body.extend_from_slice(&flags.to_le_bytes());
+                    body.extend_from_slice(&movement_clock.next_timestamp().to_le_bytes());
+                    write_client_frame(&mut writer, &mut enc, &ClientFrame {
+                        opcode: 0x00C7,
+                        body,
+                    }).await?;
+                    if let Some(mut position) = canonical_position.or(controlled_position) {
+                        position.point = point;
+                        position.orientation = orientation;
+                        if player_guid == Some(mover) {
+                            canonical_position = Some(position);
+                            canonical_flags = flags;
+                            let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition {
+                                position,
+                                moving: flags != 0,
+                                flags,
+                                client_time: movement_clock.current_timestamp(),
+                            })).await;
+                        } else if controlled_mover == Some(mover) {
+                            controlled_position = Some(position);
+                            controlled_flags = flags;
+                            let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::ControlledMover {
+                                mover: Some(mover),
+                                position: Some(position),
+                                flags,
+                            })).await;
+                        }
+                    }
+                    tracing::info!(account=%account.config.account_name, ?mover, "headless near teleport acknowledged");
                 }
                 if opcode == 0x01DD {
                     if let Some(sequence) = parse_headless_pong(&frame.body) {
@@ -1298,6 +1345,33 @@ async fn run_headless_world_session(
                     {
                         let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::CastFailed { spell, reason, target })).await;
                     }
+                }
+                if opcode == 0x003E {
+                    if let Some(guid) = player_guid
+                        && let Some(ProtocolObservation::EnteredWorld { position: Some(position), .. }) = login_verify_world(&frame.body, guid.0)
+                    {
+                        canonical_position = Some(position);
+                        canonical_flags = 0;
+                        controlled_mover = None;
+                        controlled_position = None;
+                        controlled_flags = 0;
+                        object_observer.set_world(position.map, Some(guid));
+                        let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::EnteredWorld {
+                            character_guid: guid.0,
+                            position: Some(position),
+                        })).await;
+                    }
+                    // Keep movement_clock alive across the transfer. The
+                    // server's clockDelta still maps this client clock to its
+                    // clock for the lifetime of this world session.
+                    // MSG_MOVE_WORLDPORT_ACK has an empty body. The server holds
+                    // a far teleport open until this packet arrives.
+                    write_client_frame(&mut writer, &mut enc, &ClientFrame {
+                        opcode: 0x00DC,
+                        body: Vec::new(),
+                    }).await?;
+                    world_transfer_pending = false;
+                    tracing::info!(account=%account.config.account_name, opcode, "headless world transfer acknowledged");
                 }
                 if opcode == 0x0236 {
                     if let Some(guid) = player_guid {

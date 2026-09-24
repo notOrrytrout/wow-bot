@@ -51,7 +51,7 @@ impl MovementClock {
         }
     }
 
-    fn next_timestamp(&mut self) -> u32 {
+    pub(super) fn next_timestamp(&mut self) -> u32 {
         let current = self.current_timestamp();
         let next = match self.last_generated {
             Some(last) if !timestamp_is_after(current, last) => last.wrapping_add(1),
@@ -60,6 +60,37 @@ impl MovementClock {
         self.last_generated = Some(next);
         next
     }
+}
+
+pub(super) fn parse_server_near_teleport(
+    body: &[u8],
+) -> Option<(EntityId, u32, Vec3, f32)> {
+    let (&mask, mut rest) = body.split_first()?;
+    let mut guid = 0_u64;
+    for index in 0..8 {
+        if mask & (1 << index) != 0 {
+            let (&byte, tail) = rest.split_first()?;
+            rest = tail;
+            guid |= u64::from(byte) << (index * 8);
+        }
+    }
+    if guid == 0 {
+        return None;
+    }
+
+    // Server near-teleport requests contain packed mover GUID, order counter,
+    // then MovementInfo. The client ACK contains the GUID, flags, and its own
+    // movement timestamp.
+    let movement = rest.get(4..)?;
+    let flags = u32::from_le_bytes(movement.get(..4)?.try_into().ok()?);
+    let position = movement.get(10..26)?;
+    let x = f32::from_le_bytes(position.get(..4)?.try_into().ok()?);
+    let y = f32::from_le_bytes(position.get(4..8)?.try_into().ok()?);
+    let z = f32::from_le_bytes(position.get(8..12)?.try_into().ok()?);
+    let orientation = f32::from_le_bytes(position.get(12..16)?.try_into().ok()?);
+    let point = Vec3::new(x, y, z);
+    (point.is_finite() && orientation.is_finite())
+        .then_some((EntityId(guid), flags, point, orientation))
 }
 
 fn timestamp_is_after(candidate: u32, previous: u32) -> bool {
