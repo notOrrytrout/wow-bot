@@ -552,6 +552,10 @@ impl LaneEngine {
                 }
             }
             MissionIntent::Grind { creature } => self.tick_grind(&creature).await,
+            MissionIntent::Battleground { battleground } => {
+                self.tick_battleground(battleground.as_deref()).await
+            }
+            MissionIntent::Goal { text } => self.tick_goal(&text).await,
             MissionIntent::Party { .. } | MissionIntent::Raid { .. } => {
                 self.tick_group_encounter().await
             }
@@ -699,6 +703,36 @@ impl LaneEngine {
         }
         self.waiting(format!("waiting for an observed {creature} target"));
         true
+    }
+
+    async fn tick_battleground(&mut self, battleground: Option<&str>) -> bool {
+        // The current protocol projection does not include authoritative queue,
+        // invite, battleground status, or objective state. Do not infer an invite
+        // from chat text or interact with an unclassified game object.
+        let label = battleground.unwrap_or("any battleground");
+        self.waiting(format!(
+            "battleground mission for {label:?} is waiting for authoritative queue, invite, or objective state"
+        ));
+        true
+    }
+
+    async fn tick_goal(&mut self, text: &str) -> bool {
+        if self.state.authoritative.quests.active.is_empty() {
+            self.waiting(format!(
+                "Goal mission {text:?} is waiting for grounded supported work; no active quest state is available"
+            ));
+            return true;
+        }
+        if !self.state.authoritative.quests.offers.is_empty() {
+            self.waiting(format!(
+                "Goal mission {text:?} is waiting because quest offers are outside its grounded active work"
+            ));
+            return true;
+        }
+        // Goal work can safely reuse the supported quest task flow while an
+        // authoritative quest is active. Free-form Goal text alone cannot name
+        // a target or authorize an action.
+        self.tick_quest().await
     }
 
     async fn tick_group_encounter(&mut self) -> bool {
@@ -2902,6 +2936,93 @@ mod tests {
         assert_eq!(action.command(), &GameplayCommand::Gather(EntityId(31)));
         assert!(engine.tick_mission().await);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn battleground_mission_defers_without_authoritative_lifecycle_or_objective_state() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        let mission = Mission {
+            id: MissionId(4),
+            intent: MissionIntent::Battleground {
+                battleground: Some("Warsong Gulch".into()),
+            },
+            permissions: PermissionSet::MOVE | PermissionSet::COMBAT,
+        };
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+
+        assert!(engine.tick_mission().await);
+        assert!(engine.last_wait_reason.as_deref().is_some_and(|reason| {
+            reason.contains("authoritative queue, invite, or objective state")
+        }));
+        assert!(proxy.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn goal_mission_dispatches_grounded_active_quest_work_through_shared_validator() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.quests.active.insert(
+            42,
+            wow_state::quests::QuestProgress {
+                complete: false,
+                objectives: vec![0],
+            },
+        );
+        let mission = Mission::goal(MissionId(5), "complete my active objective");
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = proxy.recv().await.unwrap() else {
+            panic!("expected shared quest action")
+        };
+        assert_eq!(action.command(), &GameplayCommand::QueryQuest { quest: 42 });
+        assert_eq!(action.origin(), PlanOrigin::SystemPolicy);
+    }
+
+    #[tokio::test]
+    async fn goal_mission_does_not_treat_free_form_text_as_action_authority() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        let (mut engine, mut proxy) = test_engine(
+            Mission::goal(MissionId(6), "attack a nearby stranger"),
+            authoritative,
+        );
+
+        assert!(engine.tick_mission().await);
+        assert!(
+            engine
+                .last_wait_reason
+                .as_deref()
+                .is_some_and(|reason| { reason.contains("waiting for grounded supported work") })
+        );
+        assert!(proxy.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn goal_quest_work_remains_blocked_when_mission_lacks_quest_permission() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.quests.active.insert(
+            42,
+            wow_state::quests::QuestProgress {
+                complete: false,
+                objectives: vec![0],
+            },
+        );
+        let mission = Mission {
+            id: MissionId(7),
+            intent: MissionIntent::Goal {
+                text: "complete my active objective".into(),
+            },
+            permissions: PermissionSet::MOVE,
+        };
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+
+        assert!(engine.tick_mission().await);
+        assert_eq!(engine.last_dispatch, DispatchOutcome::Rejected);
+        assert!(proxy.try_recv().is_err());
     }
 
     #[test]
