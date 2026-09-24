@@ -84,6 +84,16 @@ enum PendingQuestAction {
     },
 }
 
+impl PendingQuestAction {
+    fn combat(target: EntityId, cycle: Duration) -> Self {
+        Self::Combat {
+            target,
+            started: Instant::now(),
+            cycle,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchOutcome {
     Sent,
@@ -1808,11 +1818,7 @@ impl LaneEngine {
                         spell,
                         target: Some(target),
                     },
-                    PendingQuestAction::Combat {
-                        target,
-                        started: Instant::now(),
-                        cycle: Duration::from_secs(3),
-                    },
+                    PendingQuestAction::combat(target, Duration::from_secs(3)),
                 )
                 .await
             }
@@ -1823,11 +1829,7 @@ impl LaneEngine {
                         spell: 5019,
                         target: Some(target),
                     },
-                    PendingQuestAction::Combat {
-                        target,
-                        started: Instant::now(),
-                        cycle: Duration::from_secs(12),
-                    },
+                    PendingQuestAction::combat(target, Duration::from_secs(12)),
                 )
                 .await
             }
@@ -1835,11 +1837,7 @@ impl LaneEngine {
                 tracing::info!(lane=?self.state.lane, ?target, "shared combat selector chose melee fallback");
                 self.dispatch_quest_semantic(
                     GameplayCommand::Attack(target),
-                    PendingQuestAction::Combat {
-                        target,
-                        started: Instant::now(),
-                        cycle: Duration::from_secs(12),
-                    },
+                    PendingQuestAction::combat(target, Duration::from_secs(12)),
                 )
                 .await
             }
@@ -1856,11 +1854,9 @@ impl LaneEngine {
         work: &QuestWorkKey,
     ) -> bool {
         let pending = match command.clone() {
-            GameplayCommand::Attack(target) => Some(PendingQuestAction::Combat {
-                target,
-                started: Instant::now(),
-                cycle: Duration::from_secs(12),
-            }),
+            GameplayCommand::Attack(target) => {
+                Some(PendingQuestAction::combat(target, Duration::from_secs(12)))
+            }
             GameplayCommand::Cast {
                 target: Some(target),
                 ..
@@ -1869,11 +1865,7 @@ impl LaneEngine {
                 QuestWorkKey::CombatObjective { .. } | QuestWorkKey::CollectItem { .. }
             ) =>
             {
-                Some(PendingQuestAction::Combat {
-                    target,
-                    started: Instant::now(),
-                    cycle: Duration::from_secs(3),
-                })
+                Some(PendingQuestAction::combat(target, Duration::from_secs(3)))
             }
             GameplayCommand::Loot(target) => {
                 let item = match work {
