@@ -103,6 +103,9 @@ pub fn decide_next(
             reason: "player_moving",
         };
     }
+    if let Some(pet_decision) = hunter_pet_care(snapshot, class_id, player, retry_after, now) {
+        return pet_decision;
+    }
     let player_position = snapshot
         .state
         .entities
@@ -147,6 +150,48 @@ pub fn decide_next(
         }
     }
     MaintenanceDecision::Satisfied
+}
+
+/// Restore a hunter's confirmed missing or dead pet before ordinary buffs.
+/// Unknown control state and an unobserved pet entity remain fail-closed.
+fn hunter_pet_care(
+    snapshot: &Snapshot,
+    class_id: u8,
+    player: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    if class_id != 3 || !snapshot.state.pet.control_known {
+        return None;
+    }
+    let (spell, family) = match snapshot.state.pet.guid {
+        None => (883, "call_pet"),
+        Some(pet) => {
+            let entity = snapshot.state.entities.0.get(&pet)?;
+            if !entity.is_dead() {
+                return None;
+            }
+            (982, "revive_pet")
+        }
+    };
+    if retry_after
+        .get(&(spell, player))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    crate::combat::readiness::check_spell_readiness(
+        snapshot,
+        spell,
+        Some(player),
+        Millis::wall_clock_now().0,
+    )
+    .ok()?;
+    Some(MaintenanceDecision::Cast {
+        family: family.into(),
+        spell,
+        target: player,
+    })
 }
 
 fn cast_decision(
@@ -266,6 +311,91 @@ mod tests {
                 aura_state: Some(0),
                 ..Default::default()
             },
+        );
+    }
+
+    fn hunter_state() -> AuthoritativeState {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(3);
+        state.capabilities.spells.extend([883, 982]);
+        authoritative_caster(&mut state, EntityId(7));
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+        state.pet.control_known = true;
+        state
+    }
+
+    #[test]
+    fn pet_care_fails_closed_for_unknown_or_unobserved_pet_state() {
+        let mut state = hunter_state();
+        state.pet.control_known = false;
+        assert!(
+            hunter_pet_care(
+                &Snapshot::from_state(&state),
+                3,
+                EntityId(7),
+                &BTreeMap::new(),
+                Instant::now()
+            )
+            .is_none()
+        );
+        state.pet.control_known = true;
+        state.pet.guid = Some(EntityId(9));
+        assert!(
+            hunter_pet_care(
+                &Snapshot::from_state(&state),
+                3,
+                EntityId(7),
+                &BTreeMap::new(),
+                Instant::now()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pet_care_calls_a_confirmed_absent_pet_and_revives_a_confirmed_dead_pet() {
+        let mut state = hunter_state();
+        let now = Instant::now();
+        assert!(matches!(
+            hunter_pet_care(
+                &Snapshot::from_state(&state),
+                3,
+                EntityId(7),
+                &BTreeMap::new(),
+                now
+            ),
+            Some(MaintenanceDecision::Cast { spell: 883, .. })
+        ));
+        let mut dead = EntityState {
+            id: EntityId(9),
+            health: Some((0, 100)),
+            ..Default::default()
+        };
+        dead.mark_dead();
+        state.pet.guid = Some(EntityId(9));
+        state.entities.0.insert(EntityId(9), dead);
+        assert!(matches!(
+            hunter_pet_care(
+                &Snapshot::from_state(&state),
+                3,
+                EntityId(7),
+                &BTreeMap::new(),
+                now
+            ),
+            Some(MaintenanceDecision::Cast { spell: 982, .. })
+        ));
+        state.entities.0.get_mut(&EntityId(9)).unwrap().health = Some((50, 100));
+        assert!(
+            hunter_pet_care(
+                &Snapshot::from_state(&state),
+                3,
+                EntityId(7),
+                &BTreeMap::new(),
+                now
+            )
+            .is_none()
         );
     }
 
