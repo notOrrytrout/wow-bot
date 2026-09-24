@@ -60,6 +60,8 @@ pub struct InventoryState {
     pub instances: BTreeMap<EntityId, InventoryItemInstance>,
     pub free_slots: u16,
     pub equipped_ranged_item: Option<u32>,
+    pub equipped_items: BTreeMap<u8, u32>,
+    pub equipment_slots_authoritative: bool,
     pub equipment_authoritative: bool,
     pub money: u64,
     pub loot_generation: u64,

@@ -30,6 +30,20 @@ pub fn object_to_entity(
         .as_unit()
         .and_then(|unit| unit.power_type())
         .map(u8::from);
+    let level = object.as_unit().and_then(|unit| unit.level());
+    let base_health =
+        unit_integer(object, UnitField::BaseHealth).and_then(|value| u32::try_from(value).ok());
+    let base_mana =
+        unit_integer(object, UnitField::BaseMana).and_then(|value| u32::try_from(value).ok());
+    let power_cost_modifiers = unit_integer_array(object, UnitField::PowerCostModifier);
+    let power_cost_multipliers = unit_float_array(object, UnitField::PowerCostMultiplier);
+    let base_attack_time_ms = unit_unsigned_array::<2>(object, UnitField::BaseAttackTime);
+    let shapeshift_form = match object.unit_fields.get(&UnitField::Bytes2) {
+        Some(FieldValue::Bytes(value)) => Some((value >> 24) as u8),
+        _ => None,
+    };
+    let aura_state =
+        unit_integer(object, UnitField::AuraState).and_then(|value| u32::try_from(value).ok());
     let target = match object.unit_fields.get(&UnitField::Target) {
         Some(FieldValue::Long(value)) if *value != 0 => Some(EntityId(*value)),
         _ => None,
@@ -62,10 +76,64 @@ pub fn object_to_entity(
         health,
         power,
         power_type,
+        level,
+        base_health,
+        base_mana,
+        power_cost_modifiers,
+        power_cost_multipliers,
+        base_attack_time_ms,
+        shapeshift_form,
+        aura_state,
         target,
         hostile: false,
         interactable,
     }
+}
+
+fn unit_integer(object: &Object, field: UnitField) -> Option<i32> {
+    match object.unit_fields.get(&field) {
+        Some(FieldValue::Integer(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn unit_integer_array(object: &Object, field: UnitField) -> Option<[i32; 7]> {
+    let Some(FieldValue::IntegerArray(values)) = object.unit_fields.get(&field) else {
+        return None;
+    };
+    values
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()
+}
+
+fn unit_float_array(object: &Object, field: UnitField) -> Option<[f32; 7]> {
+    let Some(FieldValue::FloatArray(values)) = object.unit_fields.get(&field) else {
+        return None;
+    };
+    values
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()
+}
+
+fn unit_unsigned_array<const N: usize>(object: &Object, field: UnitField) -> Option<[u32; N]> {
+    let Some(FieldValue::IntegerArray(values)) = object.unit_fields.get(&field) else {
+        return None;
+    };
+    values
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .map(|value| u32::try_from(value).ok())
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()
 }
 
 pub fn upsert_object(

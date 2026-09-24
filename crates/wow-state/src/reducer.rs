@@ -148,6 +148,11 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.inventory.equipment_authoritative = true;
             delta.changed.push("inventory".into());
         }
+        ProtocolObservation::EquippedItems { items } => {
+            state.inventory.equipment_slots_authoritative = items.is_some();
+            state.inventory.equipped_items = items.unwrap_or_default();
+            delta.changed.push("inventory".into());
+        }
         ProtocolObservation::Money { copper } => {
             state.inventory.money = copper;
             delta.changed.push("inventory".into());
@@ -263,6 +268,30 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 .capabilities
                 .spell_cooldowns
                 .insert(spell, ready_at_ms);
+            delta.changed.push("capabilities".into());
+        }
+        ProtocolObservation::SpellGlobalCooldown {
+            spell,
+            started_at_ms,
+        } => {
+            state.capabilities.global_cooldown_spell = Some(spell);
+            state.capabilities.global_cooldown_started_at_ms = Some(started_at_ms);
+            delta.changed.push("capabilities".into());
+        }
+        ProtocolObservation::PlayerRunes { runes } => {
+            state.capabilities.runes = runes;
+            delta.changed.push("capabilities".into());
+        }
+        ProtocolObservation::ComboPoints { target, points } => {
+            match (target, points) {
+                (Some(target), Some(points)) => {
+                    state.capabilities.combo_points.insert(target, points);
+                }
+                (Some(target), None) => {
+                    state.capabilities.combo_points.remove(&target);
+                }
+                (None, _) => state.capabilities.combo_points.clear(),
+            }
             delta.changed.push("capabilities".into());
         }
         ProtocolObservation::PlayerClass { class_id } => {

@@ -141,8 +141,9 @@ pub fn validate_response(
 mod tests {
     use super::*;
     use wow_domain::{
-        ControllerResponse, EntityId, GroundedChoice, MissionId, MissionIntent, MissionRevision,
-        OwnershipGeneration, PermissionRevision, PlanOrigin, StateRevision, WorkerGeneration,
+        ControllerResponse, EntityId, GameplayCommand, GroundedChoice, MissionId, MissionIntent,
+        MissionRevision, OwnershipGeneration, PermissionRevision, PlanOrigin, StateRevision,
+        WorkerGeneration,
     };
     use wow_state::{
         AuthoritativeState,

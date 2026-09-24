@@ -185,8 +185,18 @@ fn readiness_reason(reason: crate::combat::readiness::SpellUnavailableReason) ->
     use crate::combat::readiness::SpellUnavailableReason::*;
     match reason {
         Unknown => "spell_unknown",
+        UnknownMetadata => "spell_metadata_unknown",
+        UnknownState => "required_state_unknown",
+        WrongClass => "spell_wrong_class",
         Cooldown => "spell_cooldown",
+        GlobalCooldown => "global_cooldown",
         InsufficientPower => "insufficient_power",
+        InsufficientRunes => "insufficient_runes",
+        MissingComboPoints => "missing_combo_points",
+        MissingReagent => "missing_reagent",
+        MissingEquipment => "missing_equipment",
+        RequirementNotMet => "spell_requirement_not_met",
+        UnsupportedRequirement => "spell_requirement_unsupported",
         TargetNotAuthoritative => "target_not_authoritative",
         NotInWorld => "not_in_world",
     }
@@ -241,7 +251,27 @@ fn party_member_nearby(snapshot: &Snapshot, player: EntityId, member: EntityId) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wow_state::{AuthoritativeState, Snapshot, auras::AuraInstance};
+    use wow_state::{AuthoritativeState, Snapshot, auras::AuraInstance, entities::EntityState};
+
+    fn authoritative_caster(state: &mut AuthoritativeState, entity: EntityId) {
+        state.entities.0.insert(
+            entity,
+            EntityState {
+                id: entity,
+                power_type: Some(0),
+                power: Some((10_000, 10_000)),
+                health: Some((10_000, 10_000)),
+                base_health: Some(10_000),
+                base_mana: Some(10_000),
+                power_cost_modifiers: Some([0; 7]),
+                power_cost_multipliers: Some([0.0; 7]),
+                shapeshift_form: Some(0),
+                aura_state: Some(0),
+                ..Default::default()
+            },
+        );
+    }
+
     #[test]
     fn mage_chooses_highest_known_intellect_and_stops_when_family_present() {
         let mut state = AuthoritativeState::default();
@@ -249,6 +279,7 @@ mod tests {
         state.session.character_guid = Some(7);
         state.capabilities.class_id = Some(8);
         state.capabilities.spells.extend([1459, 1460, 42995]);
+        authoritative_caster(&mut state, EntityId(7));
         state.auras.by_entity.entry(EntityId(7)).or_default();
         let snap = Snapshot::from_state(&state);
         let now = Instant::now();
@@ -330,6 +361,7 @@ mod tests {
         state.session.character_guid = Some(7);
         state.capabilities.class_id = Some(9);
         state.capabilities.spells.insert(687);
+        authoritative_caster(&mut state, EntityId(7));
         state.auras.by_entity.entry(EntityId(7)).or_default();
         assert_eq!(
             decide_next(

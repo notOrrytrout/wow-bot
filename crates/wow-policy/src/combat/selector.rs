@@ -16,14 +16,7 @@ struct ClassPolicy {
 
 #[derive(Clone, Debug, Deserialize)]
 struct TreePolicy {
-    power_policies: BTreeMap<u8, Vec<SpellFamily>>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct SpellFamily {
-    #[serde(rename = "name")]
-    _name: String,
-    spells: Vec<u32>,
+    power_policies: BTreeMap<u8, Vec<u32>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -39,7 +32,7 @@ fn combat_catalog() -> &'static CombatCatalog {
         let catalog: CombatCatalog =
             serde_json::from_str(include_str!("../../data/combat-priorities.json"))
                 .expect("combat priority catalog");
-        assert_eq!(catalog.format_version, 1);
+        assert_eq!(catalog.format_version, 2);
         catalog
     })
 }
@@ -91,13 +84,13 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
         return CombatDecision::Melee { target };
     }
 
-    for family in priorities {
-        let Some(spell) = family
-            .spells
-            .iter()
-            .find(|spell| snapshot.state.capabilities.spells.contains(spell))
-            .copied()
-        else {
+    for family_id in priorities {
+        let Some(spell) = crate::combat::spells::family_spells(*family_id).and_then(|spells| {
+            spells
+                .iter()
+                .find(|spell| snapshot.state.capabilities.spells.contains(spell))
+                .copied()
+        }) else {
             continue;
         };
         if crate::combat::readiness::check_spell_readiness(
@@ -158,7 +151,8 @@ pub fn supported_class_trees() -> impl Iterator<Item = (u8, u8, Vec<(u8, u32)>)>
                     .filter_map(|(&power_type, priorities)| {
                         priorities
                             .first()
-                            .and_then(|family| family.spells.first())
+                            .and_then(|family_id| crate::combat::spells::family_spells(*family_id))
+                            .and_then(|spells| spells.first())
                             .map(|spell| (power_type, *spell))
                     })
                     .collect();
@@ -226,6 +220,13 @@ mod tests {
                 id: EntityId(1),
                 power_type: Some(power_type),
                 power: Some((power, 100)),
+                health: Some((100, 100)),
+                base_health: Some(100),
+                base_mana: Some(100),
+                power_cost_modifiers: Some([0; 7]),
+                power_cost_multipliers: Some([0.0; 7]),
+                shapeshift_form: Some(0),
+                aura_state: Some(0),
                 ..Default::default()
             },
         );
@@ -240,19 +241,58 @@ mod tests {
     }
 
     #[test]
-    fn every_wotlk_class_and_tree_has_a_grounded_ready_priority() {
+    fn every_wotlk_class_and_tree_has_a_grounded_priority() {
         let entries: Vec<_> = supported_class_trees().collect();
         assert_eq!(entries.len(), 30);
         for (class_id, tree, profiles) in entries {
             for (power_type, spell) in profiles {
                 let target = EntityId(9);
-                let mut state = state(class_id, tree, power_type, 100, target);
+                let mut state = state(class_id, tree, power_type, 1000, target);
                 state.capabilities.spells.insert(spell);
-                assert_eq!(
-                    select(&Snapshot::from_state(&state), target),
-                    CombatDecision::Cast { spell, target },
-                    "class={class_id}, tree={tree}, power={power_type}"
+                if let Some(requirement) = crate::combat::spells::metadata(spell)
+                    .map(|metadata| metadata.equipment)
+                    .filter(|requirement| requirement.class_id >= 0)
+                {
+                    state.inventory.equipment_slots_authoritative = true;
+                    let equipped = crate::combat::spells::item_ids().find(|item_id| {
+                        crate::combat::spells::item_metadata(*item_id).is_some_and(|item| {
+                            item.class_id == requirement.class_id as u32
+                                && (requirement.subclass_mask <= 0
+                                    || requirement.subclass_mask as u32
+                                        & (1u32.checked_shl(item.subclass).unwrap_or(0))
+                                        != 0)
+                                && (requirement.inventory_mask <= 0
+                                    || requirement.inventory_mask as u32
+                                        & (1u32.checked_shl(item.inventory_type).unwrap_or(0))
+                                        != 0)
+                        })
+                    });
+                    if let Some(item) = equipped {
+                        state.inventory.equipped_items.insert(15, item);
+                    }
+                }
+                let decision = select(&Snapshot::from_state(&state), target);
+                let readiness = crate::combat::readiness::check_spell_readiness(
+                    &Snapshot::from_state(&state),
+                    spell,
+                    Some(target),
+                    Millis::wall_clock_now().0,
                 );
+                if readiness.is_ok() {
+                    assert_eq!(
+                        decision,
+                        CombatDecision::Cast { spell, target },
+                        "class={class_id}, tree={tree}, power={power_type}"
+                    );
+                } else if let Some(metadata) = crate::combat::spells::metadata(spell) {
+                    if metadata.requirements.target_creature_type != 0 {
+                        assert_ne!(
+                            decision,
+                            CombatDecision::Cast { spell, target },
+                            "class={class_id}, tree={tree}, power={power_type} must not guess target creature type"
+                        );
+                    }
+                }
             }
         }
     }

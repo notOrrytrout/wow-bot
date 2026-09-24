@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import struct
 from pathlib import Path
 
@@ -59,8 +60,13 @@ FIELDS = {
     "rank_offset": 153,
     "cost_percent": 204,
     "spell_family": 208,
+    "family_flags_start": 209,
     "school_mask": 225,
     "rune_cost_id": 226,
+    "effect_aura_start": 95,
+    "effect_base_points_start": 80,
+    "effect_misc_start": 110,
+    "effect_family_flags_start": 122,
 }
 
 SPELL_FIELDS = 234
@@ -104,6 +110,8 @@ def generate(dbc_dir: Path) -> dict:
     required = (
         "Spell.dbc", "SpellRange.dbc", "SpellCastTimes.dbc", "SpellDuration.dbc",
         "SpellRuneCost.dbc", "SkillLineAbility.dbc", "Talent.dbc", "TalentTab.dbc",
+        "Item.dbc",
+        "SpellShapeshiftForm.dbc",
     )
     paths = {name: dbc_dir / name for name in required}
     for path in paths.values():
@@ -117,6 +125,8 @@ def generate(dbc_dir: Path) -> dict:
     cast_times = indexed_rows(paths["SpellCastTimes.dbc"])
     durations = indexed_rows(paths["SpellDuration.dbc"])
     rune_costs = indexed_rows(paths["SpellRuneCost.dbc"])
+    item_rows = indexed_rows(paths["Item.dbc"])
+    shapeshift_forms = indexed_rows(paths["SpellShapeshiftForm.dbc"])
     spell_by_id = {row[0]: row for row in spell_rows if row[0]}
 
     # Get class spell IDs from learned abilities and all reviewed talent ranks.
@@ -154,7 +164,27 @@ def generate(dbc_dir: Path) -> dict:
                 name = dbc_string(spell_strings, row[FIELDS["name_offset"]])
                 spell_ids.update(by_name.get(name, ()))
 
+    for spell_ids in class_spells.values():
+        spell_ids.intersection_update(spell_by_id)
     selected = set().union(*class_spells.values())
+    family_members: dict[str, list[int]] = {}
+    for spell_id in selected:
+        row = spell_by_id[spell_id]
+        spell_name = dbc_string(spell_strings, row[FIELDS["name_offset"]])
+        if spell_name:
+            family_members.setdefault(spell_name, []).append(spell_id)
+    family_ids = {
+        name: min(spell_ids) for name, spell_ids in family_members.items()
+    }
+    ordered_families = {}
+    for name, spell_ids in family_members.items():
+        def rank_number(spell_id: int) -> int:
+            rank = dbc_string(spell_strings, spell_by_id[spell_id][FIELDS["rank_offset"]])
+            match = re.fullmatch(r"Rank (\d+)", rank)
+            return int(match.group(1)) if match else 0
+        ordered_families[family_ids[name]] = sorted(
+            spell_ids, key=lambda spell_id: (rank_number(spell_id), spell_id), reverse=True
+        )
     records = []
     stealth_required_spells = []
     for spell_id in sorted(selected):
@@ -182,6 +212,7 @@ def generate(dbc_dir: Path) -> dict:
             "id": spell_id,
             "name": name,
             "rank": rank,
+            "family_id": family_ids.get(name, spell_id),
             "classes": [class_id for class_id in CLASS_IDS if spell_id in class_spells[class_id]],
             "power_type": signed_value(value("power_type")),
             "cost": {
@@ -199,7 +230,7 @@ def generate(dbc_dir: Path) -> dict:
                 "duration_ms": value("start_recovery_ms"),
             },
             "cast_time_ms": (cast_row[1] if cast_row else (0 if value("cast_time_index") == 0 else None)),
-            "duration_ms": (duration_row[1] if duration_row else (0 if value("duration_index") == 0 else None)),
+            "duration_ms": (signed_value(duration_row[1]) if duration_row else (0 if value("duration_index") == 0 else None)),
             "range": ({
                 "hostile_min": float_value(range_row[1]), "friendly_min": float_value(range_row[2]),
                 "hostile_max": float_value(range_row[3]), "friendly_max": float_value(range_row[4]),
@@ -210,14 +241,14 @@ def generate(dbc_dir: Path) -> dict:
                 "unholy": rune_row[3], "runic_power_gain": rune_row[4],
             } if rune_row else None),
             "reagents": [
-                {"item": row[FIELDS["reagent_start"] + i],
+                {"item": signed_value(row[FIELDS["reagent_start"] + i]),
                  "count": row[FIELDS["reagent_count_start"] + i]}
                 for i in range(8) if row[FIELDS["reagent_start"] + i]
             ],
             "equipment": {
-                "class": row[FIELDS["equipped_item_class"]],
-                "subclass_mask": row[FIELDS["equipped_item_subclass_mask"]],
-                "inventory_mask": row[FIELDS["equipped_item_inventory_mask"]],
+                "class": signed_value(row[FIELDS["equipped_item_class"]]),
+                "subclass_mask": signed_value(row[FIELDS["equipped_item_subclass_mask"]]),
+                "inventory_mask": signed_value(row[FIELDS["equipped_item_inventory_mask"]]),
             },
             "requirements": {
                 key: value(key) for key in (
@@ -230,6 +261,22 @@ def generate(dbc_dir: Path) -> dict:
                 )
             },
             "spell_family": value("spell_family"),
+            "family_flags": list(row[FIELDS["family_flags_start"]:FIELDS["family_flags_start"] + 3]),
+            "requires_combo_points": bool(value("attributes_ex") & 0x00500000),
+            "cost_spell_modifiers": [
+                {
+                    "aura_type": row[FIELDS["effect_aura_start"] + effect],
+                    "base_points": signed_value(row[FIELDS["effect_base_points_start"] + effect]),
+                    "family_flags": list(row[
+                        FIELDS["effect_family_flags_start"] + effect * 3:
+                        FIELDS["effect_family_flags_start"] + effect * 3 + 3
+                    ]),
+                    "percent": row[FIELDS["effect_aura_start"] + effect] == 108,
+                }
+                for effect in range(3)
+                if row[FIELDS["effect_aura_start"] + effect] in (107, 108)
+                and signed_value(row[FIELDS["effect_misc_start"] + effect]) == 14
+            ],
             "school_mask": value("school_mask"),
         })
 
@@ -248,6 +295,15 @@ def generate(dbc_dir: Path) -> dict:
         },
         "classes": list(CLASS_IDS),
         "spells": records,
+        "spell_families": ordered_families,
+        "items": {
+            item_id: {"class": row[1], "subclass": row[2], "inventory_type": row[6]}
+            for item_id, row in item_rows.items()
+        },
+        "shapeshift_forms": {
+            form_id: {"flags": row[19], "attack_speed_ms": row[22]}
+            for form_id, row in shapeshift_forms.items()
+        },
         "stealth_required_spells": stealth_required_spells,
         "stealth_aura_spells": stealth_aura_spells,
     }

@@ -1,12 +1,70 @@
 use wow_domain::{EntityId, Vec3, WorldPosition, time::Millis};
 use wow_state::ProtocolObservation;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rune_observation_requires_six_valid_runes() {
+        let mut packet = 6u32.to_le_bytes().to_vec();
+        packet.extend_from_slice(&[0, 255, 1, 0, 2, 255, 3, 0, 1, 255, 2, 0]);
+        let runes = parse_player_runes(&packet).expect("six rune states");
+        assert_eq!(runes.len(), 6);
+        assert!(runes[0].ready);
+        assert!(!runes[1].ready);
+
+        assert!(parse_player_runes(&packet[..packet.len() - 1]).is_none());
+        packet[4] = 4;
+        assert!(parse_player_runes(&packet).is_none());
+    }
+
+    #[test]
+    fn combo_points_decode_packed_target_and_reject_trailing_bytes() {
+        let packet = [0b0000_0010, 0x34, 5];
+        assert!(matches!(
+            parse_combo_points(&packet),
+            ProtocolObservation::ComboPoints {
+                target: Some(EntityId(0x3400)),
+                points: Some(5),
+            }
+        ));
+        assert!(matches!(
+            parse_combo_points(&[0b0000_0010, 0x34, 5, 9]),
+            ProtocolObservation::ComboPoints {
+                target: Some(EntityId(0x3400)),
+                points: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn cooldown_flags_observe_global_cooldown_start() {
+        let mut packet = vec![0; 9];
+        packet[8] = 1;
+        packet.extend_from_slice(&123u32.to_le_bytes());
+        packet.extend_from_slice(&500u32.to_le_bytes());
+        let observations = parse_spell_cooldowns(&packet);
+        assert_eq!(observations.len(), 2);
+        assert!(matches!(
+            observations[0],
+            ProtocolObservation::SpellCooldown { spell: 123, .. }
+        ));
+        assert!(matches!(
+            observations[1],
+            ProtocolObservation::SpellGlobalCooldown { spell: 123, .. }
+        ));
+    }
+}
+
 pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation> {
     const SMSG_INITIAL_SPELLS: u32 = 0x012A;
     const SMSG_LEARNED_SPELL: u32 = 0x012B;
     const SMSG_AURA_UPDATE_ALL: u32 = 0x0495;
     const SMSG_AURA_UPDATE: u32 = 0x0496;
     const SMSG_SPELL_COOLDOWN: u32 = 0x0134;
+    const SMSG_RESYNC_RUNES: u32 = 0x0487;
+    const SMSG_UPDATE_COMBO_POINTS: u32 = 0x039D;
     const MSG_CORPSE_QUERY: u32 = 0x0216;
     const SMSG_CORPSE_RECLAIM_DELAY: u32 = 0x0269;
     match opcode {
@@ -22,6 +80,10 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_AURA_UPDATE_ALL => parse_aura_update_all(body).into_iter().collect(),
         SMSG_AURA_UPDATE => parse_aura_update(body).into_iter().collect(),
         SMSG_SPELL_COOLDOWN => parse_spell_cooldowns(body),
+        SMSG_RESYNC_RUNES => vec![ProtocolObservation::PlayerRunes {
+            runes: parse_player_runes(body),
+        }],
+        SMSG_UPDATE_COMBO_POINTS => vec![parse_combo_points(body)],
         MSG_CORPSE_QUERY => parse_corpse_query(body).into_iter().collect(),
         SMSG_CORPSE_RECLAIM_DELAY => parse_reclaim_delay(body).into_iter().collect(),
         _ => Vec::new(),
@@ -61,6 +123,7 @@ pub(super) fn parse_spell_cooldowns(body: &[u8]) -> Vec<ProtocolObservation> {
     }
     let now = Millis::wall_clock_now().0;
     let mut offset = 9usize; // caster GUID + flags
+    let starts_global_cooldown = body[8] & 0x01 != 0;
     let mut out = Vec::new();
     while offset + 8 <= body.len() {
         let spell = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap_or([0; 4]));
@@ -72,9 +135,47 @@ pub(super) fn parse_spell_cooldowns(body: &[u8]) -> Vec<ProtocolObservation> {
                 spell,
                 ready_at_ms: now.saturating_add(u64::from(cooldown)),
             });
+            if starts_global_cooldown {
+                out.push(ProtocolObservation::SpellGlobalCooldown {
+                    spell,
+                    started_at_ms: now,
+                });
+            }
         }
     }
     out
+}
+
+pub(super) fn parse_player_runes(body: &[u8]) -> Option<Vec<wow_state::capabilities::RuneState>> {
+    if body.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes(body[0..4].try_into().ok()?) as usize;
+    if count != 6 || body.len() != 4 + count * 2 {
+        return None;
+    }
+    let mut runes = Vec::with_capacity(count);
+    for pair in body[4..].chunks_exact(2) {
+        let rune_type = pair[0];
+        if rune_type > 3 {
+            return None;
+        }
+        runes.push(wow_state::capabilities::RuneState {
+            rune_type,
+            ready: pair[1] == u8::MAX,
+        });
+    }
+    Some(runes)
+}
+
+pub(super) fn parse_combo_points(body: &[u8]) -> ProtocolObservation {
+    let mut offset = 0;
+    let target = read_packed_guid(body, &mut offset);
+    let points = body
+        .get(offset)
+        .copied()
+        .filter(|_| offset + 1 == body.len());
+    ProtocolObservation::ComboPoints { target, points }
 }
 
 pub(super) fn parse_initial_spells(body: &[u8]) -> Vec<ProtocolObservation> {

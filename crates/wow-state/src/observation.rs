@@ -62,6 +62,9 @@ pub enum ProtocolObservation {
     EquippedRangedItem {
         item: Option<u32>,
     },
+    EquippedItems {
+        items: Option<std::collections::BTreeMap<u8, u32>>,
+    },
     Money {
         copper: u64,
     },
@@ -119,6 +122,17 @@ pub enum ProtocolObservation {
     SpellCooldown {
         spell: u32,
         ready_at_ms: u64,
+    },
+    SpellGlobalCooldown {
+        spell: u32,
+        started_at_ms: u64,
+    },
+    PlayerRunes {
+        runes: Option<Vec<crate::capabilities::RuneState>>,
+    },
+    ComboPoints {
+        target: Option<EntityId>,
+        points: Option<u8>,
     },
     PlayerClass {
         class_id: u8,

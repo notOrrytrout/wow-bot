@@ -9,7 +9,7 @@ use tentacli::{
         CtxMap, HandlerOutput, Packet, PacketOpcode, PacketType, Processor, Request,
     },
     plugins::wow::wotlk::realm::object::{
-        ObjectProcessor, object_names, objects,
+        ObjectMap, ObjectProcessor, object_names, objects,
         types::update_fields::{FieldValue, ItemField, PlayerField, UnitField},
     },
 };
@@ -40,6 +40,8 @@ pub struct ObjectObservationRuntime {
     last_money: Option<u64>,
     known_equipped_ranged_item: Option<u32>,
     equipment_observed: bool,
+    known_equipped_items: Option<BTreeMap<u8, u32>>,
+    equipment_slots_observed: bool,
     last_class_id: Option<u8>,
     last_player_position: Option<WorldPosition>,
     map_id: u32,
@@ -64,6 +66,8 @@ impl ObjectObservationRuntime {
             last_money: None,
             known_equipped_ranged_item: None,
             equipment_observed: false,
+            known_equipped_items: None,
+            equipment_slots_observed: false,
             last_class_id: None,
             last_player_position: None,
             map_id: 0,
@@ -193,6 +197,16 @@ impl ObjectObservationRuntime {
                         }
                     }
                     if self.player_guid == Some(entity.id) {
+                        let equipped_items = equipped_items_of(object, map);
+                        if !self.equipment_slots_observed
+                            || equipped_items != self.known_equipped_items
+                        {
+                            observations.push(ProtocolObservation::EquippedItems {
+                                items: equipped_items.clone(),
+                            });
+                            self.known_equipped_items = equipped_items;
+                            self.equipment_slots_observed = true;
+                        }
                         if let Some(class_id) = object
                             .as_player()
                             .and_then(|player| player.class())
@@ -314,6 +328,27 @@ fn equipped_ranged_guid_of(
             .filter(|guid| *guid != 0),
         _ => None,
     }
+}
+
+fn equipped_items_of(
+    player: &tentacli::plugins::wow::wotlk::realm::object::Object,
+    objects: &ObjectMap,
+) -> Option<BTreeMap<u8, u32>> {
+    let Some(FieldValue::LongArray(slots)) = player.player_fields.get(&PlayerField::InvSlot) else {
+        return None;
+    };
+    let mut equipped = BTreeMap::new();
+    for (slot, guid) in slots.iter().take(19).enumerate() {
+        let Some(guid) = guid.filter(|guid| *guid != 0) else {
+            continue;
+        };
+        let item = objects
+            .values()
+            .find(|object| object.guid().0 == guid)
+            .and_then(|object| object.entry_id())?;
+        equipped.insert(u8::try_from(slot).ok()?, item);
+    }
+    Some(equipped)
 }
 
 fn backpack_slots_of(
