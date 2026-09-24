@@ -75,6 +75,8 @@ Transparent unknown-account sessions SHALL NOT gain `.bot` mission or control au
 ### Requirement: Local command handling is visible to the operator
 Every recognized configured-account `.bot` or `.log` command SHALL emit an operator-visible diagnostic when the proxy consumes it. Control commands SHALL also emit a diagnostic after the ownership/control transition is applied so reception can be distinguished from successful state change.
 
+Recognized `.log` commands SHALL also send a chat notice to the player with the result of the local logging operation.
+
 #### Scenario: Player sends `.bot off`
 - **THEN** the supervisor console reports that `.bot off` was received for the matching account
 - **AND** the console reports whether manual ownership was committed
@@ -83,3 +85,4 @@ Every recognized configured-account `.bot` or `.log` command SHALL emit an opera
 #### Scenario: Player sends `.log status`
 - **THEN** the supervisor console reports whether Action Log capture is active
 - **AND** when active, it reports the capture path
+- **AND** the player receives the same status and path in game chat

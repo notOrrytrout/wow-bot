@@ -849,7 +849,9 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                 continue;
                             }
                             Ok(Some(crate::commands::LocalCommand::Log(log))) => {
-                                handle_log_command(&shared.action_logs, &account_name, log).await;
+                                let notice =
+                                    handle_log_command(&shared.action_logs, &account_name, log).await;
+                                let _ = write_bot_notice(&mut dw, &mut down_enc, &notice).await;
                                 continue;
                             }
                             Ok(None) => {}
@@ -1691,39 +1693,55 @@ async fn handle_log_command(
     logs: &ActionLogManager,
     account: &str,
     command: crate::commands::log::LogCommand,
-) {
+) -> String {
     use crate::commands::log::LogCommand;
     match command {
         LogCommand::Start => match logs.start(account).await {
             Ok(path) => {
-                tracing::info!(account=%account, path=%path.display(), "action logging started")
+                tracing::info!(account=%account, path=%path.display(), "action logging started");
+                format!("[wow-bot] action logging started: {}", path.display())
             }
             Err(error) => {
-                tracing::error!(account=%account, %error, "failed to start action logging")
+                tracing::error!(account=%account, %error, "failed to start action logging");
+                format!("[wow-bot] failed to start action logging: {error}")
             }
         },
         LogCommand::Stop => match logs.stop(account).await {
             Ok(Some(path)) => {
-                tracing::info!(account=%account, path=%path.display(), "action logging stopped")
+                tracing::info!(account=%account, path=%path.display(), "action logging stopped");
+                format!("[wow-bot] action logging stopped: {}", path.display())
             }
-            Ok(None) => tracing::info!(account=%account, "action logging is not active"),
+            Ok(None) => {
+                tracing::info!(account=%account, "action logging is not active");
+                "[wow-bot] action logging is not active".to_string()
+            }
             Err(error) => {
-                tracing::error!(account=%account, %error, "failed to stop action logging")
+                tracing::error!(account=%account, %error, "failed to stop action logging");
+                format!("[wow-bot] failed to stop action logging: {error}")
             }
         },
         LogCommand::Status => match logs.status(account).await {
             Some(path) => {
-                tracing::info!(account=%account, path=%path.display(), "action logging is active")
+                tracing::info!(account=%account, path=%path.display(), "action logging is active");
+                format!("[wow-bot] action logging is active: {}", path.display())
             }
-            None => tracing::info!(account=%account, "action logging is inactive"),
+            None => {
+                tracing::info!(account=%account, "action logging is inactive");
+                "[wow-bot] action logging is inactive".to_string()
+            }
         },
         LogCommand::Mark(label) => match logs.mark(account, label.as_deref()).await {
-            Ok(true) => tracing::info!(account=%account, ?label, "action log marker written"),
+            Ok(true) => {
+                tracing::info!(account=%account, ?label, "action log marker written");
+                "[wow-bot] action log marker written".to_string()
+            }
             Ok(false) => {
-                tracing::info!(account=%account, "action logging is not active; marker ignored")
+                tracing::info!(account=%account, "action logging is not active; marker ignored");
+                "[wow-bot] action logging is not active; marker ignored".to_string()
             }
             Err(error) => {
-                tracing::error!(account=%account, %error, "failed to write action log marker")
+                tracing::error!(account=%account, %error, "failed to write action log marker");
+                format!("[wow-bot] failed to write action log marker: {error}")
             }
         },
     }
