@@ -380,7 +380,7 @@ impl AzerothCoreCatalog {
         ordered_spawns(spawns.into_iter().flatten(), map, from)
     }
     pub fn nearest_item_source(&self, item: u32, map: u32, from: Vec3) -> Option<Vec3> {
-        self.item_source_spawns(item, map, from).into_iter().next()
+        self.nearest_spawn_for_entries(self.item_sources.get(&item)?.iter().copied(), map, from)
     }
     pub fn item_source_spawns(&self, item: u32, map: u32, from: Vec3) -> Vec<Vec3> {
         let points = self
@@ -392,26 +392,24 @@ impl AzerothCoreCatalog {
         ordered_points(points, from)
     }
     pub fn nearest_turn_in(&self, quest: u32, map: u32, from: Vec3) -> Option<Vec3> {
-        self.quest_ends
-            .get(&quest)?
-            .iter()
-            .filter_map(|(kind, entry)| {
-                self.nearest_spawn((*kind).into(), *entry, map, from)
-                    .map(|point| (from.distance(point), point))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, point)| point)
+        self.nearest_spawn_for_entries(
+            self.quest_ends
+                .get(&quest)?
+                .iter()
+                .map(|(kind, entry)| (*kind, *entry)),
+            map,
+            from,
+        )
     }
     pub fn nearest_quest_tool(&self, quest: u32, map: u32, from: Vec3) -> Option<Vec3> {
-        self.quest_tools
-            .get(&quest)?
-            .iter()
-            .filter_map(|tool| {
-                self.nearest_spawn(QuestTargetKind::GameObject, tool.entry, map, from)
-                    .map(|point| (from.distance(point), point))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, point)| point)
+        self.nearest_spawn_for_entries(
+            self.quest_tools
+                .get(&quest)?
+                .iter()
+                .map(|tool| (KnowledgeEntityKind::GameObject, tool.entry)),
+            map,
+            from,
+        )
     }
     pub fn nearest_vendor(&self, service: VendorKind, map: u32, from: Vec3) -> Option<(u32, Vec3)> {
         self.world
@@ -467,6 +465,21 @@ impl AzerothCoreCatalog {
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, node, point)| (node, point))
+    }
+    fn nearest_spawn_for_entries(
+        &self,
+        entries: impl IntoIterator<Item = (KnowledgeEntityKind, u32)>,
+        map: u32,
+        from: Vec3,
+    ) -> Option<Vec3> {
+        entries
+            .into_iter()
+            .filter_map(|(kind, entry)| {
+                self.nearest_spawn(kind.into(), entry, map, from)
+                    .map(|point| (from.distance(point), point))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, point)| point)
     }
 }
 
