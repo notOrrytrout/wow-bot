@@ -1,4 +1,24 @@
 use crate::{AuthoritativeState, ProtocolObservation, StateDelta};
+use wow_domain::EntityId;
+
+fn ensure_quest_giver(state: &mut AuthoritativeState, giver: EntityId) {
+    state
+        .entities
+        .0
+        .entry(giver)
+        .or_insert_with(|| crate::entities::EntityState {
+            id: giver,
+            interactable: true,
+            ..Default::default()
+        });
+}
+
+fn advance_loot_generation(state: &mut AuthoritativeState, ownership: crate::LootOwnership) {
+    state.inventory.loot_generation = state.inventory.loot_generation.wrapping_add(1);
+    if matches!(ownership, crate::LootOwnership::Bot) {
+        state.inventory.bot_loot_generation = state.inventory.bot_loot_generation.wrapping_add(1);
+    }
+}
 
 pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) -> StateDelta {
     let mut delta = StateDelta::default();
@@ -135,21 +155,13 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
         ProtocolObservation::LootOpened { target, ownership } => {
             state.inventory.current_loot = Some(target);
             state.inventory.current_loot_owner = Some(ownership);
-            state.inventory.loot_generation = state.inventory.loot_generation.wrapping_add(1);
-            if matches!(ownership, crate::observation::LootOwnership::Bot) {
-                state.inventory.bot_loot_generation =
-                    state.inventory.bot_loot_generation.wrapping_add(1);
-            }
+            advance_loot_generation(state, ownership);
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::LootClosed { ownership } => {
             state.inventory.current_loot = None;
             state.inventory.current_loot_owner = None;
-            state.inventory.loot_generation = state.inventory.loot_generation.wrapping_add(1);
-            if matches!(ownership, crate::observation::LootOwnership::Bot) {
-                state.inventory.bot_loot_generation =
-                    state.inventory.bot_loot_generation.wrapping_add(1);
-            }
+            advance_loot_generation(state, ownership);
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::VendorOpened { vendor } => {
@@ -177,15 +189,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             if !matches!(status, 2 | 4 | 7 | 8) {
                 state.quests.offers.retain(|_, offer| offer.giver != giver);
             }
-            state
-                .entities
-                .0
-                .entry(giver)
-                .or_insert_with(|| crate::entities::EntityState {
-                    id: giver,
-                    interactable: true,
-                    ..Default::default()
-                });
+            ensure_quest_giver(state, giver);
             delta.touched_entities.push(giver);
             delta.changed.extend(["quests".into(), "entities".into()]);
         }
@@ -195,15 +199,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 .quests
                 .offers
                 .insert(quest, crate::quests::QuestOffer { giver, icon });
-            state
-                .entities
-                .0
-                .entry(giver)
-                .or_insert_with(|| crate::entities::EntityState {
-                    id: giver,
-                    interactable: true,
-                    ..Default::default()
-                });
+            ensure_quest_giver(state, giver);
             delta.touched_entities.push(giver);
             delta.changed.extend(["quests".into(), "entities".into()]);
         }
