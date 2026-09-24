@@ -20,6 +20,13 @@ fn advance_loot_generation(state: &mut AuthoritativeState, ownership: crate::Loo
     }
 }
 
+fn mark_entity_changed(delta: &mut StateDelta, entity: EntityId, sections: &[&str]) {
+    delta.touched_entities.push(entity);
+    delta
+        .changed
+        .extend(sections.iter().map(|section| (*section).into()));
+}
+
 pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) -> StateDelta {
     let mut delta = StateDelta::default();
     match observation {
@@ -106,8 +113,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                         ends_at_ms,
                     },
                 );
-                delta.touched_entities.push(caster);
-                delta.changed.push("active_casts".into());
+                mark_entity_changed(&mut delta, caster, &["active_casts"]);
             }
         }
         ProtocolObservation::CastFinished { caster, spell } => {
@@ -117,8 +123,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                     .get(&caster)
                     .is_some_and(|active| active.spell == spell);
             if matches_spell && state.active_casts.remove(&caster).is_some() {
-                delta.touched_entities.push(caster);
-                delta.changed.push("active_casts".into());
+                mark_entity_changed(&mut delta, caster, &["active_casts"]);
             }
         }
         ProtocolObservation::CastUpdated { caster, ends_at_ms } => {
@@ -127,8 +132,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 if ends_at_ms == 0 {
                     state.active_casts.remove(&caster);
                 }
-                delta.touched_entities.push(caster);
-                delta.changed.push("active_casts".into());
+                mark_entity_changed(&mut delta, caster, &["active_casts"]);
             }
         }
         ProtocolObservation::CorpseLocation { position } => {
@@ -141,9 +145,9 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             delta.changed.push("life".into());
         }
         ProtocolObservation::EntityUpsert { entity } => {
-            delta.touched_entities.push(entity.id);
-            state.entities.0.insert(entity.id, entity);
-            delta.changed.push("entities".into());
+            let entity_id = entity.id;
+            state.entities.0.insert(entity_id, entity);
+            mark_entity_changed(&mut delta, entity_id, &["entities"]);
         }
         ProtocolObservation::EntityRemoved { entity } => {
             state.entities.0.remove(&entity);
@@ -160,10 +164,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 state.inventory.trade.open = false;
                 state.inventory.trade.generation = state.inventory.trade.generation.wrapping_add(1);
             }
-            delta.touched_entities.push(entity);
-            delta
-                .changed
-                .extend(["entities".into(), "inventory".into()]);
+            mark_entity_changed(&mut delta, entity, &["entities", "inventory"]);
         }
         ProtocolObservation::InventoryCount { item, count } => {
             if count == 0 {
@@ -236,8 +237,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 state.quests.offers.retain(|_, offer| offer.giver != giver);
             }
             ensure_quest_giver(state, giver);
-            delta.touched_entities.push(giver);
-            delta.changed.extend(["quests".into(), "entities".into()]);
+            mark_entity_changed(&mut delta, giver, &["quests", "entities"]);
         }
         ProtocolObservation::QuestGiverListReceived { .. } => {}
         ProtocolObservation::QuestOffer { giver, quest, icon } => {
@@ -246,8 +246,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 .offers
                 .insert(quest, crate::quests::QuestOffer { giver, icon });
             ensure_quest_giver(state, giver);
-            delta.touched_entities.push(giver);
-            delta.changed.extend(["quests".into(), "entities".into()]);
+            mark_entity_changed(&mut delta, giver, &["quests", "entities"]);
         }
         ProtocolObservation::QuestAccepted { quest } => {
             state.quests.active.entry(quest).or_default();
