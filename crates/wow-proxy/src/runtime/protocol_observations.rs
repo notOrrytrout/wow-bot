@@ -422,7 +422,7 @@ pub(super) fn parse_quest_query_response(body: &[u8]) -> Option<ProtocolObservat
     })
 }
 
-fn read_cstring<'a>(body: &'a [u8], offset: &mut usize) -> Option<&'a str> {
+pub(super) fn read_cstring<'a>(body: &'a [u8], offset: &mut usize) -> Option<&'a str> {
     let rest = body.get(*offset..)?;
     let end = rest.iter().position(|b| *b == 0)?;
     let text = std::str::from_utf8(rest.get(..end)?).ok()?;
