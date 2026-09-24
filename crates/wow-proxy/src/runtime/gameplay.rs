@@ -62,9 +62,7 @@ impl MovementClock {
     }
 }
 
-pub(super) fn parse_server_near_teleport(
-    body: &[u8],
-) -> Option<(EntityId, u32, Vec3, f32)> {
+pub(super) fn parse_server_near_teleport(body: &[u8]) -> Option<(EntityId, u32, Vec3, f32)> {
     let (&mask, mut rest) = body.split_first()?;
     let mut guid = 0_u64;
     for index in 0..8 {
@@ -89,8 +87,12 @@ pub(super) fn parse_server_near_teleport(
     let z = f32::from_le_bytes(position.get(8..12)?.try_into().ok()?);
     let orientation = f32::from_le_bytes(position.get(12..16)?.try_into().ok()?);
     let point = Vec3::new(x, y, z);
-    (point.is_finite() && orientation.is_finite())
-        .then_some((EntityId(guid), flags, point, orientation))
+    (point.is_finite() && orientation.is_finite()).then_some((
+        EntityId(guid),
+        flags,
+        point,
+        orientation,
+    ))
 }
 
 fn timestamp_is_after(candidate: u32, previous: u32) -> bool {
