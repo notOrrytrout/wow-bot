@@ -1080,6 +1080,16 @@ async fn headless_session_manager(shared: SharedRuntime, account: AccountRuntime
                 tracing::info!(account=%account.config.account_name, connected_for_ms=connected_for.as_millis(), retry_after_ms=retry.as_millis(), "headless autonomous session ended; reconnect scheduled")
             }
             Err(error) => {
+                if is_missing_warden_client_image(&error) {
+                    tracing::error!(
+                        account=%account.config.account_name,
+                        error=%format_args!("{error:#}"),
+                        "headless session stopped; configure proxy.warden_client_image before retrying"
+                    );
+                    let _ = account.headless_enabled.send(false);
+                    retry = Duration::from_secs(1);
+                    continue;
+                }
                 tracing::warn!(account=%account.config.account_name, connected_for_ms=connected_for.as_millis(), retry_after_ms=retry.as_millis(), error=%format_args!("{error:#}"), "headless autonomous session failed; reconnect scheduled")
             }
         }
@@ -1089,6 +1099,12 @@ async fn headless_session_manager(shared: SharedRuntime, account: AccountRuntime
         }
         retry = (retry * 2).min(Duration::from_secs(15));
     }
+}
+
+fn is_missing_warden_client_image(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == "Warden checks require proxy.warden_client_image")
 }
 
 async fn run_headless_world_session(
@@ -1764,6 +1780,16 @@ mod runtime_chat_tests {
 #[cfg(test)]
 mod player_world_handoff_tests {
     use super::*;
+
+    #[test]
+    fn missing_warden_image_is_a_non_retryable_configuration_error() {
+        let error = anyhow::anyhow!("headless Warden exchange failed")
+            .context("Warden checks require proxy.warden_client_image");
+        assert!(is_missing_warden_client_image(&error));
+
+        let transient = anyhow::anyhow!("connection reset");
+        assert!(!is_missing_warden_client_image(&transient));
+    }
 
     #[test]
     fn headless_waits_for_final_overlapping_player_connection() {
