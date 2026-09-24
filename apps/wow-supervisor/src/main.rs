@@ -442,11 +442,12 @@ fn ensure_runtime_data(
             let typed = typed.trim();
             if typed.is_empty() {
                 tracing::info!("opening native folder browser for AzerothCore runtime data");
-                match pick_runtime_data_folder(start_dir.as_deref())? {
-                    Some(path) => path,
-                    None => {
-                        println!("Folder selection was cancelled. You can type the path instead.");
-                        continue;
+                match pick_runtime_data_folder(start_dir.as_deref()) {
+                    Ok(Some(path)) => path,
+                    Ok(None) => prompt_runtime_data_path("Folder selection was cancelled.")?,
+                    Err(error) => {
+                        tracing::warn!(%error, "native folder browser is unavailable");
+                        prompt_runtime_data_path("Folder browser is unavailable.")?
                     }
                 }
             } else {
@@ -471,28 +472,27 @@ fn ensure_runtime_data(
     }
 }
 
+fn prompt_runtime_data_path(reason: &str) -> Result<PathBuf> {
+    println!("{reason} Enter the path instead.");
+    Ok(PathBuf::from(prompt_required(
+        "AzerothCore data directory",
+    )?))
+}
+
 #[cfg(target_os = "macos")]
 fn pick_runtime_data_folder(start_dir: Option<&Path>) -> Result<Option<PathBuf>> {
     use std::process::Command as StdCommand;
 
     let prompt = "Select AzerothCore data directory (contains dbc, maps, vmaps, and mmaps)";
-    let script = if let Some(dir) = start_dir {
+    let mut choose_folder = format!("set chosenFolder to choose folder with prompt \"{prompt}\"");
+    if let Some(dir) = start_dir {
         let escaped = dir
             .to_string_lossy()
             .replace('\\', "\\\\")
             .replace('\"', "\\\"");
-        format!(
-            r#"set chosenFolder to choose folder with prompt "{}" default location POSIX file "{}"
-POSIX path of chosenFolder"#,
-            prompt, escaped
-        )
-    } else {
-        format!(
-            r#"set chosenFolder to choose folder with prompt "{}"
-POSIX path of chosenFolder"#,
-            prompt
-        )
-    };
+        choose_folder.push_str(&format!(" default location POSIX file \"{escaped}\""));
+    }
+    let script = format!("{choose_folder}\nPOSIX path of chosenFolder");
 
     let output = StdCommand::new("osascript")
         .arg("-e")
