@@ -944,441 +944,7 @@ impl LaneEngine {
             .find(|(_, progress)| !progress.complete)
             .map(|(&quest, _)| quest);
         if let Some(quest) = incomplete_quest {
-            if !self
-                .state
-                .authoritative
-                .quests
-                .definitions
-                .contains_key(&quest)
-            {
-                self.set_work(QuestWorkKey::QueryDefinition { quest });
-                tracing::info!(lane=?self.state.lane, quest, "quest scheduler requesting authoritative quest definition");
-                return self
-                    .propose_command(GameplayCommand::QueryQuest { quest }, true)
-                    .await;
-            }
-            let snapshot = Snapshot::from_state(&self.state.authoritative);
-            let excluded: BTreeSet<(usize, EntityId)> = self
-                .credited_quest_targets
-                .iter()
-                .filter_map(|(credited_quest, objective, target)| {
-                    (*credited_quest == quest).then_some((*objective, *target))
-                })
-                .collect();
-            match resolve_with_exclusions(&snapshot, quest, &excluded) {
-                ObjectiveResolution::WaitingForDefinition => {
-                    self.waiting(format!(
-                        "quest {quest} is waiting for authoritative definition"
-                    ));
-                    return true;
-                }
-                ObjectiveResolution::GroundedCreature { objective, target } => {
-                    self.set_work(QuestWorkKey::CombatObjective {
-                        quest,
-                        objective,
-                        target,
-                    });
-                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, "quest scheduler grounded creature objective from live object state");
-                    return self.dispatch_combat_target(target).await;
-                }
-                ObjectiveResolution::GroundedGameObject { objective, target } => {
-                    self.set_work(QuestWorkKey::InteractObjective {
-                        quest,
-                        objective,
-                        target,
-                    });
-                    if !self.interaction_ready(quest, target) {
-                        return true;
-                    }
-                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, "quest scheduler grounded game-object objective from live object state");
-                    let baseline_progress = self
-                        .state
-                        .authoritative
-                        .quests
-                        .active
-                        .get(&quest)
-                        .and_then(|progress| progress.objectives.get(objective))
-                        .copied()
-                        .unwrap_or_default();
-                    return self
-                        .dispatch_quest_semantic(
-                            GameplayCommand::UseGameObject(target),
-                            PendingQuestAction::QuestObjectUse {
-                                quest,
-                                target,
-                                objective: Some(objective),
-                                item: None,
-                                baseline_progress,
-                                baseline_count: 0,
-                                started: Instant::now(),
-                            },
-                        )
-                        .await;
-                }
-                ObjectiveResolution::GroundedScriptedItemUse {
-                    objective,
-                    target,
-                    item,
-                    spell,
-                    cast_count,
-                } => {
-                    self.set_work(QuestWorkKey::InteractObjective {
-                        quest,
-                        objective,
-                        target,
-                    });
-                    let Some(instance) = self
-                        .state
-                        .authoritative
-                        .inventory
-                        .usable_instance(item)
-                        .cloned()
-                    else {
-                        self.waiting(format!("quest {quest} needs usable item {item} for scripted objective, but no authoritative backpack slot/GUID is known"));
-                        return true;
-                    };
-                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, item, spell, slot=instance.backpack_slot, "quest scheduler using scripted targeted quest item");
-                    let baseline = self
-                        .state
-                        .authoritative
-                        .quests
-                        .active
-                        .get(&quest)
-                        .and_then(|p| p.objectives.get(objective))
-                        .copied()
-                        .unwrap_or_default();
-                    return self
-                        .dispatch_quest_semantic(
-                            GameplayCommand::UseItemInstance {
-                                item,
-                                item_guid: instance.guid,
-                                backpack_slot: instance.backpack_slot,
-                                spell,
-                                target: Some(target),
-                                cast_count,
-                            },
-                            PendingQuestAction::QuestCredit {
-                                quest,
-                                objective,
-                                baseline,
-                                target,
-                                started: Instant::now(),
-                                label: "scripted item use",
-                            },
-                        )
-                        .await;
-                }
-                ObjectiveResolution::GroundedQuestSpell {
-                    objective,
-                    target,
-                    spell,
-                    name,
-                } => {
-                    self.set_work(QuestWorkKey::InteractObjective {
-                        quest,
-                        objective,
-                        target,
-                    });
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    if let Err(reason) = wow_policy::combat::readiness::check_spell_readiness(
-                        &snapshot,
-                        spell,
-                        Some(target),
-                        now_ms,
-                    ) {
-                        self.waiting(format!(
-                            "quest {quest} is waiting for {name} ({spell}): {reason:?}"
-                        ));
-                        return true;
-                    }
-                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, spell, %name, "quest scheduler casting required spell on quest target");
-                    let baseline = self
-                        .state
-                        .authoritative
-                        .quests
-                        .active
-                        .get(&quest)
-                        .and_then(|p| p.objectives.get(objective))
-                        .copied()
-                        .unwrap_or_default();
-                    return self
-                        .dispatch_quest_semantic(
-                            GameplayCommand::Cast {
-                                spell,
-                                target: Some(target),
-                            },
-                            PendingQuestAction::QuestCredit {
-                                quest,
-                                objective,
-                                baseline,
-                                target,
-                                started: Instant::now(),
-                                label: name,
-                            },
-                        )
-                        .await;
-                }
-                ObjectiveResolution::QuestSpellUnavailable {
-                    objective,
-                    target,
-                    name,
-                } => {
-                    self.set_work(QuestWorkKey::InteractObjective {
-                        quest,
-                        objective,
-                        target,
-                    });
-                    self.waiting(format!("quest {quest} needs {name} for target {target}, but the spell is not in the observed spellbook"));
-                    return true;
-                }
-                ObjectiveResolution::GroundedControlledSpell {
-                    objective,
-                    target,
-                    spell,
-                } => {
-                    self.set_work(QuestWorkKey::InteractObjective {
-                        quest,
-                        objective,
-                        target,
-                    });
-                    tracing::info!(lane=?self.state.lane, quest, objective, ?target, spell, mover=?self.state.authoritative.control.mover, "quest scheduler using observed controlled-unit ability for objective");
-                    let baseline = self
-                        .state
-                        .authoritative
-                        .quests
-                        .active
-                        .get(&quest)
-                        .and_then(|p| p.objectives.get(objective))
-                        .copied()
-                        .unwrap_or_default();
-                    return self
-                        .dispatch_quest_semantic(
-                            GameplayCommand::VehicleCast {
-                                spell,
-                                target: Some(target),
-                            },
-                            PendingQuestAction::QuestCredit {
-                                quest,
-                                objective,
-                                baseline,
-                                target,
-                                started: Instant::now(),
-                                label: "controlled quest ability",
-                            },
-                        )
-                        .await;
-                }
-                ObjectiveResolution::GroundedQuestTool {
-                    target,
-                    activation_spell,
-                } => {
-                    self.set_work(QuestWorkKey::InteractObjective {
-                        quest,
-                        objective: usize::MAX,
-                        target,
-                    });
-                    if !self.interaction_ready(quest, target) {
-                        return true;
-                    }
-                    tracing::info!(lane=?self.state.lane, quest, ?target, ?activation_spell, "quest scheduler activating live quest-bound control object");
-                    let command = activation_spell
-                        .map(|spell| GameplayCommand::CastGameObject {
-                            spell,
-                            target,
-                            report_use: true,
-                        })
-                        .unwrap_or(GameplayCommand::UseGameObject(target));
-                    let pending = PendingQuestAction::ControlActivation {
-                        target,
-                        started: Instant::now(),
-                    };
-                    return self.dispatch_quest_semantic(command, pending).await;
-                }
-                ObjectiveResolution::QuestToolSearch { destination } => {
-                    let work = self.set_work(QuestWorkKey::TravelToObjective {
-                        quest,
-                        objective: usize::MAX,
-                        destination,
-                    });
-                    if self
-                        .state
-                        .authoritative
-                        .position
-                        .player
-                        .is_some_and(|player| player.point.distance(destination) <= 12.0)
-                    {
-                        self.waiting(format!("quest {quest} reached quest-control search area; waiting for live authoritative control object"));
-                        return true;
-                    }
-                    tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "quest scheduler traveling to quest-bound control object search area");
-                    self.queue_movement(
-                        destination,
-                        12.0,
-                        None,
-                        None,
-                        PlanOrigin::SystemPolicy,
-                        work,
-                        MovementPurpose::SearchArea,
-                    );
-                    return true;
-                }
-                ObjectiveResolution::GroundedItemCreature { item, target, dead } => {
-                    self.set_work(QuestWorkKey::CollectItem { quest, item });
-                    if dead {
-                        tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler looting grounded quest-item source");
-                        let baseline_count = self
-                            .state
-                            .authoritative
-                            .inventory
-                            .items
-                            .get(&item)
-                            .copied()
-                            .unwrap_or_default();
-                        return self
-                            .dispatch_quest_semantic(
-                                GameplayCommand::Loot(target),
-                                PendingQuestAction::Loot {
-                                    item,
-                                    target,
-                                    baseline_count,
-                                    baseline_generation: self
-                                        .state
-                                        .authoritative
-                                        .inventory
-                                        .bot_loot_generation,
-                                    started: Instant::now(),
-                                },
-                            )
-                            .await;
-                    }
-                    tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler engaging grounded quest-item source through shared combat selector");
-                    return self.dispatch_combat_target(target).await;
-                }
-                ObjectiveResolution::GroundedItemGameObject { item, target } => {
-                    self.set_work(QuestWorkKey::CollectItem { quest, item });
-                    if !self.interaction_ready(quest, target) {
-                        return true;
-                    }
-                    tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler using grounded game-object quest-item source");
-                    let baseline_count = self
-                        .state
-                        .authoritative
-                        .inventory
-                        .items
-                        .get(&item)
-                        .copied()
-                        .unwrap_or_default();
-                    return self
-                        .dispatch_quest_semantic(
-                            GameplayCommand::UseGameObject(target),
-                            PendingQuestAction::QuestObjectUse {
-                                quest,
-                                target,
-                                objective: None,
-                                item: Some(item),
-                                baseline_progress: 0,
-                                baseline_count,
-                                started: Instant::now(),
-                            },
-                        )
-                        .await;
-                }
-                ObjectiveResolution::SearchArea {
-                    objective,
-                    destination,
-                    alternatives,
-                    source,
-                } => {
-                    let work = self.set_work(QuestWorkKey::TravelToObjective {
-                        quest,
-                        objective,
-                        destination,
-                    });
-                    let key = (quest, objective, 0);
-                    let current_pos = self
-                        .state
-                        .authoritative
-                        .position
-                        .player
-                        .map(|player| player.point);
-                    let arrived =
-                        current_pos.is_some_and(|position| position.distance(destination) <= 18.0);
-                    let candidates =
-                        bounded_candidates(alternatives, current_pos.unwrap_or(destination));
-                    let Some(destination) = self.next_search_destination(
-                        key,
-                        &candidates,
-                        arrived.then_some(destination),
-                    ) else {
-                        self.waiting(format!("quest {quest} exhausted nearby {source} hints for objective {objective}; waiting before a bounded retry"));
-                        return true;
-                    };
-                    tracing::info!(lane=?self.state.lane, quest, objective, work_id=?work.id, %source, x=destination.x, y=destination.y, "quest scheduler starting bounded objective-area travel");
-                    self.queue_movement(
-                        destination,
-                        18.0,
-                        None,
-                        None,
-                        PlanOrigin::SystemPolicy,
-                        work,
-                        MovementPurpose::SearchArea,
-                    );
-                    return true;
-                }
-                ObjectiveResolution::ItemCollection {
-                    item,
-                    required,
-                    current,
-                    destinations,
-                } => {
-                    let work = self.set_work(QuestWorkKey::CollectItem { quest, item });
-                    let key = (quest, usize::MAX, item);
-                    let current_pos = self
-                        .state
-                        .authoritative
-                        .position
-                        .player
-                        .map(|player| player.point);
-                    let candidates =
-                        bounded_candidates(destinations, current_pos.unwrap_or_default());
-                    let arrived = current_pos.is_some_and(|position| {
-                        candidates
-                            .iter()
-                            .any(|candidate| position.distance(*candidate) <= 18.0)
-                    });
-                    let current_destination = candidates.iter().copied().find(|point| {
-                        current_pos.is_some_and(|position| position.distance(*point) <= 18.0)
-                    });
-                    let Some(destination) = self.next_search_destination(
-                        key,
-                        &candidates,
-                        arrived.then_some(current_destination).flatten(),
-                    ) else {
-                        self.waiting(format!("quest {quest} exhausted nearby loot-source hints for item {item} at {current}/{required}; waiting before a bounded retry"));
-                        return true;
-                    };
-                    if !arrived || current_destination != Some(destination) {
-                        tracing::info!(lane=?self.state.lane, quest, item, current, required, work_id=?work.id, x=destination.x, y=destination.y, "quest item objective using AzerothCore loot-source search hint");
-                        self.queue_movement(
-                            destination,
-                            18.0,
-                            None,
-                            None,
-                            PlanOrigin::SystemPolicy,
-                            work,
-                            MovementPurpose::SearchArea,
-                        );
-                    }
-                    return true;
-                }
-                ObjectiveResolution::NoSupportedObjective => {
-                    self.waiting(format!("quest {quest} has no remaining supported objective in the authoritative definition"));
-                    return true;
-                }
-            }
+            return self.tick_incomplete_quest(quest).await;
         }
 
         let complete_quest = self
@@ -1390,98 +956,7 @@ impl LaneEngine {
             .find(|(_, progress)| progress.complete)
             .map(|(&quest, _)| quest);
         if let Some(quest) = complete_quest {
-            self.set_work(QuestWorkKey::TurnIn { quest });
-            if let Some(dialog) = self.state.authoritative.quests.turn_in.get(&quest).cloned() {
-                match dialog.stage {
-                    wow_state::quests::QuestTurnInStage::RequestItems { can_complete: true } => {
-                        tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, "quest turn-in requesting reward after required-items confirmation");
-                        self.pending_turn_in = Some((quest, Instant::now(), "request-reward"));
-                        return self
-                            .propose_command(
-                                GameplayCommand::RequestQuestReward {
-                                    quest,
-                                    giver: dialog.giver,
-                                },
-                                true,
-                            )
-                            .await;
-                    }
-                    wow_state::quests::QuestTurnInStage::RequestItems {
-                        can_complete: false,
-                    } => {
-                        self.waiting(format!("quest {quest} turn-in dialog reports required items or money are still incomplete"));
-                        return true;
-                    }
-                    wow_state::quests::QuestTurnInStage::OfferReward { reward_choices } => {
-                        tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, reward_choices, "quest turn-in choosing first authoritative reward option");
-                        self.pending_turn_in = Some((quest, Instant::now(), "choose-reward"));
-                        return self
-                            .propose_command(
-                                GameplayCommand::ChooseQuestReward {
-                                    quest,
-                                    giver: dialog.giver,
-                                    reward: 0,
-                                },
-                                true,
-                            )
-                            .await;
-                    }
-                }
-            }
-            let reward_giver = self
-                .state
-                .authoritative
-                .quests
-                .giver_status
-                .iter()
-                .find(|(_, status)| quest_status_reward(**status))
-                .map(|(&giver, &status)| (giver, status));
-            if let Some((giver, status)) = reward_giver {
-                tracing::info!(lane=?self.state.lane, quest, ?giver, status, "quest scheduler opening authoritative turn-in giver");
-                self.pending_turn_in = Some((quest, Instant::now(), "complete-quest"));
-                return self
-                    .propose_command(GameplayCommand::TurnInQuest { quest, giver }, true)
-                    .await;
-            }
-            if let Some(player) = self.state.authoritative.position.player {
-                if let Some(destination) = wow_policy::questing::static_hints::nearest_turn_in(
-                    quest,
-                    player.map,
-                    player.point,
-                ) {
-                    if turn_in_search_arrived(player.point, destination) {
-                        self.waiting(format!("quest {quest} reached turn-in search area; waiting for live authoritative reward giver"));
-                        if self
-                            .last_turn_in_search_query
-                            .is_none_or(|(queried_quest, at)| {
-                                queried_quest != quest || at.elapsed() >= Duration::from_secs(10)
-                            })
-                        {
-                            self.last_turn_in_search_query = Some((quest, Instant::now()));
-                            return self
-                                .propose_command(GameplayCommand::QueryQuestGivers, true)
-                                .await;
-                        }
-                        return true;
-                    }
-                    let work = self.current_work.clone().expect("turn-in work exists");
-                    tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "completed quest using AzerothCore turn-in search hint");
-                    self.queue_movement(
-                        destination,
-                        TURN_IN_SEARCH_RANGE,
-                        Some(GameplayCommand::QueryQuestGivers),
-                        None,
-                        PlanOrigin::SystemPolicy,
-                        work,
-                        MovementPurpose::SearchArea,
-                    );
-                    return true;
-                }
-            }
-            tracing::debug!(lane=?self.state.lane, quest, "completed quest has no observed reward giver; refreshing quest-giver statuses");
-            return self
-                .propose_command(GameplayCommand::QueryQuestGivers, true)
-                .await;
+            return self.tick_complete_quest(quest).await;
         }
 
         let available_giver = self
@@ -1513,6 +988,469 @@ impl LaneEngine {
             .await
     }
 
+    async fn tick_incomplete_quest(&mut self, quest: u32) -> bool {
+        if !self
+            .state
+            .authoritative
+            .quests
+            .definitions
+            .contains_key(&quest)
+        {
+            self.set_work(QuestWorkKey::QueryDefinition { quest });
+            tracing::info!(lane=?self.state.lane, quest, "quest scheduler requesting authoritative quest definition");
+            return self
+                .propose_command(GameplayCommand::QueryQuest { quest }, true)
+                .await;
+        }
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        let excluded: BTreeSet<(usize, EntityId)> = self
+            .credited_quest_targets
+            .iter()
+            .filter_map(|(credited_quest, objective, target)| {
+                (*credited_quest == quest).then_some((*objective, *target))
+            })
+            .collect();
+        match resolve_with_exclusions(&snapshot, quest, &excluded) {
+            ObjectiveResolution::WaitingForDefinition => {
+                self.waiting(format!(
+                    "quest {quest} is waiting for authoritative definition"
+                ));
+                return true;
+            }
+            ObjectiveResolution::GroundedCreature { objective, target } => {
+                self.set_work(QuestWorkKey::CombatObjective {
+                    quest,
+                    objective,
+                    target,
+                });
+                tracing::info!(lane=?self.state.lane, quest, objective, ?target, "quest scheduler grounded creature objective from live object state");
+                return self.dispatch_combat_target(target).await;
+            }
+            ObjectiveResolution::GroundedGameObject { objective, target } => {
+                self.set_work(QuestWorkKey::InteractObjective {
+                    quest,
+                    objective,
+                    target,
+                });
+                if !self.interaction_ready(quest, target) {
+                    return true;
+                }
+                tracing::info!(lane=?self.state.lane, quest, objective, ?target, "quest scheduler grounded game-object objective from live object state");
+                let baseline_progress = self.quest_objective_progress(quest, objective);
+                return self
+                    .dispatch_quest_semantic(
+                        GameplayCommand::UseGameObject(target),
+                        PendingQuestAction::QuestObjectUse {
+                            quest,
+                            target,
+                            objective: Some(objective),
+                            item: None,
+                            baseline_progress,
+                            baseline_count: 0,
+                            started: Instant::now(),
+                        },
+                    )
+                    .await;
+            }
+            ObjectiveResolution::GroundedScriptedItemUse {
+                objective,
+                target,
+                item,
+                spell,
+                cast_count,
+            } => {
+                self.set_work(QuestWorkKey::InteractObjective {
+                    quest,
+                    objective,
+                    target,
+                });
+                let Some(instance) = self
+                    .state
+                    .authoritative
+                    .inventory
+                    .usable_instance(item)
+                    .cloned()
+                else {
+                    self.waiting(format!("quest {quest} needs usable item {item} for scripted objective, but no authoritative backpack slot/GUID is known"));
+                    return true;
+                };
+                tracing::info!(lane=?self.state.lane, quest, objective, ?target, item, spell, slot=instance.backpack_slot, "quest scheduler using scripted targeted quest item");
+                return self
+                    .dispatch_quest_semantic(
+                        GameplayCommand::UseItemInstance {
+                            item,
+                            item_guid: instance.guid,
+                            backpack_slot: instance.backpack_slot,
+                            spell,
+                            target: Some(target),
+                            cast_count,
+                        },
+                        self.pending_quest_credit(quest, objective, target, "scripted item use"),
+                    )
+                    .await;
+            }
+            ObjectiveResolution::GroundedQuestSpell {
+                objective,
+                target,
+                spell,
+                name,
+            } => {
+                self.set_work(QuestWorkKey::InteractObjective {
+                    quest,
+                    objective,
+                    target,
+                });
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if let Err(reason) = wow_policy::combat::readiness::check_spell_readiness(
+                    &snapshot,
+                    spell,
+                    Some(target),
+                    now_ms,
+                ) {
+                    self.waiting(format!(
+                        "quest {quest} is waiting for {name} ({spell}): {reason:?}"
+                    ));
+                    return true;
+                }
+                tracing::info!(lane=?self.state.lane, quest, objective, ?target, spell, %name, "quest scheduler casting required spell on quest target");
+                return self
+                    .dispatch_quest_semantic(
+                        GameplayCommand::Cast {
+                            spell,
+                            target: Some(target),
+                        },
+                        self.pending_quest_credit(quest, objective, target, name),
+                    )
+                    .await;
+            }
+            ObjectiveResolution::QuestSpellUnavailable {
+                objective,
+                target,
+                name,
+            } => {
+                self.set_work(QuestWorkKey::InteractObjective {
+                    quest,
+                    objective,
+                    target,
+                });
+                self.waiting(format!("quest {quest} needs {name} for target {target}, but the spell is not in the observed spellbook"));
+                return true;
+            }
+            ObjectiveResolution::GroundedControlledSpell {
+                objective,
+                target,
+                spell,
+            } => {
+                self.set_work(QuestWorkKey::InteractObjective {
+                    quest,
+                    objective,
+                    target,
+                });
+                tracing::info!(lane=?self.state.lane, quest, objective, ?target, spell, mover=?self.state.authoritative.control.mover, "quest scheduler using observed controlled-unit ability for objective");
+                return self
+                    .dispatch_quest_semantic(
+                        GameplayCommand::VehicleCast {
+                            spell,
+                            target: Some(target),
+                        },
+                        self.pending_quest_credit(
+                            quest,
+                            objective,
+                            target,
+                            "controlled quest ability",
+                        ),
+                    )
+                    .await;
+            }
+            ObjectiveResolution::GroundedQuestTool {
+                target,
+                activation_spell,
+            } => {
+                self.set_work(QuestWorkKey::InteractObjective {
+                    quest,
+                    objective: usize::MAX,
+                    target,
+                });
+                if !self.interaction_ready(quest, target) {
+                    return true;
+                }
+                tracing::info!(lane=?self.state.lane, quest, ?target, ?activation_spell, "quest scheduler activating live quest-bound control object");
+                let command = activation_spell
+                    .map(|spell| GameplayCommand::CastGameObject {
+                        spell,
+                        target,
+                        report_use: true,
+                    })
+                    .unwrap_or(GameplayCommand::UseGameObject(target));
+                let pending = PendingQuestAction::ControlActivation {
+                    target,
+                    started: Instant::now(),
+                };
+                return self.dispatch_quest_semantic(command, pending).await;
+            }
+            ObjectiveResolution::QuestToolSearch { destination } => {
+                let work = self.set_work(QuestWorkKey::TravelToObjective {
+                    quest,
+                    objective: usize::MAX,
+                    destination,
+                });
+                if self
+                    .state
+                    .authoritative
+                    .position
+                    .player
+                    .is_some_and(|player| player.point.distance(destination) <= 12.0)
+                {
+                    self.waiting(format!("quest {quest} reached quest-control search area; waiting for live authoritative control object"));
+                    return true;
+                }
+                tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "quest scheduler traveling to quest-bound control object search area");
+                self.queue_movement(
+                    destination,
+                    12.0,
+                    None,
+                    None,
+                    PlanOrigin::SystemPolicy,
+                    work,
+                    MovementPurpose::SearchArea,
+                );
+                return true;
+            }
+            ObjectiveResolution::GroundedItemCreature { item, target, dead } => {
+                self.set_work(QuestWorkKey::CollectItem { quest, item });
+                if dead {
+                    tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler looting grounded quest-item source");
+                    let baseline_count = self.quest_item_count(item);
+                    return self
+                        .dispatch_quest_semantic(
+                            GameplayCommand::Loot(target),
+                            PendingQuestAction::Loot {
+                                item,
+                                target,
+                                baseline_count,
+                                baseline_generation: self
+                                    .state
+                                    .authoritative
+                                    .inventory
+                                    .bot_loot_generation,
+                                started: Instant::now(),
+                            },
+                        )
+                        .await;
+                }
+                tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler engaging grounded quest-item source through shared combat selector");
+                return self.dispatch_combat_target(target).await;
+            }
+            ObjectiveResolution::GroundedItemGameObject { item, target } => {
+                self.set_work(QuestWorkKey::CollectItem { quest, item });
+                if !self.interaction_ready(quest, target) {
+                    return true;
+                }
+                tracing::info!(lane=?self.state.lane, quest, item, ?target, "quest scheduler using grounded game-object quest-item source");
+                let baseline_count = self.quest_item_count(item);
+                return self
+                    .dispatch_quest_semantic(
+                        GameplayCommand::UseGameObject(target),
+                        PendingQuestAction::QuestObjectUse {
+                            quest,
+                            target,
+                            objective: None,
+                            item: Some(item),
+                            baseline_progress: 0,
+                            baseline_count,
+                            started: Instant::now(),
+                        },
+                    )
+                    .await;
+            }
+            ObjectiveResolution::SearchArea {
+                objective,
+                destination,
+                alternatives,
+                source,
+            } => {
+                let work = self.set_work(QuestWorkKey::TravelToObjective {
+                    quest,
+                    objective,
+                    destination,
+                });
+                let key = (quest, objective, 0);
+                let current_pos = self
+                    .state
+                    .authoritative
+                    .position
+                    .player
+                    .map(|player| player.point);
+                let arrived =
+                    current_pos.is_some_and(|position| position.distance(destination) <= 18.0);
+                let candidates =
+                    bounded_candidates(alternatives, current_pos.unwrap_or(destination));
+                let Some(destination) =
+                    self.next_search_destination(key, &candidates, arrived.then_some(destination))
+                else {
+                    self.waiting(format!("quest {quest} exhausted nearby {source} hints for objective {objective}; waiting before a bounded retry"));
+                    return true;
+                };
+                tracing::info!(lane=?self.state.lane, quest, objective, work_id=?work.id, %source, x=destination.x, y=destination.y, "quest scheduler starting bounded objective-area travel");
+                self.queue_movement(
+                    destination,
+                    18.0,
+                    None,
+                    None,
+                    PlanOrigin::SystemPolicy,
+                    work,
+                    MovementPurpose::SearchArea,
+                );
+                return true;
+            }
+            ObjectiveResolution::ItemCollection {
+                item,
+                required,
+                current,
+                destinations,
+            } => {
+                let work = self.set_work(QuestWorkKey::CollectItem { quest, item });
+                let key = (quest, usize::MAX, item);
+                let current_pos = self
+                    .state
+                    .authoritative
+                    .position
+                    .player
+                    .map(|player| player.point);
+                let candidates = bounded_candidates(destinations, current_pos.unwrap_or_default());
+                let arrived = current_pos.is_some_and(|position| {
+                    candidates
+                        .iter()
+                        .any(|candidate| position.distance(*candidate) <= 18.0)
+                });
+                let current_destination = candidates.iter().copied().find(|point| {
+                    current_pos.is_some_and(|position| position.distance(*point) <= 18.0)
+                });
+                let Some(destination) = self.next_search_destination(
+                    key,
+                    &candidates,
+                    arrived.then_some(current_destination).flatten(),
+                ) else {
+                    self.waiting(format!("quest {quest} exhausted nearby loot-source hints for item {item} at {current}/{required}; waiting before a bounded retry"));
+                    return true;
+                };
+                if !arrived || current_destination != Some(destination) {
+                    tracing::info!(lane=?self.state.lane, quest, item, current, required, work_id=?work.id, x=destination.x, y=destination.y, "quest item objective using AzerothCore loot-source search hint");
+                    self.queue_movement(
+                        destination,
+                        18.0,
+                        None,
+                        None,
+                        PlanOrigin::SystemPolicy,
+                        work,
+                        MovementPurpose::SearchArea,
+                    );
+                }
+                return true;
+            }
+            ObjectiveResolution::NoSupportedObjective => {
+                self.waiting(format!("quest {quest} has no remaining supported objective in the authoritative definition"));
+                return true;
+            }
+        }
+    }
+
+    async fn tick_complete_quest(&mut self, quest: u32) -> bool {
+        self.set_work(QuestWorkKey::TurnIn { quest });
+        if let Some(dialog) = self.state.authoritative.quests.turn_in.get(&quest).cloned() {
+            match dialog.stage {
+                wow_state::quests::QuestTurnInStage::RequestItems { can_complete: true } => {
+                    tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, "quest turn-in requesting reward after required-items confirmation");
+                    self.pending_turn_in = Some((quest, Instant::now(), "request-reward"));
+                    return self
+                        .propose_command(
+                            GameplayCommand::RequestQuestReward {
+                                quest,
+                                giver: dialog.giver,
+                            },
+                            true,
+                        )
+                        .await;
+                }
+                wow_state::quests::QuestTurnInStage::RequestItems {
+                    can_complete: false,
+                } => {
+                    self.waiting(format!("quest {quest} turn-in dialog reports required items or money are still incomplete"));
+                    return true;
+                }
+                wow_state::quests::QuestTurnInStage::OfferReward { reward_choices } => {
+                    tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, reward_choices, "quest turn-in choosing first authoritative reward option");
+                    self.pending_turn_in = Some((quest, Instant::now(), "choose-reward"));
+                    return self
+                        .propose_command(
+                            GameplayCommand::ChooseQuestReward {
+                                quest,
+                                giver: dialog.giver,
+                                reward: 0,
+                            },
+                            true,
+                        )
+                        .await;
+                }
+            }
+        }
+        let reward_giver = self
+            .state
+            .authoritative
+            .quests
+            .giver_status
+            .iter()
+            .find(|(_, status)| quest_status_reward(**status))
+            .map(|(&giver, &status)| (giver, status));
+        if let Some((giver, status)) = reward_giver {
+            tracing::info!(lane=?self.state.lane, quest, ?giver, status, "quest scheduler opening authoritative turn-in giver");
+            self.pending_turn_in = Some((quest, Instant::now(), "complete-quest"));
+            return self
+                .propose_command(GameplayCommand::TurnInQuest { quest, giver }, true)
+                .await;
+        }
+        if let Some(player) = self.state.authoritative.position.player {
+            if let Some(destination) =
+                wow_policy::questing::static_hints::nearest_turn_in(quest, player.map, player.point)
+            {
+                if turn_in_search_arrived(player.point, destination) {
+                    self.waiting(format!("quest {quest} reached turn-in search area; waiting for live authoritative reward giver"));
+                    if self
+                        .last_turn_in_search_query
+                        .is_none_or(|(queried_quest, at)| {
+                            queried_quest != quest || at.elapsed() >= Duration::from_secs(10)
+                        })
+                    {
+                        self.last_turn_in_search_query = Some((quest, Instant::now()));
+                        return self
+                            .propose_command(GameplayCommand::QueryQuestGivers, true)
+                            .await;
+                    }
+                    return true;
+                }
+                let work = self.current_work.clone().expect("turn-in work exists");
+                tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "completed quest using AzerothCore turn-in search hint");
+                self.queue_movement(
+                    destination,
+                    TURN_IN_SEARCH_RANGE,
+                    Some(GameplayCommand::QueryQuestGivers),
+                    None,
+                    PlanOrigin::SystemPolicy,
+                    work,
+                    MovementPurpose::SearchArea,
+                );
+                return true;
+            }
+        }
+        tracing::debug!(lane=?self.state.lane, quest, "completed quest has no observed reward giver; refreshing quest-giver statuses");
+        return self
+            .propose_command(GameplayCommand::QueryQuestGivers, true)
+            .await;
+    }
+
     fn set_work(&mut self, key: QuestWorkKey) -> QuestWorkRuntime {
         if let Some(work) = &self.current_work {
             if work.key == key {
@@ -1538,6 +1476,55 @@ impl LaneEngine {
             giver,
             (attempts, Instant::now() + giver_retry_delay(attempts)),
         );
+    }
+
+    fn quest_objective_progress(&self, quest: u32, objective: usize) -> u32 {
+        self.state
+            .authoritative
+            .quests
+            .active
+            .get(&quest)
+            .and_then(|progress| progress.objectives.get(objective))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn quest_item_count(&self, item: u32) -> u32 {
+        self.state
+            .authoritative
+            .inventory
+            .items
+            .get(&item)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn pending_quest_credit(
+        &self,
+        quest: u32,
+        objective: usize,
+        target: EntityId,
+        label: &'static str,
+    ) -> PendingQuestAction {
+        PendingQuestAction::QuestCredit {
+            quest,
+            objective,
+            baseline: self.quest_objective_progress(quest, objective),
+            target,
+            started: Instant::now(),
+            label,
+        }
+    }
+
+    fn defer_quest_interaction(&mut self, quest: u32, target: EntityId) -> (u8, Duration) {
+        let attempts = self
+            .interaction_retry_after
+            .get(&(quest, target))
+            .map_or(1, |(attempts, _)| attempts.saturating_add(1));
+        let delay = giver_retry_delay(attempts);
+        self.interaction_retry_after
+            .insert((quest, target), (attempts, Instant::now() + delay));
+        (attempts, delay)
     }
 
     fn interaction_ready(&mut self, quest: u32, target: EntityId) -> bool {
@@ -1671,14 +1658,7 @@ impl LaneEngine {
                 baseline_generation,
                 started,
             } => {
-                let current = self
-                    .state
-                    .authoritative
-                    .inventory
-                    .items
-                    .get(&item)
-                    .copied()
-                    .unwrap_or_default();
+                let current = self.quest_item_count(item);
                 let generation = self.state.authoritative.inventory.bot_loot_generation;
                 let player_superseded = self.state.authoritative.inventory.current_loot
                     == Some(target)
@@ -1755,13 +1735,7 @@ impl LaneEngine {
                     self.waiting(format!("quest {quest} object use on {target} is awaiting objective, inventory, or despawn evidence"));
                     return true;
                 }
-                let attempts = self
-                    .interaction_retry_after
-                    .get(&(quest, target))
-                    .map_or(1, |(attempts, _)| attempts.saturating_add(1));
-                let delay = giver_retry_delay(attempts);
-                self.interaction_retry_after
-                    .insert((quest, target), (attempts, Instant::now() + delay));
+                let (attempts, delay) = self.defer_quest_interaction(quest, target);
                 tracing::warn!(lane=?self.state.lane, quest, ?objective, ?item, ?target, attempts, retry_after_ms=delay.as_millis(), baseline_progress, progress, baseline_count, count, "quest object use produced no authoritative progress; applying bounded retry delay");
                 self.pending_quest_action = None;
                 false
@@ -1776,19 +1750,6 @@ impl LaneEngine {
                     self.waiting(format!("quest control activation on {target} is waiting for authoritative controlled mover"));
                     return true;
                 }
-                let attempts = self
-                    .interaction_retry_after
-                    .get(&(
-                        self.current_work
-                            .as_ref()
-                            .and_then(|work| match work.key {
-                                QuestWorkKey::InteractObjective { quest, .. } => Some(quest),
-                                _ => None,
-                            })
-                            .unwrap_or_default(),
-                        target,
-                    ))
-                    .map_or(1, |(attempts, _)| attempts.saturating_add(1));
                 let quest = self
                     .current_work
                     .as_ref()
@@ -1797,9 +1758,7 @@ impl LaneEngine {
                         _ => None,
                     })
                     .unwrap_or_default();
-                let delay = giver_retry_delay(attempts);
-                self.interaction_retry_after
-                    .insert((quest, target), (attempts, Instant::now() + delay));
+                let (attempts, delay) = self.defer_quest_interaction(quest, target);
                 tracing::warn!(lane=?self.state.lane, quest, ?target, attempts, retry_after_ms=delay.as_millis(), "quest control activation timed out without authoritative mover; applying bounded retry delay");
                 self.pending_quest_action = None;
                 false
@@ -1921,14 +1880,7 @@ impl LaneEngine {
                     QuestWorkKey::CollectItem { item, .. } => *item,
                     _ => 0,
                 };
-                let baseline_count = self
-                    .state
-                    .authoritative
-                    .inventory
-                    .items
-                    .get(&item)
-                    .copied()
-                    .unwrap_or_default();
+                let baseline_count = self.quest_item_count(item);
                 Some(PendingQuestAction::Loot {
                     item,
                     target,
@@ -1962,23 +1914,7 @@ impl LaneEngine {
                 QuestWorkKey::InteractObjective {
                     quest, objective, ..
                 } if *objective != usize::MAX => {
-                    let baseline = self
-                        .state
-                        .authoritative
-                        .quests
-                        .active
-                        .get(quest)
-                        .and_then(|p| p.objectives.get(*objective))
-                        .copied()
-                        .unwrap_or_default();
-                    Some(PendingQuestAction::QuestCredit {
-                        quest: *quest,
-                        objective: *objective,
-                        baseline,
-                        target,
-                        started: Instant::now(),
-                        label: "scripted item use",
-                    })
+                    Some(self.pending_quest_credit(*quest, *objective, target, "scripted item use"))
                 }
                 _ => Some(PendingQuestAction::Interact {
                     target,
@@ -1991,25 +1927,12 @@ impl LaneEngine {
             } => match work {
                 QuestWorkKey::InteractObjective {
                     quest, objective, ..
-                } if *objective != usize::MAX => {
-                    let baseline = self
-                        .state
-                        .authoritative
-                        .quests
-                        .active
-                        .get(quest)
-                        .and_then(|p| p.objectives.get(*objective))
-                        .copied()
-                        .unwrap_or_default();
-                    Some(PendingQuestAction::QuestCredit {
-                        quest: *quest,
-                        objective: *objective,
-                        baseline,
-                        target,
-                        started: Instant::now(),
-                        label: "controlled quest ability",
-                    })
-                }
+                } if *objective != usize::MAX => Some(self.pending_quest_credit(
+                    *quest,
+                    *objective,
+                    target,
+                    "controlled quest ability",
+                )),
                 _ => Some(PendingQuestAction::Interact {
                     target,
                     started: Instant::now(),
