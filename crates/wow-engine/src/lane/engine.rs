@@ -40,6 +40,7 @@ enum MovementPurpose {
 const TURN_IN_SEARCH_RANGE: f32 = 5.0;
 const QUEST_SEARCH_ARRIVAL_RANGE: f32 = 18.0;
 const QUEST_TOOL_SEARCH_RANGE: f32 = 12.0;
+const MAX_INTERACTION_RETRIES: usize = 512;
 
 #[derive(Clone, Debug)]
 enum PendingQuestAction {
@@ -1690,6 +1691,18 @@ impl LaneEngine {
     }
 
     fn defer_quest_interaction(&mut self, quest: u32, target: EntityId) -> (u8, Duration) {
+        if !self.interaction_retry_after.contains_key(&(quest, target))
+            && self.interaction_retry_after.len() >= MAX_INTERACTION_RETRIES
+        {
+            if let Some(oldest) = self
+                .interaction_retry_after
+                .iter()
+                .min_by_key(|(_, (_, until))| *until)
+                .map(|(key, _)| *key)
+            {
+                self.interaction_retry_after.remove(&oldest);
+            }
+        }
         let attempts = self
             .interaction_retry_after
             .get(&(quest, target))
@@ -2499,7 +2512,6 @@ impl LaneEngine {
         self.last_turn_in_search_query = None;
         self.pending_movement = None;
         self.pending_quest_action = None;
-        self.interaction_retry_after.clear();
         self.search_attempts.clear();
         self.search_retry_after.clear();
         self.current_work = None;
@@ -2763,6 +2775,10 @@ mod tests {
         engine.pending_accept = Some((42, EntityId(8), Instant::now()));
         engine.credited_quest_targets.insert((42, 0, EntityId(8)));
         engine.los_blocked.insert(EntityId(8));
+        assert_eq!(
+            engine.defer_quest_interaction(42, EntityId(8)),
+            (1, Duration::from_secs(5))
+        );
 
         assert!(
             engine
@@ -2772,6 +2788,10 @@ mod tests {
         assert!(engine.pending_movement.is_none());
         assert!(engine.pending_quest_action.is_none());
         assert!(engine.pending_accept.is_none());
+        assert_eq!(
+            engine.defer_quest_interaction(42, EntityId(8)),
+            (2, Duration::from_secs(10))
+        );
         assert!(engine.current_work.is_none());
         assert!(engine.credited_quest_targets.is_empty());
         assert!(engine.los_blocked.is_empty());
