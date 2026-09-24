@@ -75,8 +75,12 @@ pub struct InventoryState {
 }
 
 impl InventoryState {
+    pub fn count(&self, item: u32) -> u32 {
+        self.items.get(&item).copied().unwrap_or_default()
+    }
+
     pub fn has(&self, item: u32, count: u32) -> bool {
-        self.items.get(&item).copied().unwrap_or(0) >= count
+        self.count(item) >= count
     }
 
     pub fn usable_instance(&self, item: u32) -> Option<&InventoryItemInstance> {
@@ -84,5 +88,20 @@ impl InventoryState {
             .values()
             .filter(|instance| instance.item == item && instance.count > 0)
             .min_by_key(|instance| (instance.backpack_slot, instance.guid))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InventoryState;
+
+    #[test]
+    fn item_count_is_shared_by_presence_checks() {
+        let mut inventory = InventoryState::default();
+        assert_eq!(inventory.count(7), 0);
+        inventory.items.insert(7, 3);
+        assert_eq!(inventory.count(7), 3);
+        assert!(inventory.has(7, 3));
+        assert!(!inventory.has(7, 4));
     }
 }

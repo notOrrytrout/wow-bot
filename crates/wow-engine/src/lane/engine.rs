@@ -1553,13 +1553,7 @@ impl LaneEngine {
     }
 
     fn quest_item_count(&self, item: u32) -> u32 {
-        self.state
-            .authoritative
-            .inventory
-            .items
-            .get(&item)
-            .copied()
-            .unwrap_or_default()
+        self.state.authoritative.inventory.count(item)
     }
 
     fn pending_quest_credit(
@@ -1797,7 +1791,7 @@ impl LaneEngine {
                     })
                     .unwrap_or(baseline_progress);
                 let count = item
-                    .and_then(|id| self.state.authoritative.inventory.items.get(&id).copied())
+                    .map(|id| self.state.authoritative.inventory.count(id))
                     .unwrap_or(baseline_count);
                 let gone = !self.state.authoritative.entities.0.contains_key(&target);
                 if progress > baseline_progress || count > baseline_count || gone {

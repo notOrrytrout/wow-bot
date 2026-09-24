@@ -462,13 +462,7 @@ fn active_quest_authorizes_attack(snapshot: &Snapshot, entry: u32) -> bool {
                     < target.required
         });
         let unmet_creature_item_source = definition.items.iter().any(|item| {
-            let current = snapshot
-                .state
-                .inventory
-                .items
-                .get(&item.item)
-                .copied()
-                .unwrap_or_default();
+            let current = snapshot.state.inventory.count(item.item);
             current < item.required
                 && wow_policy::questing::static_hints::item_source_entries(item.item)
                     .iter()

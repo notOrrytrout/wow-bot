@@ -243,13 +243,7 @@ pub fn resolve_with_exclusions(
     }
 
     for item in &definition.items {
-        let current = snapshot
-            .state
-            .inventory
-            .items
-            .get(&item.item)
-            .copied()
-            .unwrap_or_default();
+        let current = snapshot.state.inventory.count(item.item);
         if current < item.required {
             let source_entries = static_hints::item_source_entries(item.item);
             for (kind, entry) in &source_entries {
