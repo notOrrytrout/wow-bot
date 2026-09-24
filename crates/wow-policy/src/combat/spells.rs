@@ -26,6 +26,8 @@ pub struct SpellMetadata {
     pub requires_combo_points: bool,
     pub cost_spell_modifiers: Vec<CostSpellModifier>,
     pub school_mask: u32,
+    pub attack_spell: bool,
+    pub damage_over_time: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -150,7 +152,7 @@ fn catalog() -> &'static SpellCatalogIndex {
         let catalog: SpellCatalog =
             serde_json::from_str(include_str!("../../data/spell-catalog.json"))
                 .expect("generated spell catalogue");
-        assert_eq!(catalog.format_version, 1);
+        assert_eq!(catalog.format_version, 2);
         SpellCatalogIndex {
             spells: catalog
                 .spells

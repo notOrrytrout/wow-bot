@@ -13,6 +13,11 @@ BUILD = 12340
 CLASS_IDS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 11)
 ONLY_STEALTHED_ATTRIBUTE = 0x00020000
 STEALTH_AURA_TYPE = 16
+PET_LIFECYCLE_EFFECTS = {55, 56, 57, 101, 102, 109}
+DIRECT_DAMAGE_EFFECTS = {1, 2, 7, 8, 9, 17, 31, 58, 62}
+SPELL_EFFECT_APPLY_AURA = 6
+SPELL_AURA_PERIODIC_DAMAGE = 3
+SPELL_AURA_PERIODIC_LEECH = 53
 
 # WotLK Spell.dbc offsets are reviewed against AzerothCore DBCStructure.h.
 FIELDS = {
@@ -56,6 +61,7 @@ FIELDS = {
     "equipped_item_class": 68,
     "equipped_item_subclass_mask": 69,
     "equipped_item_inventory_mask": 70,
+    "effect_start": 71,
     "name_offset": 136,
     "rank_offset": 153,
     "cost_percent": 204,
@@ -104,6 +110,24 @@ def float_value(bits: int) -> float:
 
 def signed_value(bits: int) -> int:
     return struct.unpack("<i", struct.pack("<I", bits))[0]
+
+
+def attack_spell_flags(row: tuple[int, ...]) -> tuple[bool, bool]:
+    """Match the old bot's DBC rule for offensive and damage-over-time spells."""
+    attack = False
+    dot = False
+    for effect in range(3):
+        effect_kind = row[FIELDS["effect_start"] + effect]
+        if effect_kind in PET_LIFECYCLE_EFFECTS:
+            return False, False
+        if effect_kind in DIRECT_DAMAGE_EFFECTS:
+            attack = True
+        if effect_kind == SPELL_EFFECT_APPLY_AURA:
+            aura = row[FIELDS["effect_aura_start"] + effect]
+            if aura in (SPELL_AURA_PERIODIC_DAMAGE, SPELL_AURA_PERIODIC_LEECH):
+                attack = True
+                dot = True
+    return attack, dot
 
 
 def generate(dbc_dir: Path) -> dict:
@@ -196,6 +220,7 @@ def generate(dbc_dir: Path) -> dict:
         if value("attributes") & ONLY_STEALTHED_ATTRIBUTE:
             stealth_required_spells.append(spell_id)
         rank = dbc_string(spell_strings, value("rank_offset"))
+        attack_spell, damage_over_time = attack_spell_flags(row)
         range_row = ranges.get(value("range_index"))
         cast_row = cast_times.get(value("cast_time_index"))
         duration_row = durations.get(value("duration_index"))
@@ -278,6 +303,8 @@ def generate(dbc_dir: Path) -> dict:
                 and signed_value(row[FIELDS["effect_misc_start"] + effect]) == 14
             ],
             "school_mask": value("school_mask"),
+            "attack_spell": attack_spell,
+            "damage_over_time": damage_over_time,
         })
 
     stealth_aura_spells = sorted(
@@ -287,7 +314,7 @@ def generate(dbc_dir: Path) -> dict:
     if not records:
         raise ValueError("no class spells found in the supplied DBC files")
     return {
-        "format_version": 1,
+        "format_version": 2,
         "source": {
             "client_build": BUILD,
             "sha256": {name: hashlib.sha256(path.read_bytes()).hexdigest()

@@ -72,7 +72,7 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     if tree.is_none() && !player_is_pre_specialization(snapshot) {
         return deferred("specialization_not_authoritative");
     }
-    let Some((power_type, power)) = player_power(snapshot) else {
+    let Some((power_type, _)) = player_power(snapshot) else {
         return deferred("combat_resource_state_unknown");
     };
     let priorities = match tree {
@@ -103,12 +103,6 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     let Some(priorities) = priorities else {
         return deferred("combat_resource_type_mismatch");
     };
-    if power == 0 {
-        if is_wand_caster(class_id) {
-            return oom_fallback(snapshot, target);
-        }
-        return CombatDecision::Melee { target };
-    }
 
     for family_id in priorities {
         let Some(spell) = crate::combat::spells::family_spells(family_id).and_then(|spells| {
@@ -131,11 +125,95 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
         }
     }
 
-    if is_wand_caster(class_id) {
-        deferred("caster_has_no_ready_known_offensive_spell")
-    } else {
-        CombatDecision::Melee { target }
+    let now_ms = Millis::wall_clock_now().0;
+    if let Some(spell) = select_ranged_attack_fallback(snapshot, class_id, target, now_ms) {
+        return CombatDecision::Cast { spell, target };
     }
+    if is_wand_caster(class_id) && has_equipped_wand(snapshot) {
+        return CombatDecision::Wand { target };
+    }
+    if melee_fallback_allowed(snapshot, class_id, tree) {
+        CombatDecision::Melee { target }
+    } else {
+        deferred("no_safe_offensive_fallback")
+    }
+}
+
+fn select_ranged_attack_fallback(
+    snapshot: &Snapshot,
+    class_id: u8,
+    target: EntityId,
+    now_ms: u64,
+) -> Option<u32> {
+    const MIN_RANGED_ATTACK_RANGE_YARDS: f32 = 5.5;
+
+    let mut candidates = snapshot
+        .state
+        .capabilities
+        .spells
+        .iter()
+        .filter_map(|spell| crate::combat::spells::metadata(*spell))
+        .filter(|spell| spell.classes.contains(&class_id))
+        .filter(|spell| spell.attack_spell)
+        .filter(|spell| spell.id != 5019)
+        .filter_map(|spell| {
+            let (_, maximum) = crate::combat::spells::range_for(spell.id, true)?;
+            (maximum > MIN_RANGED_ATTACK_RANGE_YARDS).then_some((spell, maximum))
+        })
+        .filter(|(spell, _)| {
+            crate::combat::readiness::check_spell_readiness(
+                snapshot,
+                spell.id,
+                Some(target),
+                now_ms,
+            )
+            .is_ok()
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|(left, left_max), (right, right_max)| {
+        is_basic_ranged_attack(&left.name)
+            .cmp(&is_basic_ranged_attack(&right.name))
+            .then_with(|| left_max.total_cmp(right_max))
+            .then_with(|| spell_rank(&right.rank).cmp(&spell_rank(&left.rank)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates.first().map(|(spell, _)| spell.id)
+}
+
+fn is_basic_ranged_attack(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "shoot"
+        || name.starts_with("shoot ")
+        || name == "throw"
+        || name.starts_with("throw ")
+        || name == "auto shot"
+}
+
+fn spell_rank(rank: &str) -> u32 {
+    rank.strip_prefix("Rank ")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+fn melee_fallback_allowed(snapshot: &Snapshot, class_id: u8, tree: Option<u8>) -> bool {
+    let player = snapshot.state.session.character_guid.map(EntityId);
+    let assigned_tank = player.is_some_and(|player| {
+        snapshot.state.group.members.iter().any(|member| {
+            member.entity == player && member.role.as_deref().is_some_and(role_is_tank)
+        })
+    });
+    assigned_tank
+        || matches!(class_id, 1 | 4 | 6)
+        || matches!(
+            (class_id, tree),
+            (2, Some(2)) | (7, Some(1)) | (11, Some(1))
+        )
+}
+
+fn role_is_tank(role: &str) -> bool {
+    let role = role.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    matches!(role.as_str(), "tank" | "main_tank" | "off_tank")
 }
 
 fn player_is_pre_specialization(snapshot: &Snapshot) -> bool {
@@ -336,16 +414,6 @@ fn is_wand_caster(class_id: u8) -> bool {
     matches!(class_id, 5 | 8 | 9)
 }
 
-fn oom_fallback(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
-    if has_equipped_wand(snapshot) {
-        return CombatDecision::Wand { target };
-    }
-    if !snapshot.state.inventory.equipment_authoritative {
-        return deferred("oom_but_ranged_slot_not_authoritative");
-    }
-    CombatDecision::Melee { target }
-}
-
 fn deferred(reason: &'static str) -> CombatDecision {
     CombatDecision::Deferred { reason }
 }
@@ -365,7 +433,11 @@ pub fn has_equipped_wand(snapshot: &Snapshot) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wow_state::{AuthoritativeState, entities::EntityState};
+    use wow_state::{
+        ActiveCastState, AuthoritativeState,
+        entities::{EntityKind, EntityState},
+        group::GroupMember,
+    };
 
     fn state(
         class_id: u8,
@@ -487,7 +559,7 @@ mod tests {
         let mut no_spell = state(8, 0, 0, 100, target);
         assert_eq!(
             select(&Snapshot::from_state(&no_spell), target),
-            deferred("caster_has_no_ready_known_offensive_spell")
+            deferred("no_safe_offensive_fallback")
         );
 
         let spell = supported_class_trees()
@@ -502,20 +574,161 @@ mod tests {
             .insert(spell, u64::MAX);
         assert_eq!(
             select(&Snapshot::from_state(&no_spell), target),
-            deferred("caster_has_no_ready_known_offensive_spell")
+            deferred("no_safe_offensive_fallback")
         );
 
         no_spell.entities.0.get_mut(&EntityId(1)).unwrap().power = Some((0, 100));
         no_spell.inventory.equipment_authoritative = true;
         assert_eq!(
             select(&Snapshot::from_state(&no_spell), target),
-            CombatDecision::Melee { target }
+            deferred("no_safe_offensive_fallback")
         );
 
+        no_spell.capabilities.spells.insert(5019);
+        assert_eq!(
+            select(&Snapshot::from_state(&no_spell), target),
+            deferred("no_safe_offensive_fallback")
+        );
         no_spell.inventory.equipped_ranged_item = wand_catalog().wand_items.first().copied();
         assert_eq!(
             select(&Snapshot::from_state(&no_spell), target),
             CombatDecision::Wand { target }
         );
+        assert_eq!(
+            select_action(&Snapshot::from_state(&no_spell), target)
+                .unwrap()
+                .command,
+            GameplayCommand::Cast {
+                spell: 5019,
+                target: Some(target),
+            }
+        );
+
+        no_spell.entities.0.get_mut(&EntityId(1)).unwrap().power = Some((100, 100));
+        assert_eq!(
+            select(&Snapshot::from_state(&no_spell), target),
+            CombatDecision::Wand { target }
+        );
+    }
+
+    #[test]
+    fn caster_uses_known_ready_ranged_attack_when_priority_spell_is_unknown() {
+        let target = EntityId(9);
+        let mut state = state(8, 0, 0, 100, target);
+        state.capabilities.spells.insert(116); // Mage Frostbolt, outside Arcane priorities.
+
+        assert_eq!(
+            select(&Snapshot::from_state(&state), target),
+            CombatDecision::Cast { spell: 116, target }
+        );
+        assert_eq!(
+            select_action(&Snapshot::from_state(&state), target)
+                .unwrap()
+                .command,
+            GameplayCommand::Cast {
+                spell: 116,
+                target: Some(target),
+            }
+        );
+    }
+
+    #[test]
+    fn interrupt_precedes_ranged_attack_fallback() {
+        let target = EntityId(9);
+        let mut state = state(8, 0, 0, 100, target);
+        state.capabilities.spells.extend([116, 2139]);
+        state.entities.0.get_mut(&target).unwrap().kind = EntityKind::Unit;
+        state.entities.0.get_mut(&target).unwrap().hostile = true;
+        state.active_casts.insert(
+            target,
+            ActiveCastState {
+                spell: 133,
+                started_at_ms: 1,
+                ends_at_ms: u64::MAX,
+            },
+        );
+
+        assert_eq!(
+            select_action(&Snapshot::from_state(&state), target)
+                .unwrap()
+                .command,
+            GameplayCommand::Cast {
+                spell: 2139,
+                target: Some(target),
+            }
+        );
+    }
+
+    #[test]
+    fn emergency_heal_precedes_ranged_attack_fallback() {
+        let target = EntityId(9);
+        let mut state = state(5, 0, 0, 100, target);
+        state.capabilities.spells.extend([585, 2061]);
+        state.entities.0.get_mut(&EntityId(1)).unwrap().health = Some((20, 100));
+
+        assert_eq!(
+            select_action(&Snapshot::from_state(&state), target)
+                .unwrap()
+                .command,
+            GameplayCommand::Cast {
+                spell: 2061,
+                target: Some(EntityId(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn ranged_caster_does_not_use_melee_without_melee_profile() {
+        let target = EntityId(9);
+        let mut state = state(8, 0, 0, 0, target);
+        state.inventory.equipment_authoritative = true;
+
+        assert_eq!(
+            select(&Snapshot::from_state(&state), target),
+            deferred("no_safe_offensive_fallback")
+        );
+    }
+
+    #[test]
+    fn assigned_tank_can_use_basic_melee_fallback() {
+        let target = EntityId(9);
+        let mut state = state(8, 0, 0, 0, target);
+        state.group.members.push(GroupMember {
+            entity: EntityId(1),
+            role: Some("main tank".into()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            select(&Snapshot::from_state(&state), target),
+            CombatDecision::Melee { target }
+        );
+    }
+
+    #[test]
+    fn melee_class_uses_basic_attack_when_no_priority_or_ranged_attack_is_ready() {
+        let target = EntityId(9);
+        let (power_type, _) = supported_class_trees()
+            .find(|(class, tree, _)| (*class, *tree) == (1, 0))
+            .unwrap()
+            .2[0];
+        let state = state(1, 0, power_type, 100, target);
+
+        assert_eq!(
+            select(&Snapshot::from_state(&state), target),
+            CombatDecision::Melee { target }
+        );
+    }
+
+    #[test]
+    fn spell_catalog_marks_damage_and_dot_spells_but_not_buffs_or_pet_summons() {
+        assert!(crate::combat::spells::metadata(116).unwrap().attack_spell);
+        assert!(
+            crate::combat::spells::metadata(172)
+                .unwrap()
+                .damage_over_time
+        );
+        assert!(!crate::combat::spells::metadata(17).unwrap().attack_spell);
+        assert!(!crate::combat::spells::metadata(688).unwrap().attack_spell);
     }
 }
