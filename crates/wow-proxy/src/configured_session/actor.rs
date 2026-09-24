@@ -137,13 +137,22 @@ impl ConfiguredSessionActor {
             SessionMessage::Tick(now) => {
                 if self.state.player.should_resume(now) && self.state.upstream_connected {
                     let ticket = self.state.ownership.begin(ControlMode::Bot);
-                    if self.state.ownership.commit(ticket) {
-                        if self.update_player_pause(false).await.is_ok() {
+                    match self.update_player_pause(false).await {
+                        Ok(()) if self.state.ownership.commit(ticket) => {
                             self.state.player.resumed();
+                            let owner = self.state.ownership.snapshot();
+                            tracing::info!(lane=?self.state.lane, generation=?owner.generation, movement_epoch=?owner.movement_epoch, "player idle window elapsed; bot ownership resumed");
+                            self.publish_ownership().await;
                         }
-                        let owner = self.state.ownership.snapshot();
-                        tracing::info!(lane=?self.state.lane, generation=?owner.generation, movement_epoch=?owner.movement_epoch, "player idle window elapsed; bot ownership resumed");
-                        self.publish_ownership().await;
+                        Ok(()) => {
+                            tracing::warn!(lane=?self.state.lane, "player idle window elapsed; bot resume transition became stale");
+                        }
+                        Err(error) => {
+                            self.state.ownership.fail(ticket);
+                            self.state.player.resume_failed(now);
+                            tracing::warn!(lane=?self.state.lane, %error, "player idle window elapsed; bot resume request failed");
+                            self.publish_ownership().await;
+                        }
                     }
                 }
                 false
@@ -285,6 +294,7 @@ impl ConfiguredSessionActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use wow_domain::{AccountId, LaneId, WorkerGeneration};
 
     #[tokio::test]
@@ -325,5 +335,83 @@ mod tests {
         assert_eq!(actor.state.player.count(), 0);
         assert!(!actor.state.upstream_connected);
         assert!(!actor.state.world_authoritative);
+    }
+
+    #[tokio::test]
+    async fn idle_resume_is_published_only_after_supervisor_accepts_resume() {
+        let (_, rx) = mpsc::channel(8);
+        let (worker_tx, mut worker_rx) = mpsc::channel(8);
+        let (upstream_tx, _upstream_rx) = mpsc::channel(8);
+        let (supervisor_tx, mut supervisor_rx) = mpsc::channel(8);
+        let mut actor = ConfiguredSessionActor {
+            state: ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO),
+            rx,
+            worker_tx,
+            upstream_tx,
+            supervisor_tx,
+        };
+        let moved_at = Instant::now();
+        actor.state.upstream_connected = true;
+        actor.state.player.bot_on();
+        actor.state.player.moved(moved_at);
+        actor.state.ownership.player_attached_bot_on();
+        actor.state.ownership.player_movement_takeover();
+
+        actor
+            .handle(SessionMessage::Tick(
+                moved_at + actor.state.player.idle_window,
+            ))
+            .await;
+
+        let command = supervisor_rx.recv().await.expect("resume request");
+        assert!(matches!(
+            command,
+            SupervisorCommand::UpdatePause { lane: LaneId(1), set, clear }
+                if set.is_empty() && clear.contains(PauseReasons::PLAYER_CONTROL)
+        ));
+        assert!(!actor.state.player.idle_resume_armed);
+        assert!(actor.state.ownership.snapshot().bot_allowed());
+        assert!(matches!(
+            worker_rx.recv().await,
+            Some(ProxyToWorker::OwnershipChanged(owner)) if owner.bot_allowed
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_idle_resume_keeps_resume_armed_and_does_not_publish_bot_ownership() {
+        let (_, rx) = mpsc::channel(8);
+        let (worker_tx, mut worker_rx) = mpsc::channel(8);
+        let (upstream_tx, _upstream_rx) = mpsc::channel(8);
+        let (supervisor_tx, supervisor_rx) = mpsc::channel(8);
+        drop(supervisor_rx);
+        let mut actor = ConfiguredSessionActor {
+            state: ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO),
+            rx,
+            worker_tx,
+            upstream_tx,
+            supervisor_tx,
+        };
+        let moved_at = Instant::now();
+        actor.state.upstream_connected = true;
+        actor.state.player.bot_on();
+        actor.state.player.moved(moved_at);
+        actor.state.ownership.player_attached_bot_on();
+        actor.state.ownership.player_movement_takeover();
+
+        let idle_deadline = moved_at + actor.state.player.idle_window;
+        actor.handle(SessionMessage::Tick(idle_deadline)).await;
+
+        assert!(actor.state.player.idle_resume_armed);
+        assert!(!actor.state.ownership.snapshot().bot_allowed());
+        assert!(matches!(
+            worker_rx.recv().await,
+            Some(ProxyToWorker::OwnershipChanged(owner)) if !owner.bot_allowed
+        ));
+        actor
+            .handle(SessionMessage::Tick(
+                idle_deadline + Duration::from_millis(250),
+            ))
+            .await;
+        assert!(worker_rx.try_recv().is_err());
     }
 }

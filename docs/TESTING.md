@@ -169,6 +169,15 @@ Regression coverage must verify:
 - Successful headless authoritative world entry: supervisor receives fresh Quest mission and bot ownership request without local chat commands.
 - Pre-world-entry/Warden failure: no Quest work becomes runnable merely because an upstream socket exists.
 
+## Idle-resume supervisor failure regression
+
+The configured-session actor tests cover both outcomes after the player idle window:
+
+- When the supervisor accepts the pause-clear request, the actor clears the idle-resume arm and publishes bot ownership.
+- When the supervisor is unavailable, the actor keeps resume armed, returns ownership to the player, and does not publish bot ownership. Retry delay increases from one second to a 30-second cap.
+
+The actor must not log a successful bot resume until the supervisor accepts the resume request.
+
 ## Multi-level MMAP vertical authority regression
 
 For a ground route through a cave, bridge, building, tunnel, ramp, dungeon, or other stacked geometry:

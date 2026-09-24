@@ -20,6 +20,8 @@ pub struct PlayerPresence {
     pub idle_resume_armed: bool,
     pub explicit_manual_off: bool,
     pub idle_window: Duration,
+    resume_retry_at: Option<Instant>,
+    resume_retry_delay: Duration,
 }
 impl PlayerPresence {
     pub fn new(idle_window: Duration) -> Self {
@@ -30,6 +32,8 @@ impl PlayerPresence {
             idle_resume_armed: false,
             explicit_manual_off: false,
             idle_window,
+            resume_retry_at: None,
+            resume_retry_delay: Duration::from_secs(1),
         }
     }
     pub fn attach(&mut self, id: u64) {
@@ -44,6 +48,7 @@ impl PlayerPresence {
     }
     pub fn moved(&mut self, now: Instant) {
         self.last_movement = Some(now);
+        self.reset_resume_retry();
         if !self.explicit_manual_off {
             self.idle_resume_armed = true;
         }
@@ -51,6 +56,7 @@ impl PlayerPresence {
     pub fn bot_on(&mut self) {
         self.explicit_manual_off = false;
         self.idle_resume_armed = true;
+        self.reset_resume_retry();
     }
     pub fn bot_off(&mut self) {
         self.explicit_manual_off = true;
@@ -71,11 +77,21 @@ impl PlayerPresence {
         )
     }
     pub fn should_resume(&self, now: Instant) -> bool {
-        self.resume_deadline()
-            .is_some_and(|deadline| now >= deadline)
+        self.resume_deadline().is_some_and(|deadline| {
+            now >= deadline && self.resume_retry_at.is_none_or(|retry_at| now >= retry_at)
+        })
+    }
+    pub fn resume_failed(&mut self, now: Instant) {
+        self.resume_retry_at = Some(now + self.resume_retry_delay);
+        self.resume_retry_delay = (self.resume_retry_delay * 2).min(Duration::from_secs(30));
     }
     pub fn resumed(&mut self) {
         self.idle_resume_armed = false;
         self.channel_block_until = None;
+        self.reset_resume_retry();
+    }
+    fn reset_resume_retry(&mut self) {
+        self.resume_retry_at = None;
+        self.resume_retry_delay = Duration::from_secs(1);
     }
 }
