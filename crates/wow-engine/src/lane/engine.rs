@@ -445,6 +445,9 @@ impl LaneEngine {
         match self.state.mission.intent.clone() {
             MissionIntent::Idle => true,
             MissionIntent::Quest => self.tick_quest().await,
+            MissionIntent::Party { .. } | MissionIntent::Raid { .. } => {
+                self.tick_group_encounter().await
+            }
             other => {
                 self.waiting(format!(
                     "mission scheduler for {other:?} is not implemented yet"
@@ -452,6 +455,44 @@ impl LaneEngine {
                 true
             }
         }
+    }
+
+    async fn tick_group_encounter(&mut self) -> bool {
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        let player = self
+            .state
+            .authoritative
+            .session
+            .character_guid
+            .map(EntityId);
+        let has_observed_group_member = snapshot
+            .state
+            .group
+            .members
+            .iter()
+            .any(|member| member.online && Some(member.entity) != player);
+        if !has_observed_group_member {
+            self.waiting("group mission is waiting for an observed online group member".into());
+            return true;
+        }
+
+        let Some(target) = wow_policy::group::encounter::from_observed(&snapshot).preferred_target
+        else {
+            self.waiting("group mission is waiting for an observed encounter target".into());
+            return true;
+        };
+        let Some(target_state) = self.state.authoritative.entities.0.get(&target) else {
+            self.waiting(
+                "observed group encounter target is not present in current entity state".into(),
+            );
+            return true;
+        };
+        if !target_state.hostile || target_state.is_dead() {
+            self.waiting("observed group encounter target is not a live hostile".into());
+            return true;
+        }
+
+        self.dispatch_combat_target(target, false).await
     }
 
     async fn tick_survival(&mut self, target: EntityId) -> bool {
@@ -1778,15 +1819,6 @@ impl LaneEngine {
                 false
             }
             PendingQuestAction::ControlActivation { target, started } => {
-                if self.state.authoritative.control.mover.is_some() {
-                    tracing::info!(lane=?self.state.lane, ?target, mover=?self.state.authoritative.control.mover, "authoritative controlled mover appeared after quest-tool activation");
-                    self.pending_quest_action = None;
-                    return false;
-                }
-                if started.elapsed() < Duration::from_secs(12) {
-                    self.waiting(format!("quest control activation on {target} is waiting for authoritative controlled mover"));
-                    return true;
-                }
                 let quest = self
                     .current_work
                     .as_ref()
@@ -1795,6 +1827,20 @@ impl LaneEngine {
                         _ => None,
                     })
                     .unwrap_or_default();
+                let item_target_ready = quest != 0
+                    && matches!(
+                        resolve_objective(&Snapshot::from_state(&self.state.authoritative), quest),
+                        ObjectiveResolution::GroundedScriptedItemUse { .. }
+                    );
+                if self.state.authoritative.control.mover.is_some() || item_target_ready {
+                    tracing::info!(lane=?self.state.lane, quest, ?target, mover=?self.state.authoritative.control.mover, item_target_ready, "authoritative quest state advanced after quest-tool activation");
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if started.elapsed() < Duration::from_secs(12) {
+                    self.waiting(format!("quest control activation on {target} is waiting for authoritative controlled mover"));
+                    return true;
+                }
                 let (attempts, delay) = self.defer_quest_interaction(quest, target);
                 tracing::warn!(lane=?self.state.lane, quest, ?target, attempts, retry_after_ms=delay.as_millis(), "quest control activation timed out without authoritative mover; applying bounded retry delay");
                 self.pending_quest_action = None;
@@ -2481,6 +2527,71 @@ mod tests {
         };
         assert_eq!(survival_action.command(), quest_action.command());
         assert_eq!(survival_action.origin(), PlanOrigin::Recovery);
+    }
+
+    #[test]
+    fn quest_tool_activation_waits_for_temporary_item_target() {
+        let (mut engine, _proxy) = combat_engine();
+        engine.state.authoritative.quests.active.insert(
+            10584,
+            wow_state::quests::QuestProgress {
+                complete: false,
+                objectives: vec![0, 0, 0, 0],
+            },
+        );
+        engine.state.authoritative.quests.definitions.insert(
+            10584,
+            wow_state::quests::QuestDefinition {
+                quest: 10584,
+                title: "Picking Up Some Power Converters".into(),
+                poi_map: None,
+                poi_x: None,
+                poi_y: None,
+                targets: vec![wow_state::quests::QuestTargetObjective {
+                    slot: 0,
+                    kind: wow_state::quests::QuestTargetKind::Creature,
+                    entry: 21731,
+                    required: 5,
+                    item_drop: 0,
+                    text: "Electromentals collected".into(),
+                }],
+                items: vec![],
+            },
+        );
+        engine.current_work = Some(QuestWorkRuntime {
+            id: QuestWorkId(1),
+            key: QuestWorkKey::InteractObjective {
+                quest: 10584,
+                objective: usize::MAX,
+                target: EntityId(80),
+            },
+        });
+        engine.pending_quest_action = Some(PendingQuestAction::ControlActivation {
+            target: EntityId(80),
+            started: Instant::now(),
+        });
+
+        assert!(engine.pending_quest_action_blocks());
+        assert!(engine.pending_quest_action.is_some());
+
+        engine.state.authoritative.entities.0.insert(
+            EntityId(81),
+            wow_state::entities::EntityState {
+                id: EntityId(81),
+                entry: 21729,
+                kind: wow_state::entities::EntityKind::Unit,
+                position: Some(wow_domain::WorldPosition {
+                    map: 0,
+                    point: Vec3::new(3.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+
+        assert!(!engine.pending_quest_action_blocks());
+        assert!(engine.pending_quest_action.is_none());
     }
 
     #[tokio::test]

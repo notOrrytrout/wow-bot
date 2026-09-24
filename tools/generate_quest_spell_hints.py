@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate quest spell rules from AzerothCore SQL and client Spell.dbc.
 
-This writes only the generated ``quest_spell_rules`` field in the existing
-quest-hints catalog. It uses objective text to connect named spells to quest
-targets. The runtime still requires observed spellbook and live target state.
+This writes generated quest spell and item-use rules in the existing catalog.
+It uses objective text, AzerothCore SQL, and client DBC data to connect named
+actions to quest targets. The runtime still requires authoritative live target
+and capability state.
 """
 from __future__ import annotations
 
@@ -78,6 +79,101 @@ def _near_action(text: str, start: int, end: int) -> bool:
     before = text[max(sentence_start, start - 80):start]
     after = text[end:min(sentence_end, end + 50)]
     return ACTION_PREFIX.search(before) is not None and SPELL_TARGET_SUFFIX.search(after) is not None
+
+
+def _name_mentioned(name: str, text: str) -> bool:
+    folded = name.strip().casefold()
+    text = text.casefold()
+    if not folded:
+        return False
+    plural = folded[:-1] + "ies" if folded.endswith("y") else folded + "s"
+    return any(_term_mentioned(variant, text) for variant in (folded, plural))
+
+
+def _term_mentioned(term: str, text: str) -> bool:
+    return re.search(r"(?<![\w])" + re.escape(term) + r"(?![\w])", text) is not None
+
+
+def _specific_name_term_mentioned(name: str, text: str) -> bool:
+    """Match a distinctive noun in a template name for a single objective.
+
+    Quest text may call a temporary target by its base creature name while
+    AzerothCore gives the objective credit to a scripted variant, such as
+    "resultant electromental" and "Encased Electromental".
+    """
+    return any(_term_mentioned(term, text) for term in _specific_name_terms(name))
+
+
+def _specific_name_terms(name: str) -> set[str]:
+    generic_terms = {"creature", "enemy", "monster", "target", "unit"}
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]+", name.casefold())
+        if len(word) >= 4 and word not in generic_terms
+    }
+
+
+def grounded_item_targets(
+    targets: list[dict],
+    creature_names: dict[int, str],
+    spawned_creatures: set[int],
+    target_clause: str,
+) -> list[tuple[int, int]]:
+    """Map an item-use clause to quest credit entries and live creature entries.
+
+    A quest target may be a temporary creature with no static spawn row. Such
+    a target is accepted only when the item-use clause names the objective or
+    one uniquely matching creature template. Runtime still requires a live
+    authoritative entity.
+    """
+    grounded: list[tuple[int, int]] = []
+    if len(targets) == 1 and targets[0]["kind"] == "creature":
+        objective_entry = targets[0]["entry"]
+        if objective_entry in spawned_creatures:
+            grounded.append((objective_entry, objective_entry))
+        elif _name_mentioned(creature_names.get(objective_entry, ""), target_clause):
+            grounded.append((objective_entry, objective_entry))
+        else:
+            # Scripted objectives can credit a transformed entry. Match the
+            # item-use wording to one creature template with a shared specific
+            # name term, even when that creature has no static spawn row.
+            credit_terms = _specific_name_terms(creature_names.get(objective_entry, ""))
+            exact_matches = []
+            for candidate, candidate_name in creature_names.items():
+                candidate_terms = _specific_name_terms(candidate_name)
+                if candidate_terms & credit_terms and _name_mentioned(candidate_name, target_clause):
+                    exact_matches.append(candidate)
+            matches = exact_matches
+            if matches:
+                spawned_matches = [candidate for candidate in matches if candidate in spawned_creatures]
+                if spawned_matches:
+                    matches = spawned_matches
+                specificity = max(
+                    len(re.findall(r"[a-z0-9]+", creature_names[candidate].casefold()))
+                    for candidate in matches
+                )
+                matches = [
+                    candidate
+                    for candidate in matches
+                    if len(re.findall(r"[a-z0-9]+", creature_names[candidate].casefold())) == specificity
+                ]
+            else:
+                for candidate, candidate_name in creature_names.items():
+                    candidate_terms = _specific_name_terms(candidate_name)
+                    if candidate_terms & credit_terms and _specific_name_term_mentioned(candidate_name, target_clause):
+                        matches.append(candidate)
+            if len(matches) == 1:
+                grounded.append((objective_entry, matches[0]))
+    elif len(targets) > 1:
+        for target in targets:
+            if target["kind"] != "creature":
+                continue
+            name = creature_names.get(target["entry"], "")
+            # An explicit name in the item-use clause can identify a temporary
+            # objective creature without a static spawn row.
+            if name and _name_mentioned(name, target_clause):
+                grounded.append((target["entry"], target["entry"]))
+    return sorted(set(grounded))
 
 
 def generate_rules(sql_dir: Path, dbc_dir: Path) -> tuple[dict[str, list[dict]], dict[str, dict], list[dict]]:
@@ -187,41 +283,9 @@ def generate_rules(sql_dir: Path, dbc_dir: Path) -> tuple[dict[str, list[dict]],
             target_clause = text_folded[item_end:]
             target_clause = re.split(r"[.!?;,]", target_clause, maxsplit=1)[0]
 
-            def name_mentioned(name: str) -> bool:
-                folded = name.strip().casefold()
-                if not folded:
-                    return False
-                plural = folded[:-1] + "ies" if folded.endswith("y") else folded + "s"
-                return any(re.search(r"(?<![\w])" + re.escape(variant) + r"(?![\w])", target_clause) for variant in (folded, plural))
-
-            grounded_targets = []
-            if len(targets) == 1 and targets[0]["kind"] == "creature":
-                objective_entry = targets[0]["entry"]
-                if objective_entry in spawned_creatures:
-                    grounded_targets.append((objective_entry, objective_entry))
-                else:
-                    # Some scripted objectives credit a transformed entry.
-                    # Link it to one spawned creature named in quest text when
-                    # the creature name shares specific words with the credit
-                    # template. This avoids selecting unrelated quest givers.
-                    credit_words = set(re.findall(r"[a-z0-9]+", creature_names.get(objective_entry, "").casefold()))
-                    matches = []
-                    for candidate in spawned_creatures:
-                        candidate_name = creature_names.get(candidate, "").strip()
-                        candidate_words = set(re.findall(r"[a-z0-9]+", candidate_name.casefold()))
-                        if (len(candidate_words) > 1 and candidate_words & credit_words
-                                and name_mentioned(candidate_name)):
-                            matches.append(candidate)
-                    if len(matches) == 1:
-                        grounded_targets.append((objective_entry, matches[0]))
-            elif len(targets) > 1:
-                for target in targets:
-                    if target["kind"] == "creature" and target["entry"] in spawned_creatures:
-                        name = creature_names.get(target["entry"], "")
-                        if name_mentioned(name):
-                            grounded_targets.append((target["entry"], target["entry"]))
-
-            grounded_targets = sorted(set(grounded_targets))
+            grounded_targets = grounded_item_targets(
+                targets, creature_names, spawned_creatures, target_clause
+            )
             if len(named_item_matches) == 1 and len(grounded_targets) == 1:
                 item_id, item, item_name, _ = named_item_matches[0]
                 objective_entry, target_entry = grounded_targets[0]

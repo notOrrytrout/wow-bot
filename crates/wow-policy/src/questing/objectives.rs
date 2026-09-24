@@ -89,29 +89,6 @@ pub fn resolve_with_exclusions(
     };
     let player = snapshot.state.position.player;
 
-    // Some quests require activating a quest-bound control object before their
-    // actual objectives are actionable (vehicles, possession, scripted tools).
-    // AzerothCore goober.questId is static search guidance; a live game object
-    // is still required before interaction.
-    if snapshot.state.control.mover.is_none() {
-        let tool_entries = static_hints::quest_tool_entries(quest);
-        if !tool_entries.is_empty() {
-            if let Some(entity) = nearest_live_gameobject_entry(snapshot, &tool_entries) {
-                return ObjectiveResolution::GroundedQuestTool {
-                    target: entity.id,
-                    activation_spell: static_hints::quest_tool_activation_spell(quest),
-                };
-            }
-            if let Some(player) = player {
-                if let Some(destination) =
-                    static_hints::nearest_quest_tool(quest, player.map, player.point)
-                {
-                    return ObjectiveResolution::QuestToolSearch { destination };
-                }
-            }
-        }
-    }
-
     if let Some(rule) = static_hints::quest_item_use_rule(quest) {
         let kind: QuestTargetKind = rule.kind.into();
         if let Some(target_def) = definition
@@ -157,6 +134,29 @@ pub fn resolve_with_exclusions(
                             source: "scripted-item-target-spawn",
                         };
                     }
+                }
+            }
+        }
+    }
+
+    // A live target for a grounded quest-item rule takes priority over its
+    // quest-bound setup object. When the target is absent, the setup object
+    // can create it. The static tool entry only guides search; interaction
+    // still requires a live authoritative game object.
+    if snapshot.state.control.mover.is_none() {
+        let tool_entries = static_hints::quest_tool_entries(quest);
+        if !tool_entries.is_empty() {
+            if let Some(entity) = nearest_live_gameobject_entry(snapshot, &tool_entries) {
+                return ObjectiveResolution::GroundedQuestTool {
+                    target: entity.id,
+                    activation_spell: static_hints::quest_tool_activation_spell(quest),
+                };
+            }
+            if let Some(player) = player {
+                if let Some(destination) =
+                    static_hints::nearest_quest_tool(quest, player.map, player.point)
+                {
+                    return ObjectiveResolution::QuestToolSearch { destination };
                 }
             }
         }
@@ -721,6 +721,75 @@ mod tests {
                 item: 16114,
                 spell: 19938,
                 cast_count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn scripted_temporary_creature_item_target_resolves_only_from_live_state() {
+        let mut state = AuthoritativeState::default();
+        state.position.player = Some(WorldPosition {
+            map: 530,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.quests.active.insert(
+            10584,
+            QuestProgress {
+                complete: false,
+                objectives: vec![0, 0, 0, 0],
+            },
+        );
+        state.quests.definitions.insert(
+            10584,
+            QuestDefinition {
+                quest: 10584,
+                title: "Picking Up Some Power Converters".into(),
+                poi_map: None,
+                poi_x: None,
+                poi_y: None,
+                targets: vec![QuestTargetObjective {
+                    slot: 0,
+                    kind: QuestTargetKind::Creature,
+                    entry: 21731,
+                    required: 5,
+                    item_drop: 0,
+                    text: "Electromentals collected".into(),
+                }],
+                items: vec![],
+            },
+        );
+
+        let absent_target = Snapshot::from_state(&state);
+        assert!(matches!(
+            resolve(&absent_target, 10584),
+            ObjectiveResolution::QuestToolSearch { .. }
+        ));
+
+        state.entities.0.insert(
+            EntityId(10584),
+            EntityState {
+                id: EntityId(10584),
+                entry: 21729,
+                kind: EntityKind::Unit,
+                position: Some(WorldPosition {
+                    map: 530,
+                    point: Vec3::new(3.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+        let live_target = Snapshot::from_state(&state);
+        assert_eq!(
+            resolve(&live_target, 10584),
+            ObjectiveResolution::GroundedScriptedItemUse {
+                objective: 0,
+                target: EntityId(10584),
+                item: 30656,
+                spell: 37136,
+                cast_count: 1,
             }
         );
     }

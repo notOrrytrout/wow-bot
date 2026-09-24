@@ -105,7 +105,9 @@ static search hint -> live game object observed -> UseGameObject -> authoritativ
 
 For the Death Knight Eye of Acherus quest path, verify that the log shows the quest-bound control object or controlled mover becoming authoritative, the controlled action bar being observed, and an applicable controlled spell being selected for a live marker. It must not issue a normal `Attack` against the objective marker. Controlled movement should preserve the server-observed flying movement flags.
 
-Generic quest-item-use-on-target quests remain a negative test: until that action semantic is implemented, the scheduler must report an explicit unsupported/waiting reason rather than pretending an item collection path covers it.
+For the Power Converters quest (10584), verify the setup object is activated first, the lane waits until an authoritative Electromental is visible, then uses the observed Protovoltaic Magneto Collector item instance on that creature. With no live target, it must not send item use. After item use, it must wait for authoritative quest progress before repeating.
+
+Unresolved quest-item-use candidates remain negative tests: the scheduler must not infer an item action from item possession or static spawn data alone. It needs a grounded quest-item rule, a matching incomplete objective, a live target, and an authoritative item instance.
 ## Deterministic reuse acceptance checks
 
 The OpenSpec now treats duplicate deterministic mechanics as a quality defect. During review, verify that mission-specific code delegates to the canonical subsystem instead of maintaining parallel implementations. In particular:
