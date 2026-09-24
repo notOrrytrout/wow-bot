@@ -16,6 +16,8 @@ const ROUTE_DESTINATION_EPSILON: f32 = 0.75;
 const INTERMEDIATE_WAYPOINT_RANGE: f32 = 0.65;
 const ROUTE_LOOKAHEAD_DISTANCE: f32 = 4.5;
 const ROUTE_LOOKAHEAD_MAX_ANGLE: f32 = 0.261_799_4; // 15 degrees
+const LOCAL_VISION_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(250);
+const LOCAL_VISION_MAX_DROP_YARDS: f32 = 2.5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocomotionMode {
@@ -158,10 +160,46 @@ impl MovementController {
                 return Ok(None);
             };
             self.apply_routed_ground_height(navigation, current, waypoint, route_index, &mut step)?;
+            self.validate_local_geometry(navigation, current, step)?;
             return Ok(Some(step));
         };
         self.apply_routed_ground_height(navigation, current, waypoint, route_index, &mut step)?;
+        self.validate_local_geometry(navigation, current, step)?;
         Ok(Some(step))
+    }
+
+    fn validate_local_geometry(
+        &self,
+        navigation: &NavigationData,
+        current: WorldPosition,
+        step: MovementStep,
+    ) -> Result<(), NavigationError> {
+        let middle = Vec3::new(
+            (current.point.x + step.next.x) * 0.5,
+            (current.point.y + step.next.y) * 0.5,
+            (current.point.z + step.next.z) * 0.5,
+        );
+        let probes = [
+            [current.point.x, current.point.y, current.point.z],
+            [middle.x, middle.y, middle.z],
+            [step.next.x, step.next.y, step.next.z],
+        ];
+        let sample = navigation
+            .local_geometry_sample(current.map, &probes)
+            .ok_or(NavigationError::NoRoute)?;
+        match sample.assess(
+            std::time::Instant::now(),
+            LOCAL_VISION_MAX_AGE,
+            LOCAL_VISION_MAX_DROP_YARDS,
+        ) {
+            crate::detour::LocalRouteAssessment::Clear => Ok(()),
+            crate::detour::LocalRouteAssessment::UnsafeDrop => {
+                Err(NavigationError::FloorDiscontinuity)
+            }
+            crate::detour::LocalRouteAssessment::Blocked
+            | crate::detour::LocalRouteAssessment::Unknown
+            | crate::detour::LocalRouteAssessment::Stale => Err(NavigationError::NoRoute),
+        }
     }
 
     fn routed_ground_step(

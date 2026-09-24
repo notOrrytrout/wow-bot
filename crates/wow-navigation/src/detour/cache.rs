@@ -152,6 +152,21 @@ pub struct LocalSurfaceSample {
 }
 
 impl NavigationData {
+    /// Sample a short, bounded segment from route-local navmesh geometry.
+    /// The caller must assess freshness immediately before using the result.
+    pub fn local_geometry_sample(
+        &self,
+        map_id: u32,
+        points: &[[f32; 3]],
+    ) -> Option<super::vision::LocalGeometrySample> {
+        if points.is_empty() || points.len() > super::vision::MAX_LOCAL_VISION_POINTS {
+            return None;
+        }
+        Some(super::vision::LocalGeometrySample::new(
+            self.cached_surface_samples(map_id, points),
+        ))
+    }
+
     /// Sample only route-loaded tiles. Missing or malformed tiles are unknown,
     /// not obstacles. This performs no route search or filesystem access.
     pub fn cached_surface_samples(

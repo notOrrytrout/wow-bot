@@ -63,6 +63,7 @@ mod format;
 mod graph;
 mod route;
 mod surface;
+mod vision;
 
 pub use cache::NavigationData;
 pub use format::{
@@ -73,6 +74,7 @@ pub use surface::{
     RouteSurface, SurfaceCandidate, SurfaceIdentity, SurfaceKind, SurfaceObservation, SurfaceProbe,
     SurfaceReference, nearby_route_height,
 };
+pub use vision::{LocalGeometrySample, LocalRouteAssessment};
 
 /// Semantic endpoint involved in a navigation projection failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
