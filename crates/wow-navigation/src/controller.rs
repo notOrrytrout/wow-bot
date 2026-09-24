@@ -146,38 +146,15 @@ impl MovementController {
         };
         let (waypoint, route_index) =
             self.ground_route_waypoint(navigation, current, destination)?;
-        let final_waypoint = waypoint.distance(destination) <= ROUTE_DESTINATION_EPSILON;
-        let step_range = if final_waypoint {
-            acceptable_range
-        } else {
-            INTERMEDIATE_WAYPOINT_RANGE
-        };
-        let raw = next_step(
-            current.point,
-            waypoint,
-            self.maximum_step,
-            step_range,
-            LocomotionMode::Ground,
-        )?;
+        let raw = self.routed_ground_step(current, waypoint, destination, acceptable_range)?;
         let Some(mut step) = raw else {
             // We reached this corridor waypoint. Advance once and immediately
             // calculate toward the next one so the 250 ms clock does not stall.
             self.advance_route_cursor(current.point);
             let (waypoint, route_index) =
                 self.ground_route_waypoint(navigation, current, destination)?;
-            let final_waypoint = waypoint.distance(destination) <= ROUTE_DESTINATION_EPSILON;
-            let step_range = if final_waypoint {
-                acceptable_range
-            } else {
-                INTERMEDIATE_WAYPOINT_RANGE
-            };
-            let Some(mut step) = next_step(
-                current.point,
-                waypoint,
-                self.maximum_step,
-                step_range,
-                LocomotionMode::Ground,
-            )?
+            let Some(mut step) =
+                self.routed_ground_step(current, waypoint, destination, acceptable_range)?
             else {
                 return Ok(None);
             };
@@ -186,6 +163,28 @@ impl MovementController {
         };
         self.apply_routed_ground_height(navigation, current, waypoint, route_index, &mut step)?;
         Ok(Some(step))
+    }
+
+    fn routed_ground_step(
+        &self,
+        current: WorldPosition,
+        waypoint: Vec3,
+        destination: Vec3,
+        acceptable_range: f32,
+    ) -> Result<Option<MovementStep>, NavigationError> {
+        let final_waypoint = waypoint.distance(destination) <= ROUTE_DESTINATION_EPSILON;
+        let step_range = if final_waypoint {
+            acceptable_range
+        } else {
+            INTERMEDIATE_WAYPOINT_RANGE
+        };
+        next_step(
+            current.point,
+            waypoint,
+            self.maximum_step,
+            step_range,
+            LocomotionMode::Ground,
+        )
     }
 
     /// Keep execution on the Detour-authorized vertical layer. Route-surface

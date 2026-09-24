@@ -88,29 +88,13 @@ pub(super) fn nearest_loaded_polygon(
     allow_water: bool,
     tuning: &NavigationTuning,
 ) -> Option<(PolygonRef, DetourPoint)> {
-    tiles
-        .iter()
-        .enumerate()
-        .filter_map(|(tile_index, tile)| {
-            tile.nearest_polygon(
-                point,
-                tuning.nearest_horizontal_yards,
-                tuning.nearest_vertical_yards,
-                allow_water,
-            )
-            .map(|nearest| {
-                (
-                    distance3(point, nearest.point),
-                    PolygonRef {
-                        tile: tile_index,
-                        polygon: nearest.polygon,
-                    },
-                    nearest.point,
-                )
-            })
-        })
-        .min_by(|left, right| left.0.total_cmp(&right.0))
-        .map(|(_, polygon, point)| (polygon, point))
+    nearest_loaded_polygon_in_extent(
+        tiles,
+        point,
+        tuning.nearest_horizontal_yards,
+        tuning.nearest_vertical_yards,
+        allow_water,
+    )
 }
 
 /// Return several nearby walkable polygons, ordered by projection distance.
@@ -310,6 +294,16 @@ pub(super) fn add_off_mesh_edges(
 }
 
 pub(super) fn nearest_loaded_polygon_with_extents(
+    tiles: &[DetourTile],
+    point: DetourPoint,
+    horizontal: f32,
+    vertical: f32,
+    allow_water: bool,
+) -> Option<(PolygonRef, DetourPoint)> {
+    nearest_loaded_polygon_in_extent(tiles, point, horizontal, vertical, allow_water)
+}
+
+fn nearest_loaded_polygon_in_extent(
     tiles: &[DetourTile],
     point: DetourPoint,
     horizontal: f32,

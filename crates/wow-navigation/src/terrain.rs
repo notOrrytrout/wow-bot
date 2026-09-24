@@ -175,43 +175,41 @@ impl TerrainTile {
                 v9: a,
                 v8: b,
                 scale,
-            } => {
-                interpolate(
-                    a[v9] as f32,
-                    a[v9 + 129] as f32,
-                    a[v9 + 1] as f32,
-                    a[v9 + 130] as f32,
-                    b[v8] as f32,
-                    x,
-                    y,
-                ) * *scale
-                    + self.base
-            }
+            } => sample_height(a, b, v9, v8, x, y, *scale, self.base),
             HeightGrid::U16 {
                 v9: a,
                 v8: b,
                 scale,
-            } => {
-                interpolate(
-                    a[v9] as f32,
-                    a[v9 + 129] as f32,
-                    a[v9 + 1] as f32,
-                    a[v9 + 130] as f32,
-                    b[v8] as f32,
-                    x,
-                    y,
-                ) * *scale
-                    + self.base
-            }
-            HeightGrid::Float { v9: a, v8: b } => {
-                interpolate(a[v9], a[v9 + 129], a[v9 + 1], a[v9 + 130], b[v8], x, y)
-            }
+            } => sample_height(a, b, v9, v8, x, y, *scale, self.base),
+            HeightGrid::Float { v9: a, v8: b } => sample_height(a, b, v9, v8, x, y, 1.0, 0.0),
         };
         value
             .is_finite()
             .then_some(value)
             .ok_or(NavigationError::InvalidCoordinate)
     }
+}
+
+fn sample_height<T: Copy + Into<f32>>(
+    v9: &[T],
+    v8: &[T],
+    index9: usize,
+    index8: usize,
+    x: f32,
+    y: f32,
+    scale: f32,
+    base: f32,
+) -> f32 {
+    interpolate(
+        v9[index9].into(),
+        v9[index9 + 129].into(),
+        v9[index9 + 1].into(),
+        v9[index9 + 130].into(),
+        v8[index8].into(),
+        x,
+        y,
+    ) * scale
+        + base
 }
 
 fn interpolate(h1: f32, h2: f32, h3: f32, h4: f32, h5: f32, x: f32, y: f32) -> f32 {
