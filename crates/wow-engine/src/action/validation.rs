@@ -127,14 +127,8 @@ fn validate_spatial_command(
         | GameplayCommand::CastGameObject { target: entity, .. }
         | GameplayCommand::Loot(entity)
         | GameplayCommand::Gather(entity)
-        | GameplayCommand::EnterVehicle(entity)
-            if !has_entity(snapshot, *entity) =>
-        {
-            return Err(reject(
-                "unknown_entity",
-                "target is not authoritative",
-                true,
-            ));
+        | GameplayCommand::EnterVehicle(entity) => {
+            require_authoritative_target(snapshot, Some(*entity), "target is not authoritative")?;
         }
         GameplayCommand::Cast { spell, target } => {
             if !snapshot.state.capabilities.spells.contains(spell)
@@ -146,13 +140,7 @@ fn validate_spatial_command(
                     false,
                 ));
             }
-            if !optional_target_is_authoritative(snapshot, target) {
-                return Err(reject(
-                    "unknown_entity",
-                    "spell target is not authoritative",
-                    true,
-                ));
-            }
+            require_authoritative_target(snapshot, *target, "spell target is not authoritative")?;
         }
         GameplayCommand::MaintainBuff { spell, target } => {
             if !snapshot.state.capabilities.spells.contains(spell) {
@@ -163,12 +151,12 @@ fn validate_spatial_command(
                 ));
             }
             let self_guid = snapshot.state.session.character_guid.map(EntityId);
-            if Some(*target) != self_guid && !has_entity(snapshot, *target) {
-                return Err(reject(
-                    "unknown_entity",
+            if Some(*target) != self_guid {
+                require_authoritative_target(
+                    snapshot,
+                    Some(*target),
                     "maintenance target is not authoritative",
-                    true,
-                ));
+                )?;
             }
         }
         GameplayCommand::Fish if !snapshot.state.capabilities.can_fish => {
@@ -182,13 +170,7 @@ fn validate_spatial_command(
             if !snapshot.state.inventory.has(*item, 1) {
                 return Err(reject("missing_item", "item is no longer present", false));
             }
-            if !optional_target_is_authoritative(snapshot, target) {
-                return Err(reject(
-                    "unknown_entity",
-                    "item target is not authoritative",
-                    true,
-                ));
-            }
+            require_authoritative_target(snapshot, *target, "item target is not authoritative")?;
         }
         GameplayCommand::UseItemInstance {
             item,
@@ -214,13 +196,7 @@ fn validate_spatial_command(
                     true,
                 ));
             }
-            if !optional_target_is_authoritative(snapshot, target) {
-                return Err(reject(
-                    "unknown_entity",
-                    "item target is not authoritative",
-                    true,
-                ));
-            }
+            require_authoritative_target(snapshot, *target, "item target is not authoritative")?;
         }
         _ => {}
     }
@@ -361,8 +337,16 @@ fn validate_economy_command(
     Ok(())
 }
 
-fn optional_target_is_authoritative(snapshot: &Snapshot, target: &Option<EntityId>) -> bool {
-    target.is_none_or(|entity| has_entity(snapshot, entity))
+fn require_authoritative_target(
+    snapshot: &Snapshot,
+    target: Option<EntityId>,
+    message: &str,
+) -> Result<(), ValidationOutcome> {
+    if target.is_none_or(|entity| has_entity(snapshot, entity)) {
+        Ok(())
+    } else {
+        Err(reject("unknown_entity", message, true))
+    }
 }
 
 fn has_entity(snapshot: &Snapshot, entity: EntityId) -> bool {
