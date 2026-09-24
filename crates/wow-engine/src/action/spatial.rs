@@ -422,23 +422,26 @@ pub fn angular_distance(a: f32, b: f32) -> f32 {
     d.min(TAU - d)
 }
 
+fn horizontal_direction(from: WorldPosition, to: WorldPosition) -> Option<(f32, f32)> {
+    if from.map != to.map || !from.point.is_finite() || !to.point.is_finite() {
+        return None;
+    }
+    let dx = to.point.x - from.point.x;
+    let dy = to.point.y - from.point.y;
+    let length = dx.hypot(dy);
+    if length < 0.001 {
+        return None;
+    }
+    Some((dx / length, dy / length))
+}
+
 pub fn server_range_reposition(
     mover: WorldPosition,
     target: WorldPosition,
     correction: ServerRangeCorrection,
     attempt: u8,
 ) -> Option<Vec3> {
-    if mover.map != target.map || !mover.point.is_finite() || !target.point.is_finite() {
-        return None;
-    }
-    let dx = target.point.x - mover.point.x;
-    let dy = target.point.y - mover.point.y;
-    let len = dx.hypot(dy);
-    if len < 0.001 {
-        return None;
-    }
-    let ux = dx / len;
-    let uy = dy / len;
+    let (ux, uy) = horizontal_direction(mover, target)?;
     let step = 2.5 + f32::from(attempt.min(3));
     let sign = match correction {
         ServerRangeCorrection::MoveCloser => 1.0,
@@ -459,17 +462,9 @@ pub fn line_of_sight_reposition(
     target: WorldPosition,
     attempt: u8,
 ) -> Option<Vec3> {
-    if mover.map != target.map || !mover.point.is_finite() || !target.point.is_finite() {
-        return None;
-    }
-    let dx = target.point.x - mover.point.x;
-    let dy = target.point.y - mover.point.y;
-    let len = dx.hypot(dy);
-    if len < 0.001 {
-        return None;
-    }
-    let px = -dy / len;
-    let py = dx / len;
+    let (ux, uy) = horizontal_direction(mover, target)?;
+    let px = -uy;
+    let py = ux;
     let side = if attempt % 2 == 0 { 1.0 } else { -1.0 };
     let radius = 3.0 + f32::from(attempt.min(3));
     Some(Vec3::new(
