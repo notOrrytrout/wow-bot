@@ -138,7 +138,7 @@ After `cargo test --workspace`, live-test these paths with action logging starte
 .bot quest
 ```
 
-For normal ground quest travel, verify `quest movement progress` Z values follow terrain and the player does not climb through empty space. For Lazy Peons (5441), verify the bot sends targeted item use rather than `Attack` and waits for quest credit. For Death Comes From On High (12641), verify the control object is activated, a controlled mover becomes authoritative, movement uses controlled flight, and Siphon/controlled ability credit advances the quest.
+For unrouted ground quest travel, verify `quest movement progress` Z values follow AzerothCore `maps/` terrain and the player does not climb through empty space. For routed travel, verify Z follows the Detour/MMAP route surface, including when raw terrain disagrees. For Lazy Peons (5441), verify the bot sends targeted item use rather than `Attack` and waits for quest credit. For Death Comes From On High (12641), verify the control object is activated, a controlled mover becomes authoritative, movement uses controlled flight, and Siphon/controlled ability credit advances the quest.
 
 ## Shared spatial-precondition regression checks
 

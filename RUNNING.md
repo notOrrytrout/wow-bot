@@ -164,7 +164,7 @@ Generic quests that require using a quest item on a target are not yet treated a
 
 ## Shared movement and scripted quest behavior
 
-Ground quest movement now requires the worker's `--maps-dir` path and samples the selected read-only AzerothCore `maps/` terrain for each movement step. If terrain cannot be sampled or a vertical discontinuity is unsafe, movement fails closed and logs a waiting reason instead of inventing Z/flying.
+Ground quest movement requires the worker's `--maps-dir` path. Unrouted ground movement samples the selected read-only AzerothCore `maps/` terrain at each step and fails closed if terrain cannot be sampled or a vertical discontinuity is unsafe. Routed ground movement uses the Detour/MMAP corridor surface for height, so unrelated raw terrain does not replace a valid route floor. Neither path invents airborne movement when its vertical authority is unavailable.
 
 Controlled movers with authoritative flying/can-fly/disable-gravity flags use the same movement controller in flight mode. This is the path used by the Eye of Acherus flow for quest 12641.
 
