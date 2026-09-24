@@ -41,6 +41,8 @@ const TURN_IN_SEARCH_RANGE: f32 = 5.0;
 const QUEST_SEARCH_ARRIVAL_RANGE: f32 = 18.0;
 const QUEST_TOOL_SEARCH_RANGE: f32 = 12.0;
 const MAX_INTERACTION_RETRIES: usize = 512;
+const MAX_CORPSE_RECLAIM_ATTEMPTS: u8 = 3;
+const CORPSE_HOSTILE_CLEARANCE_YARDS: f32 = 18.0;
 const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MOVEMENT_STEP_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -135,6 +137,8 @@ pub struct LaneEngine {
     last_maintenance_status: Option<String>,
     post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
     last_recovery_action: Option<Instant>,
+    corpse_reclaim_attempts: u8,
+    corpse_recovery_generation: u64,
     last_survival_action: Option<(EntityId, Instant)>,
     fishing_cast_at: Option<Instant>,
     fishing_retry_after: Option<Instant>,
@@ -146,6 +150,7 @@ impl LaneEngine {
         rx: mpsc::Receiver<LaneMessage>,
         proxy: mpsc::Sender<WorkerToProxy>,
     ) -> Self {
+        let corpse_recovery_generation = state.authoritative.life.recovery_generation;
         Self {
             state,
             rx,
@@ -181,6 +186,8 @@ impl LaneEngine {
             last_maintenance_status: None,
             post_combat_loot: None,
             last_recovery_action: None,
+            corpse_reclaim_attempts: 0,
+            corpse_recovery_generation,
             last_survival_action: None,
             fishing_cast_at: None,
             fishing_retry_after: None,
@@ -505,6 +512,7 @@ impl LaneEngine {
         if self.player_is_dead() {
             return self.tick_death_recovery().await;
         }
+        self.corpse_reclaim_attempts = 0;
         let snapshot = Snapshot::from_state(&self.state.authoritative);
         if let Some(attacker) = wow_policy::combat::engagement::survival_attacker(&snapshot) {
             if self
@@ -847,6 +855,11 @@ impl LaneEngine {
     }
 
     async fn tick_death_recovery(&mut self) -> bool {
+        let generation = self.state.authoritative.life.recovery_generation;
+        if generation != self.corpse_recovery_generation {
+            self.corpse_recovery_generation = generation;
+            self.corpse_reclaim_attempts = 0;
+        }
         let now = Instant::now();
         if self
             .last_recovery_action
@@ -885,8 +898,8 @@ impl LaneEngine {
             let _ = self.propose_recovery(GameplayCommand::ReleaseSpirit).await;
             return self.propose_recovery(GameplayCommand::QueryCorpse).await;
         };
-        if corpse.map != player_pos.map {
-            self.waiting(format!("death recovery corpse is on map {} while ghost is on map {}; instance/entrance recovery is not yet grounded",corpse.map,player_pos.map));
+        if !corpse_route_map_matches(player_pos, corpse) {
+            self.waiting(format!("death recovery has no observed entrance route from map {} to corpse map {}; waiting for a grounded map transition",player_pos.map,corpse.map));
             return true;
         }
         let distance = player_pos.point.distance(corpse.point);
@@ -917,6 +930,17 @@ impl LaneEngine {
             self.waiting("death recovery waiting for corpse reclaim timer".into());
             return true;
         }
+        if !corpse_reclaim_is_safe(&self.state.authoritative.entities.0, player_guid, corpse) {
+            self.waiting(
+                "death recovery waiting for nearby hostiles to leave corpse reclaim area".into(),
+            );
+            return true;
+        }
+        if !corpse_reclaim_attempt_allowed(self.corpse_reclaim_attempts) {
+            self.waiting("death recovery stopped after bounded corpse reclaim attempts; waiting for new corpse state or resurrection".into());
+            return true;
+        }
+        self.corpse_reclaim_attempts = self.corpse_reclaim_attempts.saturating_add(1);
         tracing::info!(lane=?self.state.lane,?player_guid,"death recovery reclaiming corpse");
         self.propose_recovery(GameplayCommand::ReclaimCorpse {
             player: player_guid,
@@ -2772,6 +2796,30 @@ impl LaneEngine {
     }
 }
 
+fn corpse_reclaim_is_safe(
+    entities: &BTreeMap<EntityId, wow_state::entities::EntityState>,
+    player: EntityId,
+    corpse: WorldPosition,
+) -> bool {
+    !entities.iter().any(|(id, entity)| {
+        *id != player
+            && entity.hostile
+            && !entity.is_dead()
+            && entity.position.is_some_and(|position| {
+                position.map == corpse.map
+                    && position.point.distance(corpse.point) < CORPSE_HOSTILE_CLEARANCE_YARDS
+            })
+    })
+}
+
+fn corpse_reclaim_attempt_allowed(attempts: u8) -> bool {
+    attempts < MAX_CORPSE_RECLAIM_ATTEMPTS
+}
+
+fn corpse_route_map_matches(player: WorldPosition, corpse: WorldPosition) -> bool {
+    player.map == corpse.map
+}
+
 fn quest_status_available(status: u8) -> bool {
     matches!(status, 2 | 4 | 7 | 8)
 }
@@ -3071,6 +3119,87 @@ mod tests {
         assert!(engine.tick_mission().await);
         assert_eq!(engine.last_dispatch, DispatchOutcome::Rejected);
         assert!(proxy.try_recv().is_err());
+    }
+
+    #[test]
+    fn corpse_route_defers_when_the_corpse_map_does_not_match() {
+        let corpse = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut entities = BTreeMap::new();
+        entities.insert(
+            EntityId(2),
+            wow_state::entities::EntityState {
+                id: EntityId(2),
+                hostile: true,
+                position: Some(WorldPosition { map: 2, ..corpse }),
+                ..Default::default()
+            },
+        );
+        let ghost = WorldPosition { map: 2, ..corpse };
+        assert!(!corpse_route_map_matches(ghost, corpse));
+        assert!(corpse_reclaim_is_safe(&entities, EntityId(1), corpse));
+    }
+
+    #[test]
+    fn corpse_reclaim_waits_for_nearby_living_hostile_risk_to_clear() {
+        let corpse = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut entities = BTreeMap::new();
+        entities.insert(
+            EntityId(2),
+            wow_state::entities::EntityState {
+                id: EntityId(2),
+                hostile: true,
+                position: Some(WorldPosition {
+                    point: Vec3::new(10.0, 0.0, 0.0),
+                    ..corpse
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(!corpse_reclaim_is_safe(&entities, EntityId(1), corpse));
+        entities.get_mut(&EntityId(2)).unwrap().mark_dead();
+        assert!(corpse_reclaim_is_safe(&entities, EntityId(1), corpse));
+    }
+
+    #[test]
+    fn corpse_reclaim_attempts_are_bounded_and_reset_on_resurrection() {
+        let (mut engine, _) = test_engine(
+            Mission::quest(MissionId(1)),
+            wow_state::AuthoritativeState::default(),
+        );
+        engine.corpse_reclaim_attempts = MAX_CORPSE_RECLAIM_ATTEMPTS;
+        assert!(!corpse_reclaim_attempt_allowed(
+            engine.corpse_reclaim_attempts
+        ));
+        engine.corpse_reclaim_attempts -= 1;
+        assert!(corpse_reclaim_attempt_allowed(
+            engine.corpse_reclaim_attempts
+        ));
+        engine.corpse_reclaim_attempts = 0; // The live-player tick clears this counter.
+        assert_eq!(engine.corpse_reclaim_attempts, 0);
+    }
+
+    #[test]
+    fn observed_resurrection_is_not_treated_as_dead() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.character_guid = Some(1);
+        authoritative.entities.0.insert(
+            EntityId(1),
+            wow_state::entities::EntityState {
+                id: EntityId(1),
+                health: Some((1, 100)),
+                ..Default::default()
+            },
+        );
+        let (engine, _) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        assert!(!engine.player_is_dead());
     }
 
     #[test]
