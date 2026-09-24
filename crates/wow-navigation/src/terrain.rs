@@ -245,34 +245,33 @@ fn read_f32(bytes: &[u8], offset: usize) -> Result<f32, NavigationError> {
     Ok(f32::from_bits(read_u32(bytes, offset)?))
 }
 fn read_u16_vec(bytes: &[u8], offset: usize, count: usize) -> Result<Vec<u16>, NavigationError> {
-    let raw = read_slice(
-        bytes,
-        offset,
-        count
-            .checked_mul(2)
-            .ok_or(NavigationError::MissingNavigationData)?,
-    )?;
-    Ok(raw
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect())
+    read_le_vec::<2, _>(bytes, offset, count, u16::from_le_bytes)
 }
 fn read_f32_vec(bytes: &[u8], offset: usize, count: usize) -> Result<Vec<f32>, NavigationError> {
-    let raw = read_slice(
-        bytes,
-        offset,
-        count
-            .checked_mul(4)
-            .ok_or(NavigationError::MissingNavigationData)?,
-    )?;
-    let values: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
+    let values = read_le_vec::<4, _>(bytes, offset, count, f32::from_le_bytes)?;
     if values.iter().any(|v| !v.is_finite()) {
         return Err(NavigationError::InvalidCoordinate);
     }
     Ok(values)
+}
+
+fn read_le_vec<const WIDTH: usize, T>(
+    bytes: &[u8],
+    offset: usize,
+    count: usize,
+    decode: impl Fn([u8; WIDTH]) -> T,
+) -> Result<Vec<T>, NavigationError> {
+    let byte_count = count
+        .checked_mul(WIDTH)
+        .ok_or(NavigationError::MissingNavigationData)?;
+    read_slice(bytes, offset, byte_count)?
+        .chunks_exact(WIDTH)
+        .map(|chunk| {
+            <[u8; WIDTH]>::try_from(chunk)
+                .map(|bytes| decode(bytes))
+                .map_err(|_| NavigationError::MissingNavigationData)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -301,5 +300,19 @@ mod tests {
         let terrain = TerrainSampler::new(&root).unwrap();
         assert_eq!(terrain.ground_height(1, 0.0, 0.0).unwrap(), 42.0);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn vector_readers_share_bounds_and_keep_float_validation() {
+        assert_eq!(
+            read_u16_vec(&[0x34, 0x12, 0x78, 0x56], 0, 2).unwrap(),
+            vec![0x1234, 0x5678]
+        );
+        assert!(read_u16_vec(&[0x34, 0x12, 0x78], 0, 2).is_err());
+        assert_eq!(
+            read_f32_vec(&1.5f32.to_le_bytes(), 0, 1).unwrap(),
+            vec![1.5]
+        );
+        assert!(read_f32_vec(&f32::INFINITY.to_le_bytes(), 0, 1).is_err());
     }
 }
