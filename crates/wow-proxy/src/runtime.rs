@@ -33,7 +33,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{RwLock, broadcast, mpsc, watch},
+    sync::{RwLock, broadcast, mpsc, oneshot, watch},
 };
 use wow_control_proto::{ProxyToWorker, SupervisorCommand, WorkerToProxy};
 #[cfg(test)]
@@ -630,6 +630,19 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
         upstream_login.session_key,
         challenge.server_seed,
     );
+    let connection = handoff.connection;
+    let (ready, paused) = oneshot::channel();
+    account
+        .session_tx
+        .send(SessionMessage::PreparePlayerLogin { connection, ready })
+        .await
+        .context("configured session actor is unavailable during player login")?;
+    if !paused
+        .await
+        .context("configured session actor stopped before player login handoff")?
+    {
+        bail!("failed to pause configured bot lane before player login");
+    }
     CMSG_AUTH_SESSION {
         client_build: 12340,
         login_server_id: 0,
@@ -648,13 +661,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     let (mut up_enc, mut up_dec) = up_crypto.split();
     let mut warden = WardenBridge::new(&upstream_login.session_key, &downstream_key);
 
-    let connection = handoff.connection;
     let mut commands = account.command_bus.subscribe();
-    account
-        .session_tx
-        .send(SessionMessage::PlayerAttached { connection })
-        .await
-        .ok();
     account
         .session_tx
         .send(SessionMessage::UpstreamConnected(true))
@@ -923,6 +930,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                     object_observer.set_world(position.map, Some(guid));
                                     canonical_position = Some(*position);
                                     canonical_flags = 0;
+                                    let _ = account.command_bus.send(GameplayCommand::StopMovement);
                                 }
                                 tracing::info!(account=%account_name, ?guid, "authoritative world-entry observation received");
                                 let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;

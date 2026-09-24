@@ -14,10 +14,22 @@ use wow_state::ProtocolObservation;
 
 pub enum SessionMessage {
     Worker(WorkerToProxy),
-    PlayerAttached { connection: u64 },
-    PlayerDetached { connection: u64 },
-    PlayerMovement { at: Instant },
-    ChannelActivity { until: Instant },
+    PlayerAttached {
+        connection: u64,
+    },
+    PreparePlayerLogin {
+        connection: u64,
+        ready: tokio::sync::oneshot::Sender<bool>,
+    },
+    PlayerDetached {
+        connection: u64,
+    },
+    PlayerMovement {
+        at: Instant,
+    },
+    ChannelActivity {
+        until: Instant,
+    },
     BotOn,
     BotOff,
     Tick(Instant),
@@ -56,11 +68,12 @@ impl ConfiguredSessionActor {
         match msg {
             SessionMessage::Worker(msg) => self.handle_worker(msg).await,
             SessionMessage::PlayerAttached { connection } => {
-                self.state.player.attach(connection);
-                if self.update_player_pause(true).await.is_ok() {
-                    self.state.ownership.player_attached_manual_off();
-                    self.publish_ownership().await;
-                }
+                self.attach_player(connection).await;
+                false
+            }
+            SessionMessage::PreparePlayerLogin { connection, ready } => {
+                let paused = self.attach_player(connection).await;
+                let _ = ready.send(paused);
                 false
             }
             SessionMessage::PlayerDetached { connection } => {
@@ -158,6 +171,19 @@ impl ConfiguredSessionActor {
             }
             SessionMessage::Shutdown => true,
         }
+    }
+
+    async fn attach_player(&mut self, connection: u64) -> bool {
+        self.state.player.attach(connection);
+        let paused = self.update_player_pause(true).await.is_ok();
+        if paused {
+            self.state.player.bot_off();
+            self.state.ownership.player_attached_manual_off();
+            self.publish_ownership().await;
+        } else {
+            self.state.player.detach(connection);
+        }
+        paused
     }
 
     async fn handle_worker(&mut self, msg: WorkerToProxy) -> bool {
