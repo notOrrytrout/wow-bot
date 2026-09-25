@@ -21,6 +21,23 @@ impl Millis {
 #[cfg(test)]
 mod tests {
     use super::Millis;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn wall_clock_now_returns_unix_milliseconds() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let now = Millis::wall_clock_now().0;
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        assert!(u128::from(now) >= before);
+        assert!(u128::from(now) <= after);
+    }
 
     #[test]
     fn saturating_add_caps_at_millisecond_limit() {

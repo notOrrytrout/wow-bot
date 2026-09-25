@@ -69,7 +69,7 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
         return deferred("class_specialization_policy_unavailable");
     };
     let tree = snapshot.state.capabilities.specialization_tree;
-    if tree.is_none() && !player_is_pre_specialization(snapshot) {
+    if tree.is_none() && !player_level_is_authoritative(snapshot) {
         return deferred("specialization_not_authoritative");
     }
     let Some((power_type, _)) = player_power(snapshot) else {
@@ -83,10 +83,9 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
             tree_policy.power_policies.get(&power_type).cloned()
         }
         None => {
-            // Before level 10, WotLK characters do not have a locked talent
-            // tree. Use only spells that the server has confirmed the player
-            // knows from the class priorities, following the old policy's
-            // class-level behavior when no talent tree is locked.
+            // If the level is authoritative but the specialization is not,
+            // use class priorities across trees. Cast only spells that the
+            // server has confirmed the player knows.
             let mut priorities = Vec::new();
             for tree_policy in policy.trees.values() {
                 if let Some(families) = tree_policy.power_policies.get(&power_type) {
@@ -317,7 +316,7 @@ fn role_is_tank(role: &str) -> bool {
     matches!(role.as_str(), "tank" | "main_tank" | "off_tank")
 }
 
-fn player_is_pre_specialization(snapshot: &Snapshot) -> bool {
+fn player_level_is_authoritative(snapshot: &Snapshot) -> bool {
     snapshot
         .state
         .session
@@ -325,7 +324,7 @@ fn player_is_pre_specialization(snapshot: &Snapshot) -> bool {
         .map(EntityId)
         .and_then(|player| snapshot.state.entities.0.get(&player))
         .and_then(|player| player.level)
-        .is_some_and(|level| level < 10)
+        .is_some()
 }
 
 /// Convert the policy decision to the one shared action shape used by every engine combat path.
