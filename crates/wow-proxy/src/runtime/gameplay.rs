@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::time::{Duration, Instant};
+use wow_domain::orientation::Radians;
 use wow_domain::{EntityId, GameplayCommand, Vec3, WorldPosition};
 use wow_srp::wrath_header::ServerEncrypterHalf;
 
@@ -354,7 +355,9 @@ pub(super) fn encode_gameplay_command(
             if !orientation.is_finite() {
                 return Err("facing orientation is invalid".into());
             }
-            position.orientation = orientation.rem_euclid(std::f32::consts::TAU);
+            position.orientation = Radians::normalized(orientation)
+                .expect("finite facing orientation was checked above")
+                .0;
             let movement_time = movement_clock.next_timestamp();
             let flags = base_movement_flags & !0x0000_0001_u32;
             let body = encode_simple_movement(
@@ -576,7 +579,10 @@ pub(super) fn movement_matches_bot_visual(
     if !point.is_finite() || !orientation.is_finite() {
         return false;
     }
-    let delta = (visual.orientation - orientation).rem_euclid(std::f32::consts::TAU);
+    let Some(delta) = Radians::normalized(visual.orientation - orientation).map(|value| value.0)
+    else {
+        return false;
+    };
     let angular = delta.min(std::f32::consts::TAU - delta);
     point.distance(visual.point) <= 0.25
         && angular <= 0.08
@@ -586,6 +592,31 @@ pub(super) fn movement_matches_bot_visual(
 #[cfg(test)]
 mod movement_clock_tests {
     use super::*;
+
+    #[test]
+    fn facing_command_normalizes_negative_orientation() {
+        let point = Vec3::new(1.0, 2.0, 3.0);
+        let mut clock = MovementClock::default();
+        let (frame, update) = encode_gameplay_command(
+            GameplayCommand::FaceDirection { orientation: -1.0 },
+            Some(EntityId(7)),
+            Some(WorldPosition {
+                map: 0,
+                point,
+                orientation: 0.0,
+            }),
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+
+        let (_, _, _, _, encoded_orientation) = decode_simple_movement(&frame.body).unwrap();
+        let expected = Radians::normalized(-1.0).unwrap().0;
+        assert_eq!(frame.opcode, 0x00DA);
+        assert!((encoded_orientation - expected).abs() < f32::EPSILON);
+        assert_eq!(update.unwrap().0.orientation, expected);
+    }
 
     #[test]
     fn generated_timestamps_use_observed_client_clock_and_stay_monotonic() {
