@@ -28,6 +28,9 @@ pub enum ProtocolObservation {
         position: Option<WorldPosition>,
         flags: u32,
     },
+    Transport {
+        state: crate::transport::TransportState,
+    },
     ControlledAbilities {
         mover: EntityId,
         spells: Vec<u32>,

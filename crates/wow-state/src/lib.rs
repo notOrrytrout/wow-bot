@@ -18,6 +18,7 @@ pub mod reducer;
 pub mod session;
 pub mod snapshot;
 pub mod talents;
+pub mod transport;
 pub use authoritative::*;
 pub use delta::*;
 pub use observation::*;

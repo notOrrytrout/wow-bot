@@ -103,6 +103,12 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 delta.changed.push("control".into());
             }
         }
+        ProtocolObservation::Transport { state: transport } => {
+            if state.transport != transport {
+                state.transport = transport;
+                delta.changed.push("transport".into());
+            }
+        }
         ProtocolObservation::PetControl { pet } => {
             state.pet.control_known = true;
             state.pet.guid = pet;
@@ -587,6 +593,41 @@ mod tests {
         assert_eq!(state.position.player, None);
         assert!(state.entities.0.is_empty());
         assert!(state.quests.active.is_empty());
+    }
+
+    #[test]
+    fn transport_observation_updates_and_clears_authoritative_state() {
+        let mut state = AuthoritativeState::default();
+        let attached = crate::transport::TransportState {
+            attached: Some(true),
+            transport: Some(EntityId(55)),
+            relative_position: Some(Vec3::new(1.0, 2.0, 0.5)),
+            relative_orientation: Some(0.25),
+            transport_time: Some(300),
+        };
+        let delta = reduce(
+            &mut state,
+            ProtocolObservation::Transport {
+                state: attached.clone(),
+            },
+        );
+        assert_eq!(state.transport, attached);
+        assert!(delta.changed.contains(&"transport".to_owned()));
+        assert_eq!(
+            reduce(
+                &mut state,
+                ProtocolObservation::Transport {
+                    state: crate::transport::TransportState {
+                        attached: Some(false),
+                        ..Default::default()
+                    },
+                },
+            )
+            .changed,
+            vec!["transport"]
+        );
+        assert_eq!(state.transport.attached, Some(false));
+        assert_eq!(state.transport.transport, None);
     }
 
     #[test]
