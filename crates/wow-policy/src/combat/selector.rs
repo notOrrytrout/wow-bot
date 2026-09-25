@@ -1,5 +1,8 @@
 use serde::Deserialize;
-use std::{collections::BTreeMap, sync::OnceLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
 use wow_domain::{EntityId, GameplayCommand, time::Millis};
 use wow_state::Snapshot;
 
@@ -69,7 +72,7 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
         return deferred("class_specialization_policy_unavailable");
     };
     let tree = snapshot.state.capabilities.specialization_tree;
-    if tree.is_none() && !player_is_pre_specialization(snapshot) {
+    if tree.is_none() && !player_level_is_authoritative(snapshot) {
         return deferred("specialization_not_authoritative");
     }
     let Some((power_type, _)) = player_power(snapshot) else {
@@ -83,10 +86,9 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
             tree_policy.power_policies.get(&power_type).cloned()
         }
         None => {
-            // Before level 10, WotLK characters do not have a locked talent
-            // tree. Use only spells that the server has confirmed the player
-            // knows from the class priorities, following the old policy's
-            // class-level behavior when no talent tree is locked.
+            // If the level is authoritative but the specialization is not,
+            // use class priorities across trees. Cast only spells that the
+            // server has confirmed the player knows.
             let mut priorities = Vec::new();
             for tree_policy in policy.trees.values() {
                 if let Some(families) = tree_policy.power_policies.get(&power_type) {
@@ -141,6 +143,120 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     } else {
         deferred("no_safe_offensive_fallback")
     }
+}
+
+/// Describe why known offensive spells cannot produce an action. Call this
+/// only after selection fails so normal combat ticks do not add log output.
+pub fn deferred_diagnostics(snapshot: &Snapshot, target: EntityId) -> String {
+    let class_id = snapshot.state.capabilities.class_id;
+    let tree = snapshot.state.capabilities.specialization_tree;
+    let player = snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|player| snapshot.state.entities.0.get(&player));
+    let level = player.and_then(|player| player.level);
+    let power = player.and_then(|player| Some((player.power_type?, player.power?.0)));
+    let now_ms = Millis::wall_clock_now().0;
+    let mut priority_candidates = Vec::new();
+    let mut missing_families = Vec::new();
+
+    if let (Some(class_id), Some((power_type, _))) = (class_id, power)
+        && let Some(policy) = combat_catalog().classes.get(&class_id)
+    {
+        let priorities = match tree {
+            Some(tree) => policy
+                .trees
+                .get(&tree)
+                .and_then(|tree| tree.power_policies.get(&power_type))
+                .cloned()
+                .unwrap_or_default(),
+            None => policy
+                .trees
+                .values()
+                .filter_map(|tree| tree.power_policies.get(&power_type))
+                .flatten()
+                .copied()
+                .collect(),
+        };
+        let mut seen_families = BTreeSet::new();
+
+        for family in priorities {
+            if !seen_families.insert(family) {
+                continue;
+            }
+            let known = crate::combat::spells::family_spells(family).and_then(|spells| {
+                spells
+                    .iter()
+                    .find(|spell| snapshot.state.capabilities.spells.contains(spell))
+                    .copied()
+            });
+            let Some(spell) = known else {
+                missing_families.push(family);
+                continue;
+            };
+            let readiness = crate::combat::readiness::check_spell_readiness(
+                snapshot,
+                spell,
+                Some(target),
+                now_ms,
+            );
+            let result = match readiness {
+                Ok(_) if rotation_reserve_preserved(snapshot, class_id, tree, spell) => {
+                    "ready".into()
+                }
+                Ok(_) => "mana_reserve_not_preserved_or_unknown".into(),
+                Err(reason) => format!("{reason:?}"),
+            };
+            priority_candidates.push(format!("{family}:{spell}={result}"));
+        }
+    }
+
+    let ranged_candidates = snapshot
+        .state
+        .capabilities
+        .spells
+        .iter()
+        .filter_map(|spell| crate::combat::spells::metadata(*spell))
+        .filter(|spell| class_id.is_some_and(|class_id| spell.classes.contains(&class_id)))
+        .filter(|spell| spell.attack_spell && spell.id != 5019)
+        .filter_map(|spell| {
+            let (_, maximum) = crate::combat::spells::range_for(spell.id, true)?;
+            (maximum > 5.5).then_some((spell.id, maximum))
+        })
+        .take(12)
+        .map(|(spell, _)| {
+            let readiness = crate::combat::readiness::check_spell_readiness(
+                snapshot,
+                spell,
+                Some(target),
+                now_ms,
+            );
+            let result = match readiness {
+                Ok(_)
+                    if class_id.is_some_and(|class_id| {
+                        rotation_reserve_preserved(snapshot, class_id, tree, spell)
+                    }) =>
+                {
+                    "ready".into()
+                }
+                Ok(_) => "mana_reserve_not_preserved_or_unknown".into(),
+                Err(reason) => format!("{reason:?}"),
+            };
+            format!("{spell}={result}")
+        })
+        .collect::<Vec<_>>();
+
+    let wand_equipped = is_wand_caster(class_id.unwrap_or_default()) && has_equipped_wand(snapshot);
+    let melee_allowed =
+        class_id.is_some_and(|class_id| melee_fallback_allowed(snapshot, class_id, tree, false));
+    format!(
+        "class={class_id:?} tree={tree:?} level={level:?} power={power:?} known_spell_count={} priority_candidates=[{}] missing_priority_families={missing_families:?} ranged_candidates=[{}] wand_equipped={wand_equipped} melee_fallback_allowed={melee_allowed}",
+        snapshot.state.capabilities.spells.len(),
+        priority_candidates.join(","),
+        ranged_candidates.join(",")
+    )
 }
 
 /// Keep a small, bounded mana reserve for reactive actions. Interrupts and
@@ -317,7 +433,7 @@ fn role_is_tank(role: &str) -> bool {
     matches!(role.as_str(), "tank" | "main_tank" | "off_tank")
 }
 
-fn player_is_pre_specialization(snapshot: &Snapshot) -> bool {
+fn player_level_is_authoritative(snapshot: &Snapshot) -> bool {
     snapshot
         .state
         .session
@@ -325,7 +441,7 @@ fn player_is_pre_specialization(snapshot: &Snapshot) -> bool {
         .map(EntityId)
         .and_then(|player| snapshot.state.entities.0.get(&player))
         .and_then(|player| player.level)
-        .is_some_and(|level| level < 10)
+        .is_some()
 }
 
 /// Convert the policy decision to the one shared action shape used by every engine combat path.

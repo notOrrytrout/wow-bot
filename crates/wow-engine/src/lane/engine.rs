@@ -2298,8 +2298,16 @@ impl LaneEngine {
             Ok(selected) => selected,
             Err(reason) => {
                 let source = if recovery { "survival" } else { "quest" };
+                let details = (reason == "no_safe_offensive_fallback")
+                    .then(|| {
+                        format!(
+                            "; combat diagnostics: {}",
+                            wow_policy::combat::selector::deferred_diagnostics(&snapshot, target)
+                        )
+                    })
+                    .unwrap_or_default();
                 self.waiting(format!(
-                    "{source} combat against {target} deferred: {reason}"
+                    "{source} combat against {target} deferred: {reason}{details}"
                 ));
                 return true;
             }
