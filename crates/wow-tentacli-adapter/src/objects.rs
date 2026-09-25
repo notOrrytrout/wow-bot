@@ -63,6 +63,17 @@ pub fn object_to_entity(
     };
     let aura_state =
         unit_integer(object, UnitField::AuraState).and_then(|value| u32::try_from(value).ok());
+    let unit_flags = unit_integer(object, UnitField::Flags)
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| (object.object_type_id() == ObjectTypeId::Player).then_some(0));
+    let mount_display_id = unit_integer(object, UnitField::MountDisplayId)
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| (object.object_type_id() == ObjectTypeId::Player).then_some(0));
+    let movement_flags = object
+        .movement
+        .as_ref()
+        .and_then(|movement| movement.movement_info.as_ref())
+        .map(|info| info.movement_flags.bits());
     let target = match object.unit_fields.get(&UnitField::Target) {
         Some(FieldValue::Long(value)) if *value != 0 => Some(EntityId(*value)),
         _ => None,
@@ -103,6 +114,9 @@ pub fn object_to_entity(
         base_attack_time_ms,
         shapeshift_form,
         aura_state,
+        unit_flags,
+        mount_display_id,
+        movement_flags,
         target,
         hostile: false,
         interactable,

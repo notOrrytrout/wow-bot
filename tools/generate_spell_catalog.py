@@ -16,6 +16,7 @@ STEALTH_AURA_TYPE = 16
 PET_LIFECYCLE_EFFECTS = {55, 56, 57, 101, 102, 109}
 DIRECT_DAMAGE_EFFECTS = {1, 2, 7, 8, 9, 17, 31, 58, 62}
 SPELL_EFFECT_APPLY_AURA = 6
+SPELL_AURA_MOUNTED = 78
 SPELL_AURA_PERIODIC_DAMAGE = 3
 SPELL_AURA_PERIODIC_LEECH = 53
 
@@ -152,6 +153,14 @@ def generate(dbc_dir: Path) -> dict:
     item_rows = indexed_rows(paths["Item.dbc"])
     shapeshift_forms = indexed_rows(paths["SpellShapeshiftForm.dbc"])
     spell_by_id = {row[0]: row for row in spell_rows if row[0]}
+    mount_spell_ids = sorted(
+        row[0] for row in spell_rows
+        if row[0] and any(
+            row[FIELDS["effect_start"] + effect] == SPELL_EFFECT_APPLY_AURA
+            and row[FIELDS["effect_aura_start"] + effect] == SPELL_AURA_MOUNTED
+            for effect in range(3)
+        )
+    )
 
     # Get class spell IDs from learned abilities and all reviewed talent ranks.
     class_spells: dict[int, set[int]] = {class_id: set() for class_id in CLASS_IDS}
@@ -191,6 +200,7 @@ def generate(dbc_dir: Path) -> dict:
     for spell_ids in class_spells.values():
         spell_ids.intersection_update(spell_by_id)
     selected = set().union(*class_spells.values())
+    selected.update(mount_spell_ids)
     family_members: dict[str, list[int]] = {}
     for spell_id in selected:
         row = spell_by_id[spell_id]
@@ -322,6 +332,7 @@ def generate(dbc_dir: Path) -> dict:
         },
         "classes": list(CLASS_IDS),
         "spells": records,
+        "mount_spell_ids": mount_spell_ids,
         "spell_families": ordered_families,
         "items": {
             item_id: {"class": row[1], "subclass": row[2], "inventory_type": row[6]}

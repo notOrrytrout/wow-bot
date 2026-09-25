@@ -27,12 +27,29 @@ pub struct EntityState {
     pub base_attack_time_ms: Option<[u32; 2]>,
     pub shapeshift_form: Option<u8>,
     pub aura_state: Option<u32>,
+    /// Server-owned UnitField flags. Missing means no authoritative unit update.
+    #[serde(default)]
+    pub unit_flags: Option<u32>,
+    /// Server-owned UnitField mount display identifier. Zero means unmounted.
+    #[serde(default)]
+    pub mount_display_id: Option<u32>,
+    /// Movement flags from a server UPDATE_OBJECT movement block.
+    #[serde(default)]
+    pub movement_flags: Option<u32>,
     pub target: Option<EntityId>,
     pub hostile: bool,
     pub interactable: bool,
 }
 
 impl EntityState {
+    pub fn in_combat(&self) -> Option<bool> {
+        self.unit_flags.map(|flags| flags & 0x0008_0000 != 0)
+    }
+
+    pub fn mounted(&self) -> Option<bool> {
+        self.mount_display_id.map(|display| display != 0)
+    }
+
     /// Return true only when observed health confirms that the entity is dead.
     pub fn is_dead(&self) -> bool {
         self.health.is_some_and(|(current, _)| current == 0)

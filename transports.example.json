@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "transports": [
+    {
+      "entry": 164871,
+      "name": "Undercity and Orgrimmar Zeppelin",
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "boarding": {
+            "map": 1,
+            "point": { "x": 1325.81, "y": -4633.86, "z": 23.084486 },
+            "orientation": 0.0
+          },
+          "exit": {
+            "map": 0,
+            "point": { "x": 2059.89, "y": 285.52, "z": 57.2912 },
+            "orientation": 0.0
+          }
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "boarding": {
+            "map": 0,
+            "point": { "x": 2059.89, "y": 285.52, "z": 57.2912 },
+            "orientation": 0.0
+          },
+          "exit": {
+            "map": 1,
+            "point": { "x": 1325.81, "y": -4633.86, "z": 23.084486 },
+            "orientation": 0.0
+          }
+        }
+      ]
+    }
+  ]
+}

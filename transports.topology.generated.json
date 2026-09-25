@@ -1,0 +1,1081 @@
+{
+  "schema_version": 1,
+  "source": "AzerothCore transports.sql and gameobject_template; TaxiPathNode data when available",
+  "note": "Topology only. Boarding and exit positions must be authored and validated separately.",
+  "transports": [
+    {
+      "entry": 176495,
+      "name": "Grom'gol Base Camp, Stranglethorn Vale and Undercity, Tirisfal Glades (Zeppelin, Horde (\"The Purple Princess\"))",
+      "path_id": 301,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 0,
+          "to_map": 0,
+          "from_node": 3,
+          "to_node": 19,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 0,
+          "to_map": 0,
+          "from_node": 19,
+          "to_node": 3,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 3,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 19,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 176310,
+      "name": "Auberdine, Darkshore and Stormwind Harbor (Boat, Alliance (\"The Bravery\"))",
+      "path_id": 967,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 0,
+          "to_map": 1,
+          "from_node": 5,
+          "to_node": 16,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 1,
+          "to_map": 0,
+          "from_node": 16,
+          "to_node": 5,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 5,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 16,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 11,
+          "from_map": 0,
+          "to_map": 1
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 176244,
+      "name": "Auberdine, Darkshore and Rut'theran Village, Teldrassil (Boat, Alliance (\"The Moonspray\"))",
+      "path_id": 293,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 1,
+          "to_map": 1,
+          "from_node": 5,
+          "to_node": 17,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 1,
+          "to_map": 1,
+          "from_node": 17,
+          "to_node": 5,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 5,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 17,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 176231,
+      "name": "Menethil Harbor, Wetlands and Theramore Isle, Dustwallow Marsh (Boat, Alliance (\"The Lady Mehley\"))",
+      "path_id": 292,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 0,
+          "to_map": 1,
+          "from_node": 5,
+          "to_node": 14,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 1,
+          "to_map": 0,
+          "from_node": 14,
+          "to_node": 5,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 5,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 14,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 10,
+          "from_map": 0,
+          "to_map": 1
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 175080,
+      "name": "Grom'gol Base Camp, Stranglethorn Vale and Orgrimmar, Durotar (Zeppelin, Horde (\"The Iron Eagle\"))",
+      "path_id": 285,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 0,
+          "to_map": 1,
+          "from_node": 3,
+          "to_node": 14,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 1,
+          "to_map": 0,
+          "from_node": 14,
+          "to_node": 3,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 3,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 14,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 8,
+          "from_map": 0,
+          "to_map": 1
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 164871,
+      "name": "Undercity, Tirisfal Glades and Orgrimmar, Durotar (Zeppelin, Horde (\"The Thundercaller\"))",
+      "path_id": 302,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 1,
+          "to_map": 0,
+          "from_node": 4,
+          "to_node": 18,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 0,
+          "to_map": 1,
+          "from_node": 18,
+          "to_node": 4,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 4,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 18,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 13,
+          "from_map": 1,
+          "to_map": 0
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 20808,
+      "name": "Booty Bay, Stranglethorn Vale and Ratchet, The Barrens (Boat, Neutral (\"The Maiden's Fancy\"))",
+      "path_id": 241,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 1,
+          "to_map": 0,
+          "from_node": 6,
+          "to_node": 16,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 0,
+          "to_map": 1,
+          "from_node": 16,
+          "to_node": 6,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 6,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 16,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 12,
+          "from_map": 1,
+          "to_map": 0
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 177233,
+      "name": "The Forgotten Coast, Feralas and Feathermoon Stronghold, Feralas (Boat, Alliance (\"Feathermoon Ferry\"))",
+      "path_id": 777,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 1,
+          "to_map": 1,
+          "from_node": 3,
+          "to_node": 13,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 1,
+          "to_map": 1,
+          "from_node": 13,
+          "to_node": 3,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 3,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 13,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 181646,
+      "name": "Auberdine, Darkshore and Valaar's Berth, Azuremyst Isle (Boat, Alliance (\"Elune's Blessing\"))",
+      "path_id": 503,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 530,
+          "to_map": 1,
+          "from_node": 6,
+          "to_node": 17,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 1,
+          "to_map": 530,
+          "from_node": 17,
+          "to_node": 6,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 6,
+          "map": 530,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 17,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 13,
+          "from_map": 530,
+          "to_map": 1
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 181688,
+      "name": "Menethil Harbor, Wetlands and Valgarde, Howling Fjord (Boat, Alliance (\"Northspear\"))",
+      "path_id": 964,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 0,
+          "to_map": 571,
+          "from_node": 5,
+          "to_node": 36,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 571,
+          "to_map": 0,
+          "from_node": 36,
+          "to_node": 5,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 5,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 36,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 11,
+          "from_map": 0,
+          "to_map": 571
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 181689,
+      "name": "Undercity, Tirisfal Glades and Vengeance Landing, Howling Fjord (Zeppelin, Horde (\"Cloudkisser\"))",
+      "path_id": 737,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 571,
+          "to_map": 0,
+          "from_node": 3,
+          "to_node": 10,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 0,
+          "to_map": 571,
+          "from_node": 10,
+          "to_node": 3,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 3,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 10,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 6,
+          "from_map": 571,
+          "to_map": 0
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 186238,
+      "name": "Orgrimmar, Durotar and Warsong Hold, Borean Tundra (Zeppelin, Horde (\"The Mighty Wind\"))",
+      "path_id": 712,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 571,
+          "to_map": 1,
+          "from_node": 4,
+          "to_node": 19,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 1,
+          "to_map": 571,
+          "from_node": 19,
+          "to_node": 4,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 4,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 19,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 15,
+          "from_map": 571,
+          "to_map": 1
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 186371,
+      "name": "Westguard Keep, Howling Fjord and Shattered Straits, Howling Fjord (Zeppelin, Alliance)",
+      "path_id": 727,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 1,
+          "to_node": 24,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 24,
+          "to_node": 1,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 1,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 24,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 187038,
+      "name": "Garvan's Reef (Boat, Neutral (\"Sister Mercy\"))",
+      "path_id": 778,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 0,
+          "to_node": 1,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 3,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 1,
+          "to_node": 2,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 3,
+          "to_stop": 4,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 2,
+          "to_node": 3,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 4,
+          "to_stop": 5,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 3,
+          "to_node": 4,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 5,
+          "to_stop": 6,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 4,
+          "to_node": 5,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 6,
+          "to_stop": 7,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 5,
+          "to_node": 10,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 7,
+          "to_stop": 1,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 10,
+          "to_node": 0,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 0,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 1,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 2
+        },
+        {
+          "node": 2,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 3
+        },
+        {
+          "node": 3,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 4
+        },
+        {
+          "node": 4,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 5
+        },
+        {
+          "node": 5,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 6
+        },
+        {
+          "node": 10,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 7
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 187568,
+      "name": "Unu'pe, Borean Tundra and Moa'ki Harbor, Dragonblight (Turtle, Neutral (\"Walker of Waves\"))",
+      "path_id": 799,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 4,
+          "to_node": 18,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 18,
+          "to_node": 4,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 4,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 18,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 188511,
+      "name": "Kamagua, Howling Fjord and Moa'ki Harbor, Dragonblight (Turtle, Neutral (\"Green Island\"))",
+      "path_id": 1079,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 4,
+          "to_node": 24,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 24,
+          "to_node": 4,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 4,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 24,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 190536,
+      "name": "Valiance Keep, Borean Tundra and Stormwind Harbor (Boat, Alliance (\"The Kraken\"))",
+      "path_id": 965,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 0,
+          "to_map": 571,
+          "from_node": 4,
+          "to_node": 16,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 571,
+          "to_map": 0,
+          "from_node": 16,
+          "to_node": 4,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 4,
+          "map": 0,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 16,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [
+        {
+          "node": 10,
+          "from_map": 0,
+          "to_map": 571
+        }
+      ],
+      "loops": true
+    },
+    {
+      "entry": 192241,
+      "name": "Icecrown (Gunship, Horde (\"Orgrim's Hammer\"))",
+      "path_id": 1095,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 0,
+          "to_node": 1,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 3,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 1,
+          "to_node": 4,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 3,
+          "to_stop": 4,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 4,
+          "to_node": 7,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 4,
+          "to_stop": 5,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 7,
+          "to_node": 14,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 5,
+          "to_stop": 6,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 14,
+          "to_node": 15,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 6,
+          "to_stop": 1,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 15,
+          "to_node": 0,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 0,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 1,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 2
+        },
+        {
+          "node": 4,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 3
+        },
+        {
+          "node": 7,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 4
+        },
+        {
+          "node": 14,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 5
+        },
+        {
+          "node": 15,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 6
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 192242,
+      "name": "Icecrown (Gunship, Alliance (\"The Skybreaker\"))",
+      "path_id": 1094,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 5,
+          "to_node": 8,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 3,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 8,
+          "to_node": 11,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 3,
+          "to_stop": 1,
+          "from_map": 571,
+          "to_map": 571,
+          "from_node": 11,
+          "to_node": 5,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 5,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 8,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 2
+        },
+        {
+          "node": 11,
+          "map": 571,
+          "action_flag": 2,
+          "stop": 3
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    },
+    {
+      "entry": 190549,
+      "name": "Orgrimmar, Durotar and Thunder Bluff, Mulgore (Zeppelin, Horde (\"The Zephyr\"))",
+      "path_id": 1221,
+      "nodes_available": true,
+      "legs": [
+        {
+          "from_stop": 1,
+          "to_stop": 2,
+          "from_map": 1,
+          "to_map": 1,
+          "from_node": 4,
+          "to_node": 22,
+          "requires_ground_points": true
+        },
+        {
+          "from_stop": 2,
+          "to_stop": 1,
+          "from_map": 1,
+          "to_map": 1,
+          "from_node": 22,
+          "to_node": 4,
+          "wraps_path": true,
+          "requires_ground_points": true
+        }
+      ],
+      "stops": [
+        {
+          "node": 4,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 1
+        },
+        {
+          "node": 22,
+          "map": 1,
+          "action_flag": 2,
+          "stop": 2
+        }
+      ],
+      "map_transitions": [],
+      "loops": true
+    }
+  ],
+  "taxipathnode_source": {
+    "file": "TaxiPathNode.dbc",
+    "sha256": "9e330838d1a50170354485514bf2d94395339070cde883fa8d18a5a7e7ed6214"
+  }
+}

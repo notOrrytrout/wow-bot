@@ -129,6 +129,7 @@ pub struct SpellRequirements {
 struct SpellCatalog {
     format_version: u32,
     spells: Vec<SpellMetadata>,
+    mount_spell_ids: Vec<u32>,
     spell_families: BTreeMap<u32, Vec<u32>>,
     stealth_required_spells: Vec<u32>,
     stealth_aura_spells: Vec<u32>,
@@ -138,6 +139,7 @@ struct SpellCatalog {
 
 struct SpellCatalogIndex {
     spells: BTreeMap<u32, SpellMetadata>,
+    mount_spell_ids: Vec<u32>,
     families: BTreeMap<u32, Vec<u32>>,
     stealth_required_spells: Vec<u32>,
     stealth_aura_spells: Vec<u32>,
@@ -159,6 +161,7 @@ fn catalog() -> &'static SpellCatalogIndex {
                 .into_iter()
                 .map(|spell| (spell.id, spell))
                 .collect(),
+            mount_spell_ids: catalog.mount_spell_ids,
             families: catalog.spell_families,
             stealth_required_spells: catalog.stealth_required_spells,
             stealth_aura_spells: catalog.stealth_aura_spells,
@@ -174,6 +177,11 @@ pub fn metadata(spell: u32) -> Option<&'static SpellMetadata> {
 
 pub fn family_spells(family_id: u32) -> Option<&'static [u32]> {
     catalog().families.get(&family_id).map(Vec::as_slice)
+}
+
+/// Return mount spell IDs detected from WotLK Spell.dbc mount auras.
+pub fn mount_spell_ids() -> &'static [u32] {
+    &catalog().mount_spell_ids
 }
 
 pub fn item_metadata(item: u32) -> Option<&'static ItemMetadata> {

@@ -1,9 +1,9 @@
-use wow_domain::{MovementEpoch, MovementId, Vec3};
+use wow_domain::{MovementEpoch, MovementId, WorldPosition};
 #[derive(Clone, Debug)]
 pub struct MovementRequest {
     pub id: MovementId,
     pub epoch: MovementEpoch,
-    pub destination: Vec3,
+    pub destination: WorldPosition,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct MovementClock {

@@ -31,6 +31,27 @@ pub fn check_spell_readiness(
     target: Option<EntityId>,
     now_ms: u64,
 ) -> Result<SpellUsePermit, SpellUnavailableReason> {
+    check_spell_readiness_inner(snapshot, spell, target, now_ms, false)
+}
+
+/// Check a known travel spell. Mount spells have no player class list in
+/// Spell.dbc, so this gate accepts metadata with an empty class list while
+/// keeping all known-spell, cooldown, resource, and requirement checks.
+pub fn check_travel_spell_readiness(
+    snapshot: &Snapshot,
+    spell: u32,
+    now_ms: u64,
+) -> Result<SpellUsePermit, SpellUnavailableReason> {
+    check_spell_readiness_inner(snapshot, spell, None, now_ms, true)
+}
+
+fn check_spell_readiness_inner(
+    snapshot: &Snapshot,
+    spell: u32,
+    target: Option<EntityId>,
+    now_ms: u64,
+    allow_classless_spell: bool,
+) -> Result<SpellUsePermit, SpellUnavailableReason> {
     if !snapshot.state.session.in_world {
         return Err(SpellUnavailableReason::NotInWorld);
     }
@@ -75,13 +96,14 @@ pub fn check_spell_readiness(
         .0
         .get(&player_id)
         .ok_or(SpellUnavailableReason::UnknownState)?;
-    if !metadata.classes.contains(
-        &snapshot
-            .state
-            .capabilities
-            .class_id
-            .ok_or(SpellUnavailableReason::UnknownState)?,
-    ) {
+    let class_id = snapshot
+        .state
+        .capabilities
+        .class_id
+        .ok_or(SpellUnavailableReason::UnknownState)?;
+    if !metadata.classes.contains(&class_id)
+        && !(allow_classless_spell && metadata.classes.is_empty())
+    {
         return Err(SpellUnavailableReason::WrongClass);
     }
     if let Some(target) = target {

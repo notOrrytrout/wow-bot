@@ -263,6 +263,8 @@ async fn main() -> Result<()> {
                 WorkerGeneration(1),
                 &config.runtime.control_bind,
                 &runtime_paths.maps,
+                &app_paths.root.join("transports.json"),
+                &config.runtime.runtime_tuning,
                 &app_paths.logs,
                 &run_id,
             )
@@ -909,6 +911,8 @@ async fn spawn_worker(
     generation: WorkerGeneration,
     control: &str,
     maps_dir: &Path,
+    transport_routes: &Path,
+    runtime_tuning: &wow_infra::config::runtime_data::RuntimeTuning,
     log_dir: &Path,
     run_id: &str,
 ) -> Result<Child> {
@@ -923,6 +927,10 @@ async fn spawn_worker(
         .arg(control)
         .arg("--maps-dir")
         .arg(maps_dir)
+        .arg("--transport-routes")
+        .arg(transport_routes)
+        .arg("--runtime-tuning-json")
+        .arg(serde_json::to_string(runtime_tuning).context("serialize worker runtime tuning")?)
         .env("WOW_BOT_RUN_ID", run_id)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

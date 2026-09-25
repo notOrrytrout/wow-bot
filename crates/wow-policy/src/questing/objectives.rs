@@ -45,7 +45,7 @@ pub enum ObjectiveResolution {
         activation_spell: Option<u32>,
     },
     QuestToolSearch {
-        destination: Vec3,
+        destination: WorldPosition,
     },
     GroundedItemCreature {
         item: u32,
@@ -58,15 +58,15 @@ pub enum ObjectiveResolution {
     },
     SearchArea {
         objective: usize,
-        destination: Vec3,
-        alternatives: Vec<Vec3>,
+        destination: WorldPosition,
+        alternatives: Vec<WorldPosition>,
         source: &'static str,
     },
     ItemCollection {
         item: u32,
         required: u32,
         current: u32,
-        destinations: Vec<Vec3>,
+        destinations: Vec<WorldPosition>,
     },
     WaitingForDefinition,
     NoSupportedObjective,
@@ -128,10 +128,22 @@ pub fn resolve_with_exclusions(
                         player.point,
                     );
                     if let Some(destination) = alternatives.first().copied() {
+                        let destination = WorldPosition {
+                            map: player.map,
+                            point: destination,
+                            orientation: 0.0,
+                        };
                         return ObjectiveResolution::SearchArea {
                             objective,
                             destination,
-                            alternatives,
+                            alternatives: alternatives
+                                .into_iter()
+                                .map(|point| WorldPosition {
+                                    map: player.map,
+                                    point,
+                                    orientation: 0.0,
+                                })
+                                .collect(),
                             source: "scripted-item-target-spawn",
                         };
                     }
@@ -157,7 +169,13 @@ pub fn resolve_with_exclusions(
                 if let Some(destination) =
                     static_hints::nearest_quest_tool(quest, player.map, player.point)
                 {
-                    return ObjectiveResolution::QuestToolSearch { destination };
+                    return ObjectiveResolution::QuestToolSearch {
+                        destination: WorldPosition {
+                            map: player.map,
+                            point: destination,
+                            orientation: 0.0,
+                        },
+                    };
                 }
             }
         }
@@ -232,10 +250,22 @@ pub fn resolve_with_exclusions(
             let alternatives =
                 static_hints::target_spawns(target.kind, target.entry, player.map, player.point);
             if let Some(destination) = alternatives.first().copied() {
+                let destination = WorldPosition {
+                    map: player.map,
+                    point: destination,
+                    orientation: 0.0,
+                };
                 return ObjectiveResolution::SearchArea {
                     objective: index,
                     destination,
-                    alternatives,
+                    alternatives: alternatives
+                        .into_iter()
+                        .map(|point| WorldPosition {
+                            map: player.map,
+                            point,
+                            orientation: 0.0,
+                        })
+                        .collect(),
                     source: "azerothcore-static-spawn",
                 };
             }
@@ -272,7 +302,16 @@ pub fn resolve_with_exclusions(
                 }
             }
             let destinations = player
-                .map(|player| static_hints::item_source_spawns(item.item, player.map, player.point))
+                .map(|player| {
+                    static_hints::item_source_spawns(item.item, player.map, player.point)
+                        .into_iter()
+                        .map(|point| WorldPosition {
+                            map: player.map,
+                            point,
+                            orientation: 0.0,
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             return ObjectiveResolution::ItemCollection {
                 item: item.item,
@@ -335,16 +374,20 @@ fn nearest_live_entity(
         .map(|(_, entity)| entity)
 }
 
-fn poi_destination(player: Option<WorldPosition>, definition: &QuestDefinition) -> Option<Vec3> {
-    let player = player?;
+fn poi_destination(
+    player: Option<WorldPosition>,
+    definition: &QuestDefinition,
+) -> Option<WorldPosition> {
+    player?;
     let map = definition.poi_map?;
-    if map != player.map {
-        return None;
-    }
     let x = definition.poi_x?;
     let y = definition.poi_y?;
-    let destination = Vec3::new(x, y, player.point.z);
-    destination.is_finite().then_some(destination)
+    let destination = WorldPosition {
+        map,
+        point: Vec3::new(x, y, 0.0),
+        orientation: 0.0,
+    };
+    destination.point.is_finite().then_some(destination)
 }
 
 #[cfg(test)]

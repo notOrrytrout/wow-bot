@@ -13,6 +13,54 @@ pub enum TravelAbilityKind {
     Mount,
 }
 
+/// Classify travel safety from server movement flags and local WotLK navmesh
+/// floor flags. Unknown evidence never permits a travel ability.
+pub fn surface_safety(
+    movement_flags: Option<u32>,
+    surface: Option<wow_navigation::detour::SurfaceKind>,
+) -> SurfaceSafety {
+    const ON_TRANSPORT: u32 = 0x0000_0200;
+    const JUMPING: u32 = 0x0000_1000;
+    const FALLING_FAR: u32 = 0x0000_2000;
+    const DISABLE_GRAVITY: u32 = 0x0000_0400;
+    const SWIMMING: u32 = 0x0020_0000;
+    const ASCENDING: u32 = 0x0040_0000;
+    const DESCENDING: u32 = 0x0080_0000;
+    const CAN_FLY: u32 = 0x0100_0000;
+    const FLYING: u32 = 0x0200_0000;
+    const SPLINE_ELEVATION: u32 = 0x0400_0000;
+    const FALLING_SLOW: u32 = 0x2000_0000;
+    const HOVER: u32 = 0x4000_0000;
+    const UNSAFE_MOVEMENT: u32 = ON_TRANSPORT
+        | JUMPING
+        | FALLING_FAR
+        | DISABLE_GRAVITY
+        | SWIMMING
+        | ASCENDING
+        | DESCENDING
+        | CAN_FLY
+        | FLYING
+        | SPLINE_ELEVATION
+        | FALLING_SLOW
+        | HOVER;
+    let Some(flags) = movement_flags else {
+        return SurfaceSafety::Unknown;
+    };
+    if flags & UNSAFE_MOVEMENT != 0 {
+        return SurfaceSafety::Unsafe;
+    }
+    match surface {
+        Some(wow_navigation::detour::SurfaceKind::Ground) => SurfaceSafety::Safe,
+        Some(
+            wow_navigation::detour::SurfaceKind::Water
+            | wow_navigation::detour::SurfaceKind::Magma
+            | wow_navigation::detour::SurfaceKind::Slime
+            | wow_navigation::detour::SurfaceKind::Mixed,
+        ) => SurfaceSafety::Unsafe,
+        Some(wow_navigation::detour::SurfaceKind::Unknown) | None => SurfaceSafety::Unknown,
+    }
+}
+
 /// A travel ability that the caller confirmed as known and ready from the current snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadyTravelAbility {
@@ -28,7 +76,7 @@ pub fn ready_travel_ability(
     spell: u32,
     now_ms: u64,
 ) -> Option<ReadyTravelAbility> {
-    crate::combat::readiness::check_spell_readiness(snapshot, spell, None, now_ms).ok()?;
+    crate::combat::readiness::check_travel_spell_readiness(snapshot, spell, now_ms).ok()?;
     Some(ReadyTravelAbility { kind, spell })
 }
 
@@ -53,7 +101,7 @@ pub struct TravelContext {
     pub alive: Option<bool>,
     pub in_combat: Option<bool>,
     pub controlled: bool,
-    pub mounted: bool,
+    pub mounted: Option<bool>,
     pub surface: SurfaceSafety,
     pub distance_yards: f32,
     pub ready_ability: Option<ReadyTravelAbility>,
@@ -69,7 +117,7 @@ pub fn select_travel_action(
     if context.alive != Some(true)
         || context.in_combat != Some(false)
         || context.controlled
-        || context.mounted
+        || context.mounted != Some(false)
         || context.surface != SurfaceSafety::Safe
         || !context.distance_yards.is_finite()
         || context.distance_yards < 0.0
@@ -108,7 +156,7 @@ mod tests {
             alive: Some(true),
             in_combat: Some(false),
             controlled: false,
-            mounted: false,
+            mounted: Some(false),
             surface: SurfaceSafety::Safe,
             distance_yards,
             ready_ability,
@@ -265,7 +313,7 @@ mod tests {
             None
         );
         context.controlled = false;
-        context.mounted = true;
+        context.mounted = Some(true);
         assert_eq!(
             select_travel_action(context, &RuntimeTuning::default()),
             None

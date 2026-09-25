@@ -8,6 +8,7 @@ pub mod risk;
 pub mod route;
 pub mod service;
 pub mod terrain;
+pub mod transports;
 pub mod vmap;
 pub use route::*;
 pub use service::*;

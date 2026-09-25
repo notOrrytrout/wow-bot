@@ -20,6 +20,8 @@ struct Args {
     generation: WorkerGeneration,
     control: String,
     maps_dir: std::path::PathBuf,
+    transport_routes: Option<std::path::PathBuf>,
+    runtime_tuning: wow_infra::config::runtime_data::RuntimeTuning,
 }
 
 fn args() -> Result<Args> {
@@ -27,6 +29,8 @@ fn args() -> Result<Args> {
     let mut generation = None;
     let mut control = None;
     let mut maps_dir = None;
+    let mut transport_routes = None;
+    let mut runtime_tuning = None;
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -48,6 +52,18 @@ fn args() -> Result<Args> {
                     it.next().context("--maps-dir requires a value")?,
                 ))
             }
+            "--transport-routes" => {
+                transport_routes = Some(std::path::PathBuf::from(
+                    it.next().context("--transport-routes requires a value")?,
+                ))
+            }
+            "--runtime-tuning-json" => {
+                let value = it
+                    .next()
+                    .context("--runtime-tuning-json requires a value")?;
+                runtime_tuning =
+                    Some(serde_json::from_str(&value).context("parse runtime tuning")?);
+            }
             "--help" | "-h" => {
                 println!(
                     "usage: wow-bot-worker --lane <id> --generation <n> --control <host:port> --maps-dir <path>"
@@ -62,6 +78,8 @@ fn args() -> Result<Args> {
         generation: generation.context("missing --generation")?,
         control: control.context("missing --control")?,
         maps_dir: maps_dir.context("missing --maps-dir")?,
+        transport_routes,
+        runtime_tuning: runtime_tuning.unwrap_or_default(),
     })
 }
 
@@ -168,9 +186,28 @@ async fn main() -> Result<()> {
                 )
             })?
             .with_maximum_step(0.7);
-    let engine = LaneEngine::new(initial_state(&args), lane_rx, proxy_tx)
+    let transport_routes = if let Some(path) =
+        args.transport_routes.as_ref().filter(|path| path.is_file())
+    {
+        let catalog = wow_navigation::transports::TransportRouteCatalog::load(path)
+            .map_err(anyhow::Error::msg)?;
+        let (validated, rejected) = catalog.validate_navigation(&movement_controller);
+        for reason in rejected {
+            tracing::warn!(%reason, "authored transport leg failed navigation validation and is disabled");
+        }
+        tracing::info!(path=%path.display(), valid_legs=validated.len(), "authored transport route catalog validated");
+        Some(validated)
+    } else {
+        tracing::info!(path=?args.transport_routes, "transport route catalog is missing; transport traversal is disabled");
+        None
+    };
+    let mut engine = LaneEngine::new(initial_state(&args), lane_rx, proxy_tx)
         .with_movement_controller(movement_controller)
+        .with_runtime_tuning(args.runtime_tuning.clone())
         .with_diagnostics(diagnostics.clone());
+    if let Some(routes) = transport_routes {
+        engine = engine.with_transport_routes(routes);
+    }
     let engine_task = tokio::spawn(engine.run());
 
     let lane = args.lane;

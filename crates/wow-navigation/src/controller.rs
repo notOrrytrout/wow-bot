@@ -141,6 +141,99 @@ impl MovementController {
         self.navigation.is_some()
     }
 
+    /// Accept an authored waypoint only when MMAP projects it onto a nearby
+    /// ground polygon without materially changing its position.
+    pub fn validate_grounded_waypoint(
+        &self,
+        position: WorldPosition,
+    ) -> Result<(), NavigationError> {
+        let navigation = self
+            .navigation
+            .as_ref()
+            .ok_or(NavigationError::MissingNavigationData)?;
+        if !position.point.is_finite() || !position.orientation.is_finite() {
+            return Err(NavigationError::NoRoute);
+        }
+        let projected = navigation
+            .project_walkable_position(
+                position.map,
+                (position.point.x, position.point.y, position.point.z),
+                false,
+                &|| false,
+            )
+            .map_err(|_| NavigationError::NoRoute)?;
+        let horizontal = (projected[0] - position.point.x).hypot(projected[1] - position.point.y);
+        let vertical = (projected[2] - position.point.z).abs();
+        if horizontal > 1.0 || vertical > 1.0 {
+            return Err(NavigationError::NoRoute);
+        }
+        let sample = [[projected[0], projected[1], projected[2]]];
+        let surface = navigation
+            .route_surfaces(position.map, &sample)
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(NavigationError::NoRoute)?;
+        if surface.kind != crate::detour::SurfaceKind::Ground {
+            return Err(NavigationError::NoRoute);
+        }
+        Ok(())
+    }
+
+    /// Project a map-aware goal's horizontal coordinates onto ground. Require
+    /// a close horizontal match; the source may not know the destination Z.
+    pub fn project_grounded_waypoint(
+        &self,
+        position: WorldPosition,
+    ) -> Result<WorldPosition, NavigationError> {
+        let navigation = self
+            .navigation
+            .as_ref()
+            .ok_or(NavigationError::MissingNavigationData)?;
+        if !position.point.is_finite() || !position.orientation.is_finite() {
+            return Err(NavigationError::NoRoute);
+        }
+        let projected = navigation
+            .project_walkable_position(
+                position.map,
+                (position.point.x, position.point.y, position.point.z),
+                false,
+                &|| false,
+            )
+            .map_err(|_| NavigationError::NoRoute)?;
+        if (projected[0] - position.point.x).hypot(projected[1] - position.point.y) > 1.0 {
+            return Err(NavigationError::NoRoute);
+        }
+        let sample = [[projected[0], projected[1], projected[2]]];
+        let surface = navigation
+            .route_surfaces(position.map, &sample)
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(NavigationError::NoRoute)?;
+        if surface.kind != crate::detour::SurfaceKind::Ground {
+            return Err(NavigationError::NoRoute);
+        }
+        Ok(WorldPosition {
+            map: position.map,
+            point: Vec3::new(projected[0], projected[1], projected[2]),
+            orientation: position.orientation,
+        })
+    }
+
+    /// Classify the server-observed position against a nearby Detour floor.
+    /// Missing or distant mesh data stays unknown.
+    pub fn surface_kind_at(&self, position: WorldPosition) -> Option<crate::detour::SurfaceKind> {
+        let navigation = self.navigation.as_ref()?;
+        let point = [[position.point.x, position.point.y, position.point.z]];
+        navigation
+            .route_surfaces(position.map, &point)
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|surface| surface.kind)
+    }
+
     pub fn plan_route_cancellable(
         &self,
         current: WorldPosition,

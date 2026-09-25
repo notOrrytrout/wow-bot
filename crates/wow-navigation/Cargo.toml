@@ -9,6 +9,7 @@ wow-domain.workspace = true
 wow-state.workspace = true
 
 serde.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true

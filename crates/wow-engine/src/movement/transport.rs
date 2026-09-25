@@ -30,13 +30,13 @@ pub struct TransportTraversal {
     pub exit_point: WorldPosition,
     pub proximity: f32,
     pub max_vertical_delta: f32,
-    pub max_observations: u8,
+    pub max_observations: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportProgress {
     pub phase: TransportPhase,
-    pub observations: u8,
+    pub observations: u16,
 }
 
 impl Default for TransportProgress {

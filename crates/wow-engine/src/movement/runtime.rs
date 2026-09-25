@@ -1,11 +1,11 @@
-use wow_domain::{MovementEpoch, MovementId, TaskId, Vec3};
+use wow_domain::{MovementEpoch, MovementId, TaskId, WorldPosition};
 use wow_navigation::Route;
 #[derive(Clone, Debug)]
 pub struct MovementRuntime {
     pub id: MovementId,
     pub owner: TaskId,
     pub epoch: MovementEpoch,
-    pub destination: Vec3,
+    pub destination: WorldPosition,
     pub route: Option<Route>,
     pub waypoint: usize,
 }

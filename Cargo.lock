@@ -2345,6 +2345,7 @@ dependencies = [
  "local-ip-address",
  "rfd",
  "rpassword",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2430,6 +2431,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "wow-domain",
@@ -2444,6 +2446,7 @@ dependencies = [
  "serde_json",
  "wow-domain",
  "wow-infra",
+ "wow-navigation",
  "wow-state",
 ]
 

@@ -1,4 +1,4 @@
-use wow_domain::{EntityId, TaskId, Vec3};
+use wow_domain::{EntityId, TaskId, WorldPosition};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct QuestWorkId(pub u64);
@@ -14,7 +14,7 @@ pub enum QuestWorkKey {
     TravelToObjective {
         quest: u32,
         objective: usize,
-        destination: Vec3,
+        destination: WorldPosition,
     },
     CombatObjective {
         quest: u32,
@@ -43,8 +43,20 @@ pub struct QuestWorkRuntime {
 
 #[derive(Clone, Debug)]
 pub enum QuestChildWork {
-    Travel { task: TaskId, destination: Vec3 },
-    Combat { task: TaskId, target: EntityId },
-    Gather { task: TaskId, item: u32 },
-    Interact { task: TaskId, target: EntityId },
+    Travel {
+        task: TaskId,
+        destination: WorldPosition,
+    },
+    Combat {
+        task: TaskId,
+        target: EntityId,
+    },
+    Gather {
+        task: TaskId,
+        item: u32,
+    },
+    Interact {
+        task: TaskId,
+        target: EntityId,
+    },
 }

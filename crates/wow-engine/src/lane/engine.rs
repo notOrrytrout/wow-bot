@@ -19,7 +19,8 @@ use wow_state::{ProtocolObservation, Snapshot, reduce};
 #[derive(Clone, Debug)]
 struct PendingMovement {
     runtime: crate::movement::MovementRuntime,
-    destination: Vec3,
+    destination: WorldPosition,
+    destination_map_known: bool,
     acceptable_range: f32,
     resume: Option<GameplayCommand>,
     resume_pending: Option<PendingQuestAction>,
@@ -36,6 +37,10 @@ struct PendingMovement {
     last_player_client_time: Option<u32>,
     last_position_update_at: Instant,
     route_failures: u8,
+    transport: Option<(
+        crate::movement::transport::TransportTraversal,
+        crate::movement::transport::TransportProgress,
+    )>,
 }
 
 struct RoutePlanJob {
@@ -52,6 +57,15 @@ struct PendingFacing {
     mover: Option<EntityId>,
     orientation: f32,
     tolerance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingTravelPreparation {
+    kind: wow_policy::travel::TravelAbilityKind,
+    spell: u32,
+    destination: WorldPosition,
+    work_id: QuestWorkId,
+    deadline: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +170,10 @@ pub struct LaneEngine {
     last_wait_reason: Option<String>,
     last_dispatch: DispatchOutcome,
     movement_controller: Option<wow_navigation::MovementController>,
+    transport_routes: Option<wow_navigation::transports::ValidatedTransportRoutes>,
+    runtime_tuning: wow_infra::config::runtime_data::RuntimeTuning,
+    pending_travel_preparation: Option<PendingTravelPreparation>,
+    travel_preparation_skipped: Option<(QuestWorkId, WorldPosition)>,
     diagnostics: Option<DiagnosticLogger>,
     credited_quest_targets: BTreeSet<(u32, usize, EntityId)>,
     los_blocked: BTreeSet<EntityId>,
@@ -209,6 +227,10 @@ impl LaneEngine {
             last_wait_reason: None,
             last_dispatch: DispatchOutcome::Rejected,
             movement_controller: None,
+            transport_routes: None,
+            runtime_tuning: wow_infra::config::runtime_data::RuntimeTuning::default(),
+            pending_travel_preparation: None,
+            travel_preparation_skipped: None,
             diagnostics: None,
             credited_quest_targets: BTreeSet::new(),
             los_blocked: BTreeSet::new(),
@@ -238,6 +260,22 @@ impl LaneEngine {
         self
     }
 
+    pub fn with_transport_routes(
+        mut self,
+        routes: wow_navigation::transports::ValidatedTransportRoutes,
+    ) -> Self {
+        self.transport_routes = Some(routes);
+        self
+    }
+
+    pub fn with_runtime_tuning(
+        mut self,
+        tuning: wow_infra::config::runtime_data::RuntimeTuning,
+    ) -> Self {
+        self.runtime_tuning = tuning;
+        self
+    }
+
     pub fn with_diagnostics(mut self, diagnostics: DiagnosticLogger) -> Self {
         self.diagnostics = Some(diagnostics);
         self
@@ -250,6 +288,9 @@ impl LaneEngine {
     }
 
     pub async fn run(mut self) {
+        if let Some(routes) = &self.transport_routes {
+            tracing::info!(lane=?self.state.lane, valid_transport_legs=routes.len(), "authored transport routes loaded");
+        }
         let mut mission_tick = tokio::time::interval(ENGINE_TICK_INTERVAL);
         mission_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut movement_tick = tokio::time::interval(MOVEMENT_STEP_INTERVAL);
@@ -1139,6 +1180,41 @@ impl LaneEngine {
         work: QuestWorkRuntime,
         purpose: MovementPurpose,
     ) {
+        let map = self
+            .state
+            .authoritative
+            .control
+            .active_position(self.state.authoritative.position.player)
+            .map(|position| position.map);
+        let map_known = map.is_some();
+        self.queue_world_movement(
+            WorldPosition {
+                map: map.unwrap_or_default(),
+                point: destination,
+                orientation: 0.0,
+            },
+            acceptable_range,
+            resume,
+            resume_pending,
+            resume_origin,
+            work,
+            purpose,
+        );
+        if !map_known && let Some(movement) = self.pending_movement.as_mut() {
+            movement.destination_map_known = false;
+        }
+    }
+
+    fn queue_world_movement(
+        &mut self,
+        destination: WorldPosition,
+        acceptable_range: f32,
+        resume: Option<GameplayCommand>,
+        resume_pending: Option<PendingQuestAction>,
+        resume_origin: PlanOrigin,
+        work: QuestWorkRuntime,
+        purpose: MovementPurpose,
+    ) {
         let now = Instant::now();
         if let Some(job) = &self.route_job {
             job.cancellation.cancel();
@@ -1160,11 +1236,16 @@ impl LaneEngine {
                 id: movement_id,
                 owner: TaskId(work.id.0),
                 epoch: self.state.movement_epoch,
-                destination,
+                destination: WorldPosition {
+                    map: destination.map,
+                    point: destination.point,
+                    orientation: destination.orientation,
+                },
                 route: None,
                 waypoint: 0,
             },
             destination,
+            destination_map_known: true,
             acceptable_range,
             resume,
             resume_pending,
@@ -1182,6 +1263,7 @@ impl LaneEngine {
                 .map(|_| self.state.authoritative.position.client_time),
             last_position_update_at: now,
             route_failures: 0,
+            transport: None,
         });
     }
 
@@ -1191,9 +1273,59 @@ impl LaneEngine {
         }
     }
 
-    fn queue_search_movement(&mut self, destination: Vec3, work: QuestWorkRuntime) {
-        self.queue_movement(
-            destination,
+    async fn queue_search_movement(&mut self, destination: Vec3, work: QuestWorkRuntime) {
+        if let Some(pending) = self.pending_travel_preparation {
+            if pending.destination != self.local_world_position(destination)
+                || pending.work_id != work.id
+            {
+                self.pending_travel_preparation = None;
+            } else if self.travel_ability_active(pending.kind, pending.spell) {
+                tracing::info!(lane=?self.state.lane, spell=pending.spell, ?pending.kind, "authoritative travel ability activation observed");
+                self.pending_travel_preparation = None;
+            } else if Instant::now() < pending.deadline {
+                self.waiting(format!(
+                    "travel spell {} is waiting for authoritative activation",
+                    pending.spell
+                ));
+                return;
+            } else {
+                tracing::warn!(lane=?self.state.lane, spell=pending.spell, ?pending.kind, "travel ability activation was not observed before timeout");
+                self.pending_travel_preparation = None;
+                self.travel_preparation_skipped =
+                    Some((work.id, self.local_world_position(destination)));
+            }
+        }
+
+        if self.pending_travel_preparation.is_none()
+            && self.travel_preparation_skipped
+                != Some((work.id, self.local_world_position(destination)))
+            && let Some(action) = self.travel_action_for(destination)
+            && self
+                .propose_command(
+                    GameplayCommand::Cast {
+                        spell: action.spell(),
+                        target: None,
+                    },
+                    true,
+                )
+                .await
+        {
+            self.pending_travel_preparation = Some(PendingTravelPreparation {
+                kind: action.kind(),
+                spell: action.spell(),
+                destination: self.local_world_position(destination),
+                work_id: work.id,
+                deadline: Instant::now() + Duration::from_secs(5),
+            });
+            self.waiting(format!(
+                "travel spell {} is waiting for authoritative activation",
+                action.spell()
+            ));
+            return;
+        }
+
+        self.queue_world_movement(
+            self.local_world_position(destination),
             QUEST_SEARCH_ARRIVAL_RANGE,
             None,
             None,
@@ -1201,6 +1333,116 @@ impl LaneEngine {
             work,
             MovementPurpose::SearchArea,
         );
+    }
+
+    fn local_world_position(&self, point: Vec3) -> WorldPosition {
+        WorldPosition {
+            map: self
+                .state
+                .authoritative
+                .control
+                .active_position(self.state.authoritative.position.player)
+                .map_or(0, |position| position.map),
+            point,
+            orientation: 0.0,
+        }
+    }
+
+    fn travel_action_for(&self, destination: Vec3) -> Option<wow_policy::travel::TravelAction> {
+        use wow_policy::travel::{
+            TravelAbilityKind, TravelContext, ready_travel_ability, select_travel_action,
+            surface_safety,
+        };
+        const TRAVEL_FORMS: [u32; 2] = [783, 2645]; // Travel Form, Ghost Wolf
+        let player_id = self
+            .state
+            .authoritative
+            .session
+            .character_guid
+            .map(EntityId)?;
+        let player = self.state.authoritative.entities.0.get(&player_id)?;
+        let position = player.position?;
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        let alive = player.health.map(|(health, _)| health > 0);
+        let in_combat = player.in_combat();
+        let mounted = player.mounted();
+        let nav_surface = self
+            .movement_controller
+            .as_ref()
+            .and_then(|controller| controller.surface_kind_at(position));
+        let surface = surface_safety(player.movement_flags, nav_surface);
+        let base = TravelContext {
+            alive,
+            in_combat,
+            controlled: self.state.authoritative.control.mover.is_some(),
+            mounted,
+            surface,
+            distance_yards: position.point.distance(destination),
+            ready_ability: None,
+        };
+        let now_ms = Millis::wall_clock_now().0;
+
+        for spell in TRAVEL_FORMS {
+            if self
+                .state
+                .authoritative
+                .auras
+                .spells(player_id)
+                .contains(&spell)
+            {
+                return None;
+            }
+            if let Some(ready) =
+                ready_travel_ability(&snapshot, TravelAbilityKind::SpeedForm, spell, now_ms)
+            {
+                let mut context = base;
+                context.ready_ability = Some(ready);
+                if let Some(action) = select_travel_action(context, &self.runtime_tuning) {
+                    return Some(action);
+                }
+            }
+        }
+
+        let mount = wow_policy::combat::spells::mount_spell_ids()
+            .iter()
+            .copied()
+            .filter(|spell| self.state.authoritative.capabilities.spells.contains(spell))
+            .find_map(|spell| {
+                ready_travel_ability(&snapshot, TravelAbilityKind::Mount, spell, now_ms)
+            });
+        let mut context = base;
+        context.ready_ability = mount;
+        select_travel_action(context, &self.runtime_tuning)
+    }
+
+    fn travel_ability_active(
+        &self,
+        kind: wow_policy::travel::TravelAbilityKind,
+        spell: u32,
+    ) -> bool {
+        let Some(player_id) = self
+            .state
+            .authoritative
+            .session
+            .character_guid
+            .map(EntityId)
+        else {
+            return false;
+        };
+        let Some(player) = self.state.authoritative.entities.0.get(&player_id) else {
+            return false;
+        };
+        match kind {
+            wow_policy::travel::TravelAbilityKind::SpeedForm => self
+                .state
+                .authoritative
+                .auras
+                .spells(player_id)
+                .contains(&spell),
+            wow_policy::travel::TravelAbilityKind::Mount => {
+                player.mount_display_id.is_some_and(|display| display != 0)
+            }
+        }
     }
 
     fn observe_movement_position(
@@ -1277,6 +1519,183 @@ impl LaneEngine {
             self.pending_movement = Some(movement);
             return true;
         };
+        if !movement.destination_map_known {
+            movement.destination.map = player.map;
+            movement.runtime.destination.map = player.map;
+            movement.destination_map_known = true;
+        }
+        if player.map != movement.destination.map || movement.transport.is_some() {
+            let Some(routes) = self.transport_routes.as_ref() else {
+                self.waiting(format!(
+                    "travel goal is on map {} while the player is on map {}; no validated transport catalog is available",
+                    movement.destination.map, player.map
+                ));
+                self.pending_movement = Some(movement);
+                return true;
+            };
+            if movement.transport.is_none() {
+                let selected_leg = routes
+                    .route_for_maps(player.map, movement.destination.map)
+                    .and_then(|route| route.into_iter().next());
+                let Some((entry, leg)) = selected_leg else {
+                    self.waiting(format!(
+                        "no visible transport and no validated leg route connects map {} to map {}",
+                        player.map, movement.destination.map
+                    ));
+                    self.pending_movement = Some(movement);
+                    return true;
+                };
+                let transport = self
+                    .state
+                    .authoritative
+                    .entities
+                    .0
+                    .values()
+                    .filter(|entity| {
+                        entity.entry == entry
+                            && entity.kind == wow_state::entities::EntityKind::GameObject
+                    })
+                    .filter_map(|entity| entity.position.map(|position| (entity, position)))
+                    .filter(|(_, position)| position.map == player.map)
+                    .min_by(|(_, a), (_, b)| {
+                        a.point
+                            .distance(player.point)
+                            .total_cmp(&b.point.distance(player.point))
+                    })
+                    .map(|(entity, _)| entity.id)
+                    // A runtime transport object may enter visibility only near
+                    // the authored terminal. Approach the grounded stop first.
+                    .unwrap_or(EntityId(0));
+                movement.transport = Some((
+                    crate::movement::transport::TransportTraversal {
+                        transport,
+                        boarding_point: leg.boarding,
+                        exit_point: leg.exit,
+                        proximity: 3.5,
+                        max_vertical_delta: 3.0,
+                        max_observations: 1200,
+                    },
+                    crate::movement::transport::TransportProgress::default(),
+                ));
+            }
+            let (mut traversal, mut progress) = movement
+                .transport
+                .expect("transport traversal was selected");
+            if traversal.transport == EntityId(0) {
+                let transport_entry = routes
+                    .route_for_maps(player.map, movement.destination.map)
+                    .and_then(|route| route.into_iter().next())
+                    .map(|(entry, _)| entry);
+                let observed_transport = self.state.authoritative.transport.transport;
+                let matched_transport = observed_transport.and_then(|id| {
+                    self.state
+                        .authoritative
+                        .entities
+                        .0
+                        .get(&id)
+                        .filter(|entity| {
+                            Some(entity.entry) == transport_entry
+                                && entity.kind == wow_state::entities::EntityKind::GameObject
+                        })
+                        .map(|entity| entity.id)
+                });
+                let visible_transport = transport_entry.and_then(|entry| {
+                    self.state
+                        .authoritative
+                        .entities
+                        .0
+                        .values()
+                        .filter(|entity| {
+                            entity.entry == entry
+                                && entity.kind == wow_state::entities::EntityKind::GameObject
+                        })
+                        .filter_map(|entity| entity.position.map(|position| (entity, position)))
+                        .filter(|(_, position)| position.map == player.map)
+                        .min_by(|(_, a), (_, b)| {
+                            a.point
+                                .distance(player.point)
+                                .total_cmp(&b.point.distance(player.point))
+                        })
+                        .map(|(entity, _)| entity.id)
+                });
+                if let Some(id) = matched_transport.or(visible_transport) {
+                    traversal.transport = id;
+                } else if progress.phase
+                    == crate::movement::transport::TransportPhase::AwaitBoarding
+                {
+                    progress.observations = progress.observations.saturating_add(1);
+                    if progress.observations >= traversal.max_observations {
+                        progress.phase = crate::movement::transport::TransportPhase::Blocked;
+                    }
+                    movement.transport = Some((traversal, progress));
+                    self.waiting("at the authored boarding point; waiting for the server to identify the transport gameobject".into());
+                    self.pending_movement = Some(movement);
+                    return true;
+                }
+            }
+            let step = crate::movement::transport::advance_transport(
+                traversal,
+                progress,
+                Some(player),
+                &self.state.authoritative.transport,
+            );
+            movement.transport = Some((traversal, step.progress));
+            use crate::movement::transport::TransportAction;
+            match step.action {
+                TransportAction::MoveToBoardingPoint | TransportAction::MoveToExitPoint => {
+                    let waypoint = if step.action == TransportAction::MoveToBoardingPoint {
+                        traversal.boarding_point
+                    } else {
+                        traversal.exit_point
+                    };
+                    let next = self
+                        .movement_controller
+                        .as_ref()
+                        .and_then(|controller| {
+                            controller
+                                .next_step(
+                                    player,
+                                    waypoint.point,
+                                    1.0,
+                                    wow_navigation::LocomotionMode::Ground,
+                                )
+                                .ok()
+                                .flatten()
+                        })
+                        .map(|step| step.next);
+                    if let Some(next) = next {
+                        movement.last_step = Some(Instant::now());
+                        self.pending_movement = Some(movement);
+                        return self
+                            .propose_command(GameplayCommand::MoveTo(next), false)
+                            .await;
+                    }
+                    self.waiting("transport waypoint has no safe local navigation step".into());
+                }
+                TransportAction::WaitForBoarding => self.waiting(
+                    "waiting for authoritative attachment to the selected transport".into(),
+                ),
+                TransportAction::WaitForRide => self.waiting(
+                    "riding transport; waiting for authoritative detachment at the authored exit"
+                        .into(),
+                ),
+                TransportAction::Complete => {
+                    movement.transport = None;
+                    movement.started_at = Instant::now();
+                    movement.last_progress_at = Instant::now();
+                    if player.map != movement.destination.map {
+                        self.waiting("transport leg completed; selecting the next validated leg toward the travel goal".into());
+                    }
+                }
+                TransportAction::Blocked => {
+                    self.waiting("transport traversal stopped because authoritative boarding, ride, exit, or waypoint checks failed".into());
+                    movement.transport = None;
+                }
+            }
+            self.pending_movement = Some(movement);
+            return true;
+        }
+        movement.transport = None;
         let controlled_mover = self.state.authoritative.control.mover.is_some();
         let movement_flags = if controlled_mover {
             self.state.authoritative.control.movement_flags
@@ -1286,9 +1705,12 @@ impl LaneEngine {
         let locomotion =
             wow_navigation::LocomotionMode::from_server_flags(controlled_mover, movement_flags);
         let distance = match locomotion {
-            wow_navigation::LocomotionMode::Ground => (movement.destination.x - player.point.x)
-                .hypot(movement.destination.y - player.point.y),
-            wow_navigation::LocomotionMode::Flight => player.point.distance(movement.destination),
+            wow_navigation::LocomotionMode::Ground => (movement.destination.point.x
+                - player.point.x)
+                .hypot(movement.destination.point.y - player.point.y),
+            wow_navigation::LocomotionMode::Flight => {
+                player.point.distance(movement.destination.point)
+            }
         };
 
         if movement.started_at.elapsed() >= Duration::from_secs(90) {
@@ -1375,7 +1797,7 @@ impl LaneEngine {
         if locomotion == wow_navigation::LocomotionMode::Ground
             && let Some(controller) = self.movement_controller.clone()
             && controller.has_navigation_data()
-            && !controller.route_is_ready(player.map, movement.destination)
+            && !controller.route_is_ready(player.map, movement.destination.point)
         {
             if let Some(job) = self.route_job.as_mut() {
                 let is_current = job.token
@@ -1534,7 +1956,7 @@ impl LaneEngine {
             let worker_token = cancellation.clone();
             let worker_controller = controller.clone();
             let route_start = player;
-            let route_destination = movement.destination;
+            let route_destination = movement.destination.point;
             let route_planning_permit = permit;
             let stamped = crate::runtime::Stamped {
                 stamp: self.state.stamp(),
@@ -1563,7 +1985,7 @@ impl LaneEngine {
         let step_result = match &self.movement_controller {
             Some(controller) => controller.next_step(
                 player,
-                movement.destination,
+                movement.destination.point,
                 movement.acceptable_range,
                 locomotion,
             ),
@@ -2046,14 +2468,17 @@ impl LaneEngine {
                     .authoritative
                     .position
                     .player
-                    .is_some_and(|player| quest_tool_search_arrived(player.point, destination))
+                    .is_some_and(|player| {
+                        player.map == destination.map
+                            && quest_tool_search_arrived(player.point, destination.point)
+                    })
                 {
                     self.waiting(format!("quest {quest} reached quest-control search area; waiting for live authoritative control object"));
                     return true;
                 }
-                tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "quest scheduler traveling to quest-bound control object search area");
+                tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, map=destination.map, x=destination.point.x, y=destination.point.y, "quest scheduler traveling to quest-bound control object search area");
                 self.queue_movement(
-                    destination,
+                    destination.point,
                     QUEST_TOOL_SEARCH_RANGE,
                     None,
                     None,
@@ -2112,15 +2537,51 @@ impl LaneEngine {
             }
             ObjectiveResolution::SearchArea {
                 objective,
-                destination,
-                alternatives,
+                mut destination,
+                mut alternatives,
                 source,
             } => {
+                let cross_map = self
+                    .state
+                    .authoritative
+                    .position
+                    .player
+                    .is_some_and(|player| player.map != destination.map);
+                if source == "server-poi" || cross_map {
+                    let Some(controller) = self.movement_controller.as_ref() else {
+                        self.waiting(format!("quest {quest} travel goal is on map {}; navigation controller is unavailable", destination.map));
+                        return true;
+                    };
+                    match controller.project_grounded_waypoint(destination) {
+                        Ok(projected) => {
+                            destination = projected;
+                            if source == "server-poi" {
+                                alternatives = vec![projected];
+                            }
+                        }
+                        Err(error) => {
+                            self.waiting(format!("quest {quest} destination is not a validated ground point: {error:?}"));
+                            return true;
+                        }
+                    }
+                }
                 let work = self.set_work(QuestWorkKey::TravelToObjective {
                     quest,
                     objective,
                     destination,
                 });
+                if cross_map {
+                    self.queue_world_movement(
+                        destination,
+                        QUEST_SEARCH_ARRIVAL_RANGE,
+                        None,
+                        None,
+                        PlanOrigin::SystemPolicy,
+                        work,
+                        MovementPurpose::SearchArea,
+                    );
+                    return true;
+                }
                 let key = (quest, objective, 0);
                 let current_pos = self
                     .state
@@ -2128,18 +2589,25 @@ impl LaneEngine {
                     .position
                     .player
                     .map(|player| player.point);
-                let arrived =
-                    current_pos.is_some_and(|position| quest_search_arrived(position, destination));
-                let candidates =
-                    bounded_candidates(alternatives, current_pos.unwrap_or(destination));
-                let Some(destination) =
-                    self.next_search_destination(key, &candidates, arrived.then_some(destination))
-                else {
+                let arrived = current_pos
+                    .is_some_and(|position| quest_search_arrived(position, destination.point));
+                let candidates = bounded_candidates(
+                    alternatives
+                        .into_iter()
+                        .map(|position| position.point)
+                        .collect(),
+                    current_pos.unwrap_or(destination.point),
+                );
+                let Some(destination) = self.next_search_destination(
+                    key,
+                    &candidates,
+                    arrived.then_some(destination.point),
+                ) else {
                     self.waiting(format!("quest {quest} exhausted nearby {source} hints for objective {objective}; waiting before a bounded retry"));
                     return true;
                 };
                 tracing::info!(lane=?self.state.lane, quest, objective, work_id=?work.id, %source, x=destination.x, y=destination.y, "quest scheduler starting bounded objective-area travel");
-                self.queue_search_movement(destination, work);
+                self.queue_search_movement(destination, work).await;
                 return true;
             }
             ObjectiveResolution::ItemCollection {
@@ -2156,7 +2624,20 @@ impl LaneEngine {
                     .position
                     .player
                     .map(|player| player.point);
-                let candidates = bounded_candidates(destinations, current_pos.unwrap_or_default());
+                let candidates = bounded_candidates(
+                    destinations
+                        .into_iter()
+                        .filter(|position| {
+                            self.state
+                                .authoritative
+                                .position
+                                .player
+                                .is_some_and(|player| player.map == position.map)
+                        })
+                        .map(|position| position.point)
+                        .collect(),
+                    current_pos.unwrap_or_default(),
+                );
                 let reached_destination = current_pos.and_then(|position| {
                     candidates
                         .iter()
@@ -2172,7 +2653,7 @@ impl LaneEngine {
                 };
                 if reached_destination != Some(destination) {
                     tracing::info!(lane=?self.state.lane, quest, item, current, required, work_id=?work.id, x=destination.x, y=destination.y, "quest item objective using AzerothCore loot-source search hint");
-                    self.queue_search_movement(destination, work);
+                    self.queue_search_movement(destination, work).await;
                 }
                 return true;
             }
@@ -2304,7 +2785,7 @@ impl LaneEngine {
                 self.quest_start_search_attempts
                     .insert(quest_start_search_point_key(
                         player.map,
-                        movement.destination,
+                        movement.destination.point,
                     ));
             }
             return;
@@ -2319,7 +2800,7 @@ impl LaneEngine {
         self.search_attempts
             .entry(key)
             .or_default()
-            .insert(search_point_key(movement.destination));
+            .insert(search_point_key(movement.destination.point));
     }
 
     fn defer_quest_giver(&mut self, giver: EntityId) {
@@ -2858,7 +3339,16 @@ impl LaneEngine {
             self.set_work(QuestWorkKey::TravelToObjective {
                 quest: 0,
                 objective: 0,
-                destination,
+                destination: WorldPosition {
+                    map: self
+                        .state
+                        .authoritative
+                        .position
+                        .player
+                        .map_or(0, |position| position.map),
+                    point: destination,
+                    orientation: 0.0,
+                },
             })
         });
         tracing::info!(lane=?self.state.lane, work_id=?work.id, ?destination, acceptable_range, resume=?resume, %label, "shared spatial precondition handed off to owned movement");
@@ -3978,7 +4468,11 @@ mod tests {
             key: QuestWorkKey::TravelToObjective {
                 quest: 42,
                 objective: 0,
-                destination,
+                destination: WorldPosition {
+                    map: 0,
+                    point: destination,
+                    orientation: 0.0,
+                },
             },
         };
         engine.current_work = Some(work.clone());

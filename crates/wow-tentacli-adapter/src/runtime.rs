@@ -51,6 +51,8 @@ pub struct ObjectObservationRuntime {
     last_player_position: Option<WorldPosition>,
     map_id: u32,
     player_guid: Option<EntityId>,
+    last_transport: Option<wow_state::transport::TransportState>,
+    transport_observed: bool,
 }
 
 impl ObjectObservationRuntime {
@@ -80,6 +82,8 @@ impl ObjectObservationRuntime {
             last_player_position: None,
             map_id: 0,
             player_guid: None,
+            last_transport: None,
+            transport_observed: false,
         })
     }
 
@@ -87,6 +91,8 @@ impl ObjectObservationRuntime {
         if player_guid.is_some() {
             self.profession_skill_info_observed = false;
             self.known_profession_skills = None;
+            self.last_transport = None;
+            self.transport_observed = false;
         }
         self.map_id = map_id;
         if player_guid.is_some() {
@@ -291,6 +297,16 @@ impl ObjectObservationRuntime {
                                 self.last_player_position = Some(position);
                             }
                         }
+                        if let Some(transport) = transport_state(object)
+                            && (!self.transport_observed
+                                || self.last_transport.as_ref() != Some(&transport))
+                        {
+                            observations.push(ProtocolObservation::Transport {
+                                state: transport.clone(),
+                            });
+                            self.last_transport = Some(transport);
+                            self.transport_observed = true;
+                        }
                         let current_quests = quest_journal(object);
                         for (&quest, (complete, objectives)) in &current_quests {
                             if self.known_quests.get(&quest)
@@ -369,6 +385,39 @@ impl ObjectObservationRuntime {
             }
         }
     }
+}
+
+/// Read passenger attachment from the server's object movement block. The
+/// movement bit is named TAXI by Tentacli, but WotLK uses it for ON_TRANSPORT.
+fn transport_state(
+    object: &tentacli::plugins::wow::wotlk::realm::object::Object,
+) -> Option<wow_state::transport::TransportState> {
+    use tentacli::plugins::wow::wotlk::realm::object::types::movement::MovementFlags;
+
+    let info = object.movement.as_ref()?.movement_info.as_ref()?;
+    let attached = info.movement_flags.contains(MovementFlags::TAXI);
+    if !attached {
+        return Some(wow_state::transport::TransportState {
+            attached: Some(false),
+            ..Default::default()
+        });
+    }
+    let passenger = info.taxi_info.as_ref();
+    Some(wow_state::transport::TransportState {
+        attached: Some(true),
+        transport: passenger
+            .map(|value| EntityId(value.guid.0))
+            .filter(|guid| guid.0 != 0),
+        relative_position: passenger.map(|value| {
+            wow_domain::Vec3::new(
+                value.location.point.x,
+                value.location.point.y,
+                value.location.point.z,
+            )
+        }),
+        relative_orientation: passenger.map(|value| value.location.direction),
+        transport_time: passenger.map(|value| value.time),
+    })
 }
 
 fn controlled_mover_of(
