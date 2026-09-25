@@ -2,10 +2,11 @@ use super::{LaneMessage, LaneState};
 use crate::action::finalize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use wow_control_proto::WorkerToProxy;
+use wow_domain::time::Millis;
 use wow_domain::*;
 use wow_infra::logging::structured::{DiagnosticLogger, DiagnosticStream};
 use wow_policy::questing::{
@@ -883,10 +884,7 @@ impl LaneEngine {
             self.waiting("death recovery waiting for authoritative position".into());
             return true;
         };
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let wall = Millis::wall_clock_now().0;
         let Some(corpse) = self.state.authoritative.life.corpse else {
             tracing::info!(lane=?self.state.lane,"death recovery releasing spirit and querying corpse");
             let _ = self.propose_recovery(GameplayCommand::ReleaseSpirit).await;
@@ -1539,10 +1537,7 @@ impl LaneEngine {
                     objective,
                     target,
                 });
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let now_ms = Millis::wall_clock_now().0;
                 if let Err(reason) = wow_policy::combat::readiness::check_spell_readiness(
                     &snapshot,
                     spell,
