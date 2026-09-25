@@ -44,6 +44,56 @@ pub struct RuntimeConfig {
     pub worker_queue: usize,
     pub handshake_timeout_ms: u64,
     pub runtime_data: RuntimeDataPaths,
+    #[serde(default)]
+    pub runtime_tuning: RuntimeTuning,
+}
+
+/// Settings that tune autonomous movement and maintenance behavior.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeTuning {
+    pub movement: MovementTuning,
+    pub maintenance: MaintenanceTuning,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MovementTuning {
+    pub travel_speed_form_min_yards: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintenanceTuning {
+    /// Disabled by default to preserve the behavior of existing JSON configs.
+    pub auto_mount_enabled: bool,
+    pub mount_min_travel_yards: u32,
+}
+
+impl Default for RuntimeTuning {
+    fn default() -> Self {
+        Self {
+            movement: MovementTuning::default(),
+            maintenance: MaintenanceTuning::default(),
+        }
+    }
+}
+
+impl Default for MovementTuning {
+    fn default() -> Self {
+        Self {
+            travel_speed_form_min_yards: 30,
+        }
+    }
+}
+
+impl Default for MaintenanceTuning {
+    fn default() -> Self {
+        Self {
+            auto_mount_enabled: false,
+            mount_min_travel_yards: 80,
+        }
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -60,6 +110,32 @@ impl Default for RuntimeConfig {
                 vmaps: None,
                 mmaps: None,
             },
+            runtime_tuning: RuntimeTuning::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_json_runtime_config_keeps_auto_mount_disabled() {
+        let config: RuntimeConfig = serde_json::from_str(
+            r#"{
+                "data_dir":"data",
+                "control_bind":"127.0.0.1:7878",
+                "worker_queue":256,
+                "handshake_timeout_ms":10000,
+                "runtime_data":{"root":"data","dbc":null,"maps":null,"vmaps":null,"mmaps":null}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.runtime_tuning.movement.travel_speed_form_min_yards,
+            30
+        );
+        assert!(!config.runtime_tuning.maintenance.auto_mount_enabled);
+        assert_eq!(config.runtime_tuning.maintenance.mount_min_travel_yards, 80);
     }
 }

@@ -1,4 +1,7 @@
-use super::app::{AccountConfig, AppConfig, ProxyConfig, UpstreamConfig};
+use super::{
+    app::{AccountConfig, AppConfig, ProxyConfig, UpstreamConfig},
+    runtime_data::RuntimeTuning,
+};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
@@ -168,6 +171,12 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
     config.runtime.handshake_timeout_ms =
         number(&values, &["proxy", "limits", "handshake_timeout_ms"])
             .unwrap_or(config.runtime.handshake_timeout_ms);
+    if let Some(tuning) = values.get("runtime_tuning") {
+        config.runtime.runtime_tuning = tuning
+            .clone()
+            .try_into::<RuntimeTuning>()
+            .context("parse runtime_tuning settings")?;
+    }
     config.runtime.runtime_data.root = data_dir;
     config.runtime.runtime_data.dbc = string(&values, &["wow", "dbc_dir"])
         .map(PathBuf::from)
@@ -305,4 +314,75 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
     config.validate().map_err(anyhow::Error::msg)?;
     tracing::info!(config=%path.display(), roster=%roster_path.display(), accounts=config.accounts.len(), "loaded user TOML configuration and bot roster");
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn runtime_tuning_toml_values_flow_to_runtime_config() {
+        let unique = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let directory = Path::new("/private/tmp").join(format!(
+            "wow-infra-runtime-tuning-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let roster_path = directory.join("bots.toml");
+        fs::write(
+            &config_path,
+            r#"
+[bots]
+roster_file = "bots.toml"
+
+[runtime_tuning.movement]
+travel_speed_form_min_yards = 30
+
+[runtime_tuning.maintenance]
+auto_mount_enabled = true
+mount_min_travel_yards = 80
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &roster_path,
+            r#"
+[[accounts]]
+id = "test-account"
+username = "test-user"
+password = "test-password"
+
+[[bots]]
+id = "test-bot"
+account = "test-account"
+character = "Test Character"
+"#,
+        )
+        .unwrap();
+
+        let config = load_toml(&config_path).unwrap();
+        assert_eq!(
+            config
+                .runtime
+                .runtime_tuning
+                .movement
+                .travel_speed_form_min_yards,
+            30
+        );
+        assert!(config.runtime.runtime_tuning.maintenance.auto_mount_enabled);
+        assert_eq!(
+            config
+                .runtime
+                .runtime_tuning
+                .maintenance
+                .mount_min_travel_yards,
+            80
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

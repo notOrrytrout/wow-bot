@@ -9,3 +9,4 @@ pub mod maintenance;
 pub mod missions;
 pub mod questing;
 pub mod risk;
+pub mod travel;
