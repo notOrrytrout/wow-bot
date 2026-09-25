@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -23,7 +23,7 @@ use wow_control_proto::{
     ProxyToWorker, SupervisorCommand, SupervisorWire, WorkerEvent, WorkerToProxy, WorkerWire,
     net::{read_frame, write_frame},
 };
-use wow_domain::{AccountId, LaneId, WorkerGeneration};
+use wow_domain::{AccountId, LaneId, WorkerGeneration, time::Millis};
 use wow_infra::config::{
     app::{AccountConfig, AppConfig},
     data_dir::AppPaths,
@@ -154,14 +154,7 @@ async fn main() -> Result<()> {
     let app_paths = AppPaths::discover().map_err(anyhow::Error::msg)?;
     app_paths.ensure().map_err(anyhow::Error::msg)?;
     let runtime_log = init_logging(&app_paths)?;
-    let run_id = format!(
-        "{}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        std::process::id()
-    );
+    let run_id = format!("{}-{}", Millis::wall_clock_now().0, std::process::id());
     tracing::info!(runtime_log=%runtime_log.display(), action_logs=%app_paths.logs.display(), "logging initialized");
     let config_path = args.config.clone().unwrap_or_else(|| {
         app_paths

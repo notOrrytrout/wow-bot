@@ -11,9 +11,8 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
-use wow_domain::LaneId;
+use wow_domain::{LaneId, time::Millis};
 
 const QUEUE_CAPACITY: usize = 4096;
 
@@ -220,16 +219,7 @@ impl JsonlWriter {
         self.sequence = self.sequence.wrapping_add(1);
         object.insert("record_type".into(), Value::String(record_type.to_owned()));
         object.insert("format_version".into(), Value::from(1));
-        object.insert(
-            "unix_ms".into(),
-            Value::from(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64,
-            ),
-        );
+        object.insert("unix_ms".into(), Value::from(Millis::wall_clock_now().0));
         object.insert("sequence".into(), Value::from(self.sequence));
         let mut line = serde_json::to_vec(&fields).map_err(std::io::Error::other)?;
         line.push(b'\n');
@@ -317,6 +307,7 @@ mod tests {
             .into_iter()
             .chain(DiagnosticStream::PROXY)
             .collect();
+        let earliest_unix_ms = Millis::wall_clock_now().0;
         let mut files: Vec<_> = streams
             .iter()
             .map(|stream| (*stream, lane_a, diagnostic_path(&root, *stream, lane_a)))
@@ -343,6 +334,7 @@ mod tests {
             json!({"opcode": 124}),
         );
         logger.flush();
+        let latest_unix_ms = Millis::wall_clock_now().0;
 
         let records = |path: PathBuf| -> Vec<Value> {
             std::fs::read_to_string(path)
@@ -357,7 +349,8 @@ mod tests {
             assert_eq!(stream_records[0]["sequence"], 1);
             assert_eq!(stream_records[0]["format_version"], 1);
             assert_eq!(stream_records[0]["run_id"], "test-run");
-            assert!(stream_records[0]["unix_ms"].as_u64().is_some());
+            let unix_ms = stream_records[0]["unix_ms"].as_u64().unwrap();
+            assert!((earliest_unix_ms..=latest_unix_ms).contains(&unix_ms));
             assert_eq!(stream_records[0]["lane"], 10);
             if *stream == DiagnosticStream::Navigation {
                 assert_eq!(stream_records[1]["sequence"], 2);
@@ -442,8 +435,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "wow-bot-structured-{label}-{}-{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
