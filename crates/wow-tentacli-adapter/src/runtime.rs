@@ -197,6 +197,25 @@ impl ObjectObservationRuntime {
                 }
                 for object in map.values() {
                     let entity = object_to_entity(object, names, self.map_id);
+                    if self.player_guid == Some(entity.id)
+                        && self.known.get(&entity.id).is_none_or(|previous| {
+                            previous.power_type != entity.power_type
+                                || previous.power != entity.power
+                                || previous.shapeshift_form != entity.shapeshift_form
+                        })
+                    {
+                        tracing::info!(
+                            player=?entity.id,
+                            power_type=?entity.power_type,
+                            power=?entity.power,
+                            shapeshift_form=?entity.shapeshift_form,
+                            raw_bytes0=?object.unit_fields.get(&UnitField::Bytes0),
+                            raw_bytes2=?object.unit_fields.get(&UnitField::Bytes2),
+                            raw_powers=?object.unit_fields.get(&UnitField::Powers),
+                            raw_max_powers=?object.unit_fields.get(&UnitField::MaxPowers),
+                            "player combat state observation updated"
+                        );
+                    }
                     if self
                         .player_guid
                         .is_some_and(|player| item_owned_by(object, player))

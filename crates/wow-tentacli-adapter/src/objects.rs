@@ -35,11 +35,30 @@ pub fn object_to_entity(
         unit_integer(object, UnitField::BaseHealth).and_then(|value| u32::try_from(value).ok());
     let base_mana =
         unit_integer(object, UnitField::BaseMana).and_then(|value| u32::try_from(value).ok());
-    let power_cost_modifiers = unit_integer_array(object, UnitField::PowerCostModifier);
-    let power_cost_multipliers = unit_float_array(object, UnitField::PowerCostMultiplier);
+    // WoW update fields omit values that remain at their protocol default. The
+    // object processor also keeps partial arrays, so unset slots mean zero.
+    let (power_cost_modifiers, power_cost_multipliers) =
+        if object.object_type_id() == ObjectTypeId::Player {
+            (
+                Some(unit_integer_array_or_default(
+                    object,
+                    UnitField::PowerCostModifier,
+                )),
+                Some(unit_float_array_or_default(
+                    object,
+                    UnitField::PowerCostMultiplier,
+                )),
+            )
+        } else {
+            (
+                unit_integer_array(object, UnitField::PowerCostModifier),
+                unit_float_array(object, UnitField::PowerCostMultiplier),
+            )
+        };
     let base_attack_time_ms = unit_unsigned_array::<2>(object, UnitField::BaseAttackTime);
     let shapeshift_form = match object.unit_fields.get(&UnitField::Bytes2) {
         Some(FieldValue::Bytes(value)) => Some((value >> 24) as u8),
+        None if object.object_type_id() == ObjectTypeId::Player => Some(0),
         _ => None,
     };
     let aura_state =
@@ -111,6 +130,20 @@ fn unit_float_array(object: &Object, field: UnitField) -> Option<[f32; 7]> {
     complete_array::<7, _, _>(values, Some)
 }
 
+fn unit_integer_array_or_default(object: &Object, field: UnitField) -> [i32; 7] {
+    let Some(FieldValue::IntegerArray(values)) = object.unit_fields.get(&field) else {
+        return [0; 7];
+    };
+    std::array::from_fn(|index| values.get(index).copied().flatten().unwrap_or_default())
+}
+
+fn unit_float_array_or_default(object: &Object, field: UnitField) -> [f32; 7] {
+    let Some(FieldValue::FloatArray(values)) = object.unit_fields.get(&field) else {
+        return [0.0; 7];
+    };
+    std::array::from_fn(|index| values.get(index).copied().flatten().unwrap_or_default())
+}
+
 fn unit_unsigned_array<const N: usize>(object: &Object, field: UnitField) -> Option<[u32; N]> {
     let Some(FieldValue::IntegerArray(values)) = object.unit_fields.get(&field) else {
         return None;
@@ -143,7 +176,38 @@ pub fn upsert_object(
 
 #[cfg(test)]
 mod tests {
-    use super::complete_array;
+    use std::collections::BTreeMap;
+
+    use tentacli::plugins::wow::wotlk::realm::object::{
+        Object, ObjectTypeId, PackedGuid,
+        types::{
+            update_data::ObjectTypeMask,
+            update_fields::{FieldValue, UnitField},
+        },
+    };
+
+    use super::{complete_array, object_to_entity};
+
+    fn object(object_type_id: ObjectTypeId, bytes2: Option<u8>) -> Object {
+        let mut unit_fields = BTreeMap::new();
+        if let Some(form) = bytes2 {
+            unit_fields.insert(UnitField::Bytes2, FieldValue::Bytes(u32::from(form) << 24));
+        }
+        Object {
+            guid: PackedGuid(1),
+            object_type_id,
+            object_type_mask: ObjectTypeMask::default(),
+            movement: None,
+            object_fields: BTreeMap::new(),
+            unit_fields,
+            player_fields: BTreeMap::new(),
+            item_fields: BTreeMap::new(),
+            container_fields: BTreeMap::new(),
+            game_object_fields: BTreeMap::new(),
+            dynamic_object_fields: BTreeMap::new(),
+            corpse_fields: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn complete_array_checks_presence_length_and_conversion() {
@@ -159,5 +223,28 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn player_with_omitted_bytes2_uses_unshifted_default_form() {
+        let entity = object_to_entity(&object(ObjectTypeId::Player, None), None, 0);
+
+        assert_eq!(entity.shapeshift_form, Some(0));
+    }
+
+    #[test]
+    fn player_with_observed_travel_form_keeps_that_form() {
+        // Form 3 is the travel form used by the test server. Keep it for any
+        // player class when the server sends it in Bytes2.
+        let entity = object_to_entity(&object(ObjectTypeId::Player, Some(3)), None, 0);
+
+        assert_eq!(entity.shapeshift_form, Some(3));
+    }
+
+    #[test]
+    fn unit_with_omitted_bytes2_remains_unknown() {
+        let entity = object_to_entity(&object(ObjectTypeId::Unit, None), None, 0);
+
+        assert_eq!(entity.shapeshift_form, None);
     }
 }
