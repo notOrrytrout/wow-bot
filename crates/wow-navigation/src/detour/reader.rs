@@ -1,4 +1,5 @@
 use std::fmt::{Display, Formatter};
+use wow_domain::binary::{u16_le, u32_le};
 
 const MAX_STRING_BYTES: usize = 4096;
 
@@ -89,11 +90,11 @@ impl<'a> PacketReader<'a> {
     }
 
     pub fn u16(&mut self) -> PacketReadResult<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16_le(self.take(2)?).expect("two byte read"))
     }
 
     pub fn u32(&mut self) -> PacketReadResult<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32_le(self.take(4)?).expect("four byte read"))
     }
 
     pub fn i32(&mut self) -> PacketReadResult<i32> {
@@ -143,5 +144,26 @@ impl<'a> PacketReader<'a> {
             .map_err(|_| PacketReadError::InvalidUtf8 { offset: start })?;
         self.offset = start + length + 1;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn little_endian_reads_keep_typed_truncation_errors() {
+        let mut reader = PacketReader::new(&[0x34, 0x12, 0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(reader.u16(), Ok(0x1234));
+        assert_eq!(reader.u32(), Ok(0x12345678));
+
+        let mut truncated = PacketReader::new(&[0x34]);
+        assert_eq!(
+            truncated.u16(),
+            Err(PacketReadError::Truncated {
+                offset: 0,
+                needed: 2,
+            })
+        );
     }
 }

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod binary;
 pub mod controller;
 pub mod distance;
 pub mod endpoint;

@@ -14,6 +14,7 @@ use tentacli::{
     },
 };
 use tokio::sync::RwLock;
+use wow_domain::binary::{array_at, u16_le, u32_le};
 use wow_domain::{EntityId, WorldPosition};
 use wow_state::{ProtocolObservation, capabilities::TalentRank};
 
@@ -607,8 +608,8 @@ impl<'a> TalentPacketReader<'a> {
     }
 
     fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let bytes = array_at(self.body, self.offset)?;
         let end = self.offset.checked_add(N)?;
-        let bytes = self.body.get(self.offset..end)?.try_into().ok()?;
         self.offset = end;
         Some(bytes)
     }
@@ -618,11 +619,11 @@ impl<'a> TalentPacketReader<'a> {
     }
 
     fn u16(&mut self) -> Option<u16> {
-        Some(u16::from_le_bytes(self.take()?))
+        u16_le(&self.take::<2>()?)
     }
 
     fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take()?))
+        u32_le(&self.take::<4>()?)
     }
 
     fn is_empty(&self) -> bool {
