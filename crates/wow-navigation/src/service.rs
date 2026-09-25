@@ -8,6 +8,9 @@ pub enum NavigationError {
     NoRoute,
     FloorDiscontinuity,
     RetryExhausted,
+    RoutePlannerBusy,
+    RoutePlanningCancelled,
+    RoutePlanningDeadlineExceeded,
 }
 
 pub trait RoutePlanner: Send + Sync {

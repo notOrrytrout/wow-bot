@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use wow_control_proto::WorkerToProxy;
 use wow_domain::time::Millis;
 use wow_domain::*;
@@ -17,6 +18,7 @@ use wow_state::{ProtocolObservation, Snapshot, reduce};
 
 #[derive(Clone, Debug)]
 struct PendingMovement {
+    runtime: crate::movement::MovementRuntime,
     destination: Vec3,
     acceptable_range: f32,
     resume: Option<GameplayCommand>,
@@ -29,6 +31,20 @@ struct PendingMovement {
     last_progress_at: Instant,
     last_progress_position: Option<Vec3>,
     last_progress_log: Option<Instant>,
+    progress_source: Option<&'static str>,
+    progress_revision: Option<StateRevision>,
+    last_player_client_time: Option<u32>,
+    last_position_update_at: Instant,
+    route_failures: u8,
+}
+
+struct RoutePlanJob {
+    token: crate::movement::ReplanToken,
+    stamped: crate::runtime::Stamped<WorldPosition>,
+    cancellation: crate::runtime::CancellationToken,
+    started_at: Instant,
+    deadline_exceeded: bool,
+    task: JoinHandle<Result<wow_navigation::PlannedRoute, wow_navigation::NavigationError>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +72,7 @@ const MAX_CORPSE_RECLAIM_ATTEMPTS: u8 = 3;
 const CORPSE_HOSTILE_CLEARANCE_YARDS: f32 = 18.0;
 const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MOVEMENT_STEP_INTERVAL: Duration = Duration::from_millis(100);
+const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
 
 #[derive(Clone, Debug)]
 enum PendingQuestAction {
@@ -127,6 +144,8 @@ pub struct LaneEngine {
     pending_turn_in: Option<(u32, Instant, &'static str)>,
     last_turn_in_search_query: Option<(u32, Instant)>,
     pending_movement: Option<PendingMovement>,
+    next_movement: u64,
+    route_job: Option<RoutePlanJob>,
     pending_facing: Option<PendingFacing>,
     pending_quest_action: Option<PendingQuestAction>,
     interaction_retry_after: BTreeMap<(u32, EntityId), (u8, Instant)>,
@@ -178,6 +197,8 @@ impl LaneEngine {
             pending_turn_in: None,
             last_turn_in_search_query: None,
             pending_movement: None,
+            next_movement: 1,
+            route_job: None,
             pending_facing: None,
             pending_quest_action: None,
             interaction_retry_after: BTreeMap::new(),
@@ -396,7 +417,36 @@ impl LaneEngine {
                     } => Some((*mover, position.orientation)),
                     _ => None,
                 };
+                let movement_position = match &o {
+                    ProtocolObservation::PlayerPosition {
+                        position,
+                        client_time,
+                        ..
+                    } if self.state.authoritative.control.mover.is_none() => {
+                        Some(("player", *position, Some(*client_time), None))
+                    }
+                    ProtocolObservation::ControlledMover {
+                        mover,
+                        position: Some(position),
+                        ..
+                    } => Some(("controlled_mover", *position, None, *mover)),
+                    _ => None,
+                };
                 let delta = reduce(&mut self.state.authoritative, o);
+                if let Some((source, position, client_time, mover)) = movement_position {
+                    let source_is_active = match source {
+                        "player" => self.state.authoritative.control.mover.is_none(),
+                        _ => self.state.authoritative.control.mover == mover,
+                    };
+                    if source_is_active {
+                        self.observe_movement_position(
+                            source,
+                            position,
+                            client_time,
+                            delta.revision,
+                        );
+                    }
+                }
                 if let (Some(pending), Some((mover, orientation))) =
                     (self.pending_facing, facing_observation)
                     && pending.mover == mover
@@ -424,6 +474,7 @@ impl LaneEngine {
                 self.last_quest_step = None;
                 self.pending_accept = None;
                 self.pending_turn_in = None;
+                self.cancel_route_job();
                 self.pending_movement = None;
                 self.pending_facing = None;
                 self.pending_quest_action = None;
@@ -502,6 +553,13 @@ impl LaneEngine {
                 movement,
                 bot_allowed,
             } => {
+                if self.state.ownership != generation || self.state.movement_epoch != movement {
+                    self.cancel_route_job();
+                }
+                if self.state.movement_epoch != movement {
+                    self.pending_movement = None;
+                    self.pending_quest_action = None;
+                }
                 self.state.ownership = generation;
                 self.state.movement_epoch = movement;
                 if bot_allowed {
@@ -522,6 +580,7 @@ impl LaneEngine {
             LaneMessage::MovementFence(epoch) => {
                 if self.state.movement_epoch != epoch {
                     self.state.movement_epoch = epoch;
+                    self.cancel_route_job();
                     self.pending_movement = None;
                     self.pending_quest_action = None;
                     self.diagnostic(
@@ -570,6 +629,7 @@ impl LaneEngine {
             if self.pending_movement.is_some() {
                 tracing::info!(lane=?self.state.lane, ?attacker, "survival attacker preempted voluntary movement");
                 let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
+                self.cancel_route_job();
                 self.pending_movement = None;
                 self.current_work = None;
             }
@@ -583,6 +643,7 @@ impl LaneEngine {
         {
             tracing::info!(lane=?self.state.lane, "survival approach ended because no authoritative attacker remains");
             let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
+            self.cancel_route_job();
             self.pending_movement = None;
             self.current_work = None;
         }
@@ -1079,7 +1140,30 @@ impl LaneEngine {
         purpose: MovementPurpose,
     ) {
         let now = Instant::now();
+        if let Some(job) = &self.route_job {
+            job.cancellation.cancel();
+        }
+        let movement_id = MovementId(self.next_movement);
+        self.next_movement = self.next_movement.wrapping_add(1).max(1);
+        let initial_position = self
+            .state
+            .authoritative
+            .control
+            .active_position(self.state.authoritative.position.player);
+        let initial_source = if self.state.authoritative.control.mover.is_some() {
+            Some("controlled_mover")
+        } else {
+            initial_position.map(|_| "player")
+        };
         self.pending_movement = Some(PendingMovement {
+            runtime: crate::movement::MovementRuntime {
+                id: movement_id,
+                owner: TaskId(work.id.0),
+                epoch: self.state.movement_epoch,
+                destination,
+                route: None,
+                waypoint: 0,
+            },
             destination,
             acceptable_range,
             resume,
@@ -1090,9 +1174,21 @@ impl LaneEngine {
             purpose,
             started_at: now,
             last_progress_at: now,
-            last_progress_position: None,
+            last_progress_position: initial_position.map(|position| position.point),
             last_progress_log: None,
+            progress_source: initial_source,
+            progress_revision: initial_position.map(|_| self.state.authoritative.revision),
+            last_player_client_time: initial_position
+                .map(|_| self.state.authoritative.position.client_time),
+            last_position_update_at: now,
+            route_failures: 0,
         });
+    }
+
+    fn cancel_route_job(&self) {
+        if let Some(job) = &self.route_job {
+            job.cancellation.cancel();
+        }
     }
 
     fn queue_search_movement(&mut self, destination: Vec3, work: QuestWorkRuntime) {
@@ -1105,6 +1201,45 @@ impl LaneEngine {
             work,
             MovementPurpose::SearchArea,
         );
+    }
+
+    fn observe_movement_position(
+        &mut self,
+        source: &'static str,
+        position: WorldPosition,
+        client_time: Option<u32>,
+        revision: StateRevision,
+    ) {
+        let Some(movement) = self.pending_movement.as_mut() else {
+            return;
+        };
+        if source == "player"
+            && let Some(client_time) = client_time
+        {
+            let is_newer = movement.last_player_client_time.is_none_or(|previous| {
+                let difference = client_time.wrapping_sub(previous);
+                difference != 0 && difference < 0x8000_0000
+            });
+            if !is_newer {
+                return;
+            }
+            movement.last_player_client_time = Some(client_time);
+        } else if movement
+            .progress_revision
+            .is_some_and(|previous| revision <= previous)
+        {
+            return;
+        }
+        movement.last_position_update_at = Instant::now();
+        if movement
+            .last_progress_position
+            .is_none_or(|previous| previous.distance(position.point) >= 0.35)
+        {
+            movement.last_progress_position = Some(position.point);
+            movement.last_progress_at = Instant::now();
+        }
+        movement.progress_source = Some(source);
+        movement.progress_revision = Some(revision);
     }
 
     async fn tick_movement(&mut self) -> bool {
@@ -1167,19 +1302,24 @@ impl LaneEngine {
             return true;
         }
 
-        match movement.last_progress_position {
-            Some(previous) if previous.distance(player.point) >= 0.35 => {
-                movement.last_progress_position = Some(player.point);
-                movement.last_progress_at = Instant::now();
-            }
-            None => {
-                movement.last_progress_position = Some(player.point);
-                movement.last_progress_at = Instant::now();
-            }
-            _ => {}
-        }
         if movement.last_progress_at.elapsed() >= Duration::from_secs(5) {
-            tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, "movement made no authoritative progress; stopping owned movement for deterministic retry");
+            let reason = if movement.last_position_update_at.elapsed() >= Duration::from_secs(5) {
+                "no_new_authoritative_position"
+            } else {
+                "newer_positions_show_no_displacement"
+            };
+            tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, movement_id=?movement.runtime.id, key=?movement.work.key, ?locomotion, remaining=distance, source=movement.progress_source, revision=?movement.progress_revision, reason, "movement made no authoritative progress; stopping owned movement for bounded recovery");
+            self.diagnostic(
+                DiagnosticStream::Navigation,
+                "movement_progress_stalled",
+                serde_json::json!({
+                    "work_id": movement.work.id.0,
+                    "movement_id": movement.runtime.id.0,
+                    "source": movement.progress_source,
+                    "revision": movement.progress_revision.map(StateRevision::get),
+                    "reason": reason,
+                }),
+            );
             self.stop_owned_movement(movement.purpose).await;
             self.current_work = None;
             self.waiting(format!(
@@ -1192,7 +1332,7 @@ impl LaneEngine {
             .last_progress_log
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
         {
-            tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, mover=?self.state.authoritative.control.mover, "movement operation progress");
+            tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, movement_id=?movement.runtime.id, key=?movement.work.key, ?locomotion, remaining=distance, mover=?self.state.authoritative.control.mover, source=movement.progress_source, revision=?movement.progress_revision, reason="newer_authoritative_position_tracking", "movement operation progress");
             self.diagnostic(
                 DiagnosticStream::MovementHeartbeat,
                 "movement_progress",
@@ -1201,6 +1341,9 @@ impl LaneEngine {
                     "locomotion": format!("{locomotion:?}"),
                     "remaining": distance,
                     "mover_controlled": controlled_mover,
+                    "source": movement.progress_source,
+                    "revision": movement.progress_revision.map(StateRevision::get),
+                    "reason": "newer_authoritative_position_tracking",
                 }),
             );
             movement.last_progress_log = Some(Instant::now());
@@ -1227,6 +1370,194 @@ impl LaneEngine {
                 }
                 return self.dispatch_resumed_quest_action(resume, &work_key).await;
             }
+            return true;
+        }
+        if locomotion == wow_navigation::LocomotionMode::Ground
+            && let Some(controller) = self.movement_controller.clone()
+            && controller.has_navigation_data()
+            && !controller.route_is_ready(player.map, movement.destination)
+        {
+            if let Some(job) = self.route_job.as_mut() {
+                let is_current = job.token
+                    == (crate::movement::ReplanToken {
+                        movement: movement.runtime.id,
+                        epoch: movement.runtime.epoch,
+                    });
+                if !is_current {
+                    job.cancellation.cancel();
+                }
+                if !job.deadline_exceeded && job.started_at.elapsed() >= ROUTE_PLAN_DEADLINE {
+                    job.deadline_exceeded = true;
+                    job.cancellation.cancel();
+                }
+            }
+            if self
+                .route_job
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished())
+            {
+                let job = self.route_job.take().expect("finished route job exists");
+                let result = job.task.await;
+                let current_stamp = self.state.stamp();
+                let stamp = job.stamped.stamp;
+                let authority_matches = stamp.mission == current_stamp.mission
+                    && stamp.permission == current_stamp.permission
+                    && stamp.worker == current_stamp.worker
+                    && stamp.ownership == current_stamp.ownership
+                    && stamp.movement == current_stamp.movement;
+                let route_start_is_current = job.stamped.value.map == player.map
+                    && job.stamped.value.point.distance(player.point) <= 2.5;
+                let token_matches = job.token.movement == movement.runtime.id
+                    && job.token.epoch == movement.runtime.epoch
+                    && movement.runtime.epoch == self.state.movement_epoch;
+                if token_matches
+                    && authority_matches
+                    && route_start_is_current
+                    && !job.cancellation.is_cancelled()
+                {
+                    match result {
+                        Ok(Ok(plan)) => {
+                            let points = plan.points().to_vec();
+                            let cost = points
+                                .windows(2)
+                                .map(|pair| pair[0].distance(pair[1]))
+                                .sum();
+                            let route = wow_navigation::Route { points, cost };
+                            if movement
+                                .runtime
+                                .replace_route(route, self.state.movement_epoch)
+                            {
+                                controller.install_route(plan, player.point);
+                                movement.route_failures = 0;
+                                self.diagnostic(
+                                    DiagnosticStream::Navigation,
+                                    "movement_route_installed",
+                                    serde_json::json!({
+                                        "movement_id": movement.runtime.id.0,
+                                        "epoch": movement.runtime.epoch.get(),
+                                        "source_revision": stamp.state.get(),
+                                    }),
+                                );
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            movement.route_failures = movement.route_failures.saturating_add(1);
+                            self.diagnostic(
+                                DiagnosticStream::Navigation,
+                                "movement_route_rejected",
+                                serde_json::json!({
+                                    "movement_id": movement.runtime.id.0,
+                                    "epoch": movement.runtime.epoch.get(),
+                                    "attempt": movement.route_failures,
+                                    "reason": format!("{error:?}"),
+                                }),
+                            );
+                            if movement.route_failures >= 3 {
+                                self.waiting("movement route planning failed three times; scheduler will re-ground before retry".into());
+                                self.pending_movement = None;
+                                self.current_work = None;
+                                return true;
+                            }
+                            movement.last_step = Some(Instant::now());
+                            self.pending_movement = Some(movement);
+                            return true;
+                        }
+                        Err(error) => {
+                            tracing::warn!(lane=?self.state.lane, ?error, "movement route worker failed");
+                            movement.route_failures = movement.route_failures.saturating_add(1);
+                            if movement.route_failures >= 3 {
+                                self.waiting("movement route worker failed three times; scheduler will re-ground before retry".into());
+                                self.pending_movement = None;
+                                self.current_work = None;
+                                return true;
+                            }
+                            movement.last_step = Some(Instant::now());
+                            self.pending_movement = Some(movement);
+                            return true;
+                        }
+                    }
+                } else {
+                    if token_matches && job.deadline_exceeded {
+                        movement.route_failures = movement.route_failures.saturating_add(1);
+                        self.diagnostic(
+                            DiagnosticStream::Navigation,
+                            "movement_route_deadline_exceeded",
+                            serde_json::json!({
+                                "movement_id": movement.runtime.id.0,
+                                "epoch": movement.runtime.epoch.get(),
+                                "attempt": movement.route_failures,
+                                "deadline_ms": ROUTE_PLAN_DEADLINE.as_millis(),
+                            }),
+                        );
+                        if movement.route_failures >= 3 {
+                            self.waiting("movement route planning exceeded its deadline three times; scheduler will re-ground before retry".into());
+                            self.pending_movement = None;
+                            self.current_work = None;
+                            return true;
+                        }
+                        movement.last_step = Some(Instant::now());
+                        self.pending_movement = Some(movement);
+                        return true;
+                    }
+                    self.diagnostic(
+                        DiagnosticStream::Navigation,
+                        "movement_route_discarded_stale",
+                        serde_json::json!({
+                            "movement_id": job.token.movement.0,
+                            "epoch": job.token.epoch.get(),
+                            "reason": "movement_or_authority_changed",
+                        }),
+                    );
+                }
+            }
+            if self.route_job.is_some() {
+                self.pending_movement = Some(movement);
+                return true;
+            }
+            let permit = match controller.try_acquire_route_planning_slot() {
+                Ok(permit) => permit,
+                Err(error) => {
+                    self.diagnostic(
+                        DiagnosticStream::Navigation,
+                        "movement_route_admission_deferred",
+                        serde_json::json!({
+                            "movement_id": movement.runtime.id.0,
+                            "reason": format!("{error:?}"),
+                        }),
+                    );
+                    movement.last_step = Some(Instant::now());
+                    self.pending_movement = Some(movement);
+                    return true;
+                }
+            };
+            let cancellation = crate::runtime::CancellationToken::new();
+            let worker_token = cancellation.clone();
+            let worker_controller = controller.clone();
+            let route_start = player;
+            let route_destination = movement.destination;
+            let route_planning_permit = permit;
+            let stamped = crate::runtime::Stamped {
+                stamp: self.state.stamp(),
+                value: route_start,
+            };
+            let task = tokio::task::spawn_blocking(move || {
+                let _permit = route_planning_permit;
+                worker_controller.plan_route_cancellable(route_start, route_destination, &|| {
+                    worker_token.is_cancelled()
+                })
+            });
+            self.route_job = Some(RoutePlanJob {
+                token: crate::movement::ReplanToken {
+                    movement: movement.runtime.id,
+                    epoch: movement.runtime.epoch,
+                },
+                stamped,
+                cancellation,
+                started_at: Instant::now(),
+                deadline_exceeded: false,
+                task,
+            });
+            self.pending_movement = Some(movement);
             return true;
         }
         let step_result = match &self.movement_controller {
@@ -2882,6 +3213,7 @@ impl LaneEngine {
         self.giver_retry_after.clear();
         self.pending_turn_in = None;
         self.last_turn_in_search_query = None;
+        self.cancel_route_job();
         self.pending_movement = None;
         self.pending_facing = None;
         self.pending_quest_action = None;
@@ -2998,6 +3330,82 @@ mod tests {
             activity: ActivityArbiter::default(),
         };
         (LaneEngine::new(state, lane_rx, proxy_tx), proxy_rx)
+    }
+
+    #[test]
+    fn movement_progress_ignores_replayed_positions_and_requires_authoritative_displacement() {
+        let (mut engine, _proxy_rx) = test_engine(
+            Mission::quest(MissionId(1)),
+            wow_state::AuthoritativeState::default(),
+        );
+        let start = Vec3::new(1.0, 2.0, 3.0);
+        engine.queue_movement(
+            Vec3::new(10.0, 2.0, 3.0),
+            1.0,
+            None,
+            None,
+            PlanOrigin::SystemPolicy,
+            QuestWorkRuntime {
+                id: QuestWorkId(7),
+                key: QuestWorkKey::AcquireQuest { quest: None },
+            },
+            MovementPurpose::SearchArea,
+        );
+        let movement = engine.pending_movement.as_mut().expect("queued movement");
+        movement.last_progress_position = Some(start);
+        movement.last_player_client_time = Some(40);
+        movement.last_progress_at = Instant::now() - Duration::from_secs(6);
+        let stalled_since = movement.last_progress_at;
+
+        engine.observe_movement_position(
+            "player",
+            WorldPosition {
+                map: 0,
+                point: start,
+                orientation: 0.0,
+            },
+            Some(40),
+            StateRevision(1),
+        );
+        assert_eq!(
+            engine.pending_movement.as_ref().unwrap().last_progress_at,
+            stalled_since
+        );
+
+        engine.observe_movement_position(
+            "player",
+            WorldPosition {
+                map: 0,
+                point: start,
+                orientation: 0.0,
+            },
+            Some(41),
+            StateRevision(2),
+        );
+        assert_eq!(
+            engine.pending_movement.as_ref().unwrap().last_progress_at,
+            stalled_since
+        );
+        assert_eq!(
+            engine.pending_movement.as_ref().unwrap().progress_source,
+            Some("player")
+        );
+        assert_eq!(
+            engine.pending_movement.as_ref().unwrap().progress_revision,
+            Some(StateRevision(2))
+        );
+
+        engine.observe_movement_position(
+            "player",
+            WorldPosition {
+                map: 0,
+                point: Vec3::new(2.0, 2.0, 3.0),
+                orientation: 0.0,
+            },
+            Some(42),
+            StateRevision(3),
+        );
+        assert!(engine.pending_movement.as_ref().unwrap().last_progress_at > stalled_since);
     }
 
     fn combat_engine() -> (LaneEngine, mpsc::Receiver<WorkerToProxy>) {

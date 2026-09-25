@@ -11,5 +11,6 @@ wow-state.workspace = true
 serde.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 [lints]
 workspace = true

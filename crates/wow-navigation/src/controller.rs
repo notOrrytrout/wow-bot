@@ -5,7 +5,9 @@ use crate::{
 use std::{
     path::Path,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+use tokio::sync::Semaphore;
 use wow_domain::{Vec3, WorldPosition};
 
 const MOVEMENTFLAG_DISABLE_GRAVITY: u32 = 0x0000_0400;
@@ -18,6 +20,8 @@ const ROUTE_LOOKAHEAD_DISTANCE: f32 = 4.5;
 const ROUTE_LOOKAHEAD_MAX_ANGLE: f32 = 0.261_799_4; // 15 degrees
 const LOCAL_VISION_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(250);
 const LOCAL_VISION_MAX_DROP_YARDS: f32 = 2.5;
+pub const MAX_CONCURRENT_ROUTE_PLANS: usize = 1;
+pub const ROUTE_PLANNING_DEADLINE: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocomotionMode {
@@ -66,12 +70,28 @@ struct RouteCursor {
     index: usize,
 }
 
+/// A route computed off the lane thread and ready for installation.
+#[derive(Clone, Debug)]
+pub struct PlannedRoute {
+    map: u32,
+    destination: Vec3,
+    points: Vec<Vec3>,
+    surfaces: Vec<Option<RouteSurface>>,
+}
+
+impl PlannedRoute {
+    pub fn points(&self) -> &[Vec3] {
+        &self.points
+    }
+}
+
 #[derive(Clone)]
 pub struct MovementController {
     terrain: TerrainSampler,
     maximum_step: f32,
     navigation: Option<Arc<NavigationData>>,
     route: Arc<Mutex<Option<RouteCursor>>>,
+    route_planning_slots: Arc<Semaphore>,
 }
 
 impl MovementController {
@@ -94,6 +114,7 @@ impl MovementController {
             maximum_step: 1.5,
             navigation,
             route: Arc::new(Mutex::new(None)),
+            route_planning_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ROUTE_PLANS)),
         }
     }
 
@@ -106,6 +127,89 @@ impl MovementController {
 
     pub fn clear_route(&self) {
         *lock_recover(&self.route) = None;
+    }
+
+    pub fn route_is_ready(&self, map: u32, destination: Vec3) -> bool {
+        lock_recover(&self.route).as_ref().is_some_and(|route| {
+            route.map == map
+                && route.destination.distance(destination) <= ROUTE_DESTINATION_EPSILON
+                && route.index < route.points.len()
+        })
+    }
+
+    pub fn has_navigation_data(&self) -> bool {
+        self.navigation.is_some()
+    }
+
+    pub fn plan_route_cancellable(
+        &self,
+        current: WorldPosition,
+        destination: Vec3,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<PlannedRoute, NavigationError> {
+        let started_at = Instant::now();
+        let navigation = self
+            .navigation
+            .as_ref()
+            .ok_or(NavigationError::MissingNavigationData)?;
+        let route_cancelled = || cancelled() || started_at.elapsed() >= ROUTE_PLANNING_DEADLINE;
+        let route_points = navigation
+            .route_cancellable(
+                current.map,
+                (current.point.x, current.point.y, current.point.z),
+                (destination.x, destination.y, destination.z),
+                false,
+                &route_cancelled,
+            )
+            .map_err(|_| route_planning_error(cancelled, started_at))?;
+        let surfaces = navigation
+            .route_surfaces_cancellable(current.map, &route_points, &route_cancelled)
+            .map_err(|_| route_planning_error(cancelled, started_at))?;
+        let points: Vec<Vec3> = route_points
+            .into_iter()
+            .map(|point| Vec3::new(point[0], point[1], point[2]))
+            .collect();
+        if points.is_empty() {
+            return Err(NavigationError::NoRoute);
+        }
+        Ok(PlannedRoute {
+            map: current.map,
+            destination,
+            points,
+            surfaces,
+        })
+    }
+
+    /// Limit route planning to one active job per shared controller.
+    pub fn plan_route_bounded_cancellable(
+        &self,
+        current: WorldPosition,
+        destination: Vec3,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<PlannedRoute, NavigationError> {
+        let _permit = self.try_acquire_route_planning_slot()?;
+        self.plan_route_cancellable(current, destination, cancelled)
+    }
+
+    pub fn try_acquire_route_planning_slot(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, NavigationError> {
+        self.route_planning_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| NavigationError::RoutePlannerBusy)
+    }
+
+    pub fn install_route(&self, plan: PlannedRoute, current: Vec3) {
+        let index = usize::from(plan.points.len() > 1);
+        *lock_recover(&self.route) = Some(RouteCursor {
+            map: plan.map,
+            destination: plan.destination,
+            points: plan.points,
+            surfaces: plan.surfaces,
+            index,
+        });
+        self.advance_route_cursor(current);
     }
 
     pub fn next_step(
@@ -299,7 +403,7 @@ impl MovementController {
             let surfaces = navigation.route_surfaces(current.map, &route_points);
             let points: Vec<Vec3> = route_points
                 .into_iter()
-                .map(|p| Vec3::new(p[0], p[1], p[2]))
+                .map(|point| Vec3::new(point[0], point[1], point[2]))
                 .collect();
             if points.is_empty() {
                 return Err(NavigationError::NoRoute);
@@ -344,6 +448,19 @@ impl MovementController {
             }
             break;
         }
+    }
+}
+
+fn route_planning_error(
+    cancelled: &(dyn Fn() -> bool + Sync),
+    started_at: Instant,
+) -> NavigationError {
+    if cancelled() {
+        NavigationError::RoutePlanningCancelled
+    } else if started_at.elapsed() >= ROUTE_PLANNING_DEADLINE {
+        NavigationError::RoutePlanningDeadlineExceeded
+    } else {
+        NavigationError::NoRoute
     }
 }
 
@@ -435,6 +552,28 @@ pub fn next_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_planning_admission_is_bounded_across_controller_clones() {
+        let maps_dir = std::env::temp_dir().join(format!(
+            "wow-navigation-controller-test-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&maps_dir).unwrap();
+        let terrain = TerrainSampler::new(&maps_dir).unwrap();
+        let controller = MovementController::new(terrain);
+        let clone = controller.clone();
+        let permit = controller.try_acquire_route_planning_slot().unwrap();
+        assert_eq!(
+            clone.try_acquire_route_planning_slot().unwrap_err(),
+            NavigationError::RoutePlannerBusy
+        );
+        drop(permit);
+        assert!(clone.try_acquire_route_planning_slot().is_ok());
+        std::fs::remove_dir_all(maps_dir).unwrap();
+    }
+
     #[test]
     fn ground_does_not_invent_z_without_terrain() {
         let s = next_step(
