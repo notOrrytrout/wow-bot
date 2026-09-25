@@ -212,10 +212,25 @@ fn parse_advertised_port(address: &str, fallback: u16) -> u16 {
         .unwrap_or(fallback)
 }
 pub fn format_endpoint(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+    wow_domain::endpoint::Endpoint {
+        host: host.to_owned(),
+        port,
+    }
+    .authority()
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::format_endpoint;
+
+    #[test]
+    fn formats_ipv4_hostname_and_ipv6_authorities() {
+        assert_eq!(format_endpoint("192.0.2.1", 3724), "192.0.2.1:3724");
+        assert_eq!(
+            format_endpoint("auth.example.test", 3724),
+            "auth.example.test:3724"
+        );
+        assert_eq!(format_endpoint("2001:db8::1", 3724), "[2001:db8::1]:3724");
     }
 }
 

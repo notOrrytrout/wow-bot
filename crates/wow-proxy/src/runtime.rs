@@ -1751,17 +1751,27 @@ fn port_of(bind: &str) -> Result<u16> {
     Ok(bind.parse::<SocketAddr>()?.port())
 }
 fn advertised(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+    wow_domain::endpoint::Endpoint {
+        host: host.to_owned(),
+        port,
     }
+    .authority()
 }
 
 #[cfg(test)]
 mod runtime_chat_tests {
     use super::*;
     use crate::commands::{self, LocalCommand};
+
+    #[test]
+    fn advertised_formats_ipv4_hostname_and_ipv6_authorities() {
+        assert_eq!(advertised("192.0.2.1", 3724), "192.0.2.1:3724");
+        assert_eq!(
+            advertised("world.example.test", 3724),
+            "world.example.test:3724"
+        );
+        assert_eq!(advertised("2001:db8::1", 3724), "[2001:db8::1]:3724");
+    }
 
     fn chat_body(chat_type: u32, target: Option<&str>, message: &str) -> Vec<u8> {
         let mut body = Vec::new();
