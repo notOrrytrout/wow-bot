@@ -128,6 +128,15 @@ mod tests {
         ));
         assert!(parse_single_quest_status(&entry[..8]).is_none());
     }
+
+    #[test]
+    fn questgiver_complete_packet_does_not_confirm_quest_journal_completion() {
+        const SMSG_QUESTGIVER_QUEST_COMPLETE: u32 = 0x018F;
+        let observations =
+            quest_observations(SMSG_QUESTGIVER_QUEST_COMPLETE, &170_u32.to_le_bytes());
+
+        assert!(observations.is_empty());
+    }
 }
 
 pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation> {
@@ -458,14 +467,10 @@ pub(super) fn quest_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObserv
         SMSG_QUESTGIVER_QUEST_LIST => parse_quest_list(body),
         SMSG_QUESTGIVER_REQUEST_ITEMS => parse_quest_request_items(body).into_iter().collect(),
         SMSG_QUESTGIVER_OFFER_REWARD => parse_quest_offer_reward(body).into_iter().collect(),
-        SMSG_QUESTGIVER_QUEST_COMPLETE => body
-            .get(..4)
-            .and_then(|quest| <[u8; 4]>::try_from(quest).ok())
-            .map(|quest| ProtocolObservation::QuestCompleted {
-                quest: u32::from_le_bytes(quest),
-            })
-            .into_iter()
-            .collect(),
+        // The questgiver completion packet is not enough to confirm that the
+        // quest left the active journal. The quest journal remains the source
+        // of truth for completed quests.
+        SMSG_QUESTGIVER_QUEST_COMPLETE => Vec::new(),
         SMSG_QUEST_QUERY_RESPONSE => parse_quest_query_response(body).into_iter().collect(),
         _ => Vec::new(),
     }
