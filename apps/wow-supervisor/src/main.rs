@@ -999,7 +999,7 @@ async fn resolve_worker_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     // stale build-time or previously moved repository path winning discovery.
     let workspace_root = env::current_dir()
         .ok()
-        .and_then(|cwd| find_workspace_root(&cwd));
+        .and_then(|cwd| wow_infra::config::data_dir::find_workspace_root(&cwd));
     let mut candidates = Vec::new();
 
     if let Some(root) = workspace_root.as_ref() {
@@ -1063,22 +1063,6 @@ async fn resolve_worker_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     bail!(
         "wow-bot-worker was not found. Searched: {searched}. Run `cargo build -p wow-bot-worker`, install the worker beside the supervisor, or pass --worker-bin <path>"
     )
-}
-
-fn find_workspace_root(start: &Path) -> Option<PathBuf> {
-    for candidate in start.ancestors() {
-        let manifest = candidate.join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
-            continue;
-        };
-        if text.contains("[workspace]")
-            && text.contains("apps/wow-supervisor")
-            && text.contains("apps/wow-worker")
-        {
-            return Some(candidate.to_path_buf());
-        }
-    }
-    None
 }
 
 async fn terminate(child: &mut Child) {

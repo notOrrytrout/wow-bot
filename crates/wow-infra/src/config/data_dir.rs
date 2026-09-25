@@ -98,7 +98,8 @@ fn discover_workspace_root() -> Option<PathBuf> {
     find_workspace_root(&manifest_dir)
 }
 
-fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+/// Find the nearest ancestor that has the expected wow-bot workspace markers.
+pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     for candidate in start.ancestors() {
         let manifest = candidate.join(WORKSPACE_MANIFEST);
         if is_wow_bot_workspace(&manifest) {
@@ -114,6 +115,7 @@ fn is_wow_bot_workspace(manifest: &Path) -> bool {
     };
     text.contains("[workspace]")
         && text.contains("apps/wow-supervisor")
+        && text.contains("apps/wow-worker")
         && text.contains("crates/wow-infra")
 }
 
@@ -138,20 +140,37 @@ mod tests {
     }
 
     #[test]
-    fn workspace_manifest_detection_requires_expected_members() {
+    fn workspace_manifest_detection_accepts_expected_members_and_ancestor() {
         let root =
             std::env::temp_dir().join(format!("wow-bot-workspace-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("apps/wow-supervisor")).expect("create test dir");
+        std::fs::create_dir_all(root.join("nested/apps/wow-supervisor")).expect("create test dir");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"apps/wow-supervisor\", \"apps/wow-worker\", \"crates/wow-infra\"]\n",
+        )
+        .expect("write manifest");
+        assert_eq!(
+            find_workspace_root(&root.join("nested/apps/wow-supervisor")),
+            Some(root.clone())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_manifest_detection_rejects_missing_expected_members() {
+        let root = std::env::temp_dir().join(format!(
+            "wow-bot-invalid-workspace-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create test dir");
         std::fs::write(
             root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"apps/wow-supervisor\", \"crates/wow-infra\"]\n",
         )
         .expect("write manifest");
-        assert_eq!(
-            find_workspace_root(&root.join("apps/wow-supervisor")),
-            Some(root.clone())
-        );
+        assert_eq!(find_workspace_root(&root), None);
         let _ = std::fs::remove_dir_all(root);
     }
 }
