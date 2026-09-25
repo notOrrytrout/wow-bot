@@ -6,7 +6,7 @@ const CAST_FACING_TOLERANCE: f32 = PI / 9.0;
 const INTERACTION_MAX_RANGE: f32 = 5.0;
 const INTERACTION_APPROACH_RANGE: f32 = 4.0;
 const NPC_FRONT_STANDOFF: f32 = 3.0;
-const NPC_FRONT_TOLERANCE: f32 = 1.5;
+const NPC_FRONT_TOLERANCE: f32 = 0.8;
 const MOB_REAR_STANDOFF: f32 = 3.0;
 const MOB_REAR_TOLERANCE: f32 = 1.0;
 const MOB_MELEE_MAX_RANGE: f32 = 5.0;
@@ -526,6 +526,33 @@ mod tests {
         );
         let requirement = movement_requirement(&s, &GameplayCommand::Loot(EntityId(7))).unwrap();
         assert_eq!(requirement.acceptable_range, 4.0);
+    }
+
+    #[test]
+    fn npc_turn_in_approach_uses_eight_tenths_yard_tolerance() {
+        let s = snapshot(
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(10.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(0.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+        );
+        let requirement = movement_requirement(
+            &s,
+            &GameplayCommand::TurnInQuest {
+                quest: 170,
+                giver: EntityId(7),
+            },
+        )
+        .expect("NPC front approach is required");
+
+        assert_eq!(requirement.destination, Vec3::new(3.0, 0.0, 0.0));
+        assert_eq!(requirement.acceptable_range, 0.8);
     }
 
     #[test]
