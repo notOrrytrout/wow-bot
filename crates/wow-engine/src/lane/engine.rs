@@ -31,6 +31,13 @@ struct PendingMovement {
     last_progress_log: Option<Instant>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingFacing {
+    mover: Option<EntityId>,
+    orientation: f32,
+    tolerance: f32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MovementPurpose {
     SearchArea,
@@ -117,6 +124,7 @@ pub struct LaneEngine {
     pending_turn_in: Option<(u32, Instant, &'static str)>,
     last_turn_in_search_query: Option<(u32, Instant)>,
     pending_movement: Option<PendingMovement>,
+    pending_facing: Option<PendingFacing>,
     pending_quest_action: Option<PendingQuestAction>,
     interaction_retry_after: BTreeMap<(u32, EntityId), (u8, Instant)>,
     search_attempts: BTreeMap<(u32, usize, u32), BTreeSet<(u32, u32, u32)>>,
@@ -166,6 +174,7 @@ impl LaneEngine {
             pending_turn_in: None,
             last_turn_in_search_query: None,
             pending_movement: None,
+            pending_facing: None,
             pending_quest_action: None,
             interaction_retry_after: BTreeMap::new(),
             search_attempts: BTreeMap::new(),
@@ -362,7 +371,36 @@ impl LaneEngine {
                         self.pending_turn_in = None;
                     }
                 }
+                let facing_observation = match &o {
+                    ProtocolObservation::PlayerPosition { position, .. }
+                        if self.state.authoritative.control.mover.is_none() =>
+                    {
+                        Some((
+                            self.state
+                                .authoritative
+                                .session
+                                .character_guid
+                                .map(EntityId),
+                            position.orientation,
+                        ))
+                    }
+                    ProtocolObservation::ControlledMover {
+                        mover,
+                        position: Some(position),
+                        ..
+                    } => Some((*mover, position.orientation)),
+                    _ => None,
+                };
                 let delta = reduce(&mut self.state.authoritative, o);
+                if let (Some(pending), Some((mover, orientation))) =
+                    (self.pending_facing, facing_observation)
+                    && pending.mover == mover
+                    && crate::action::spatial::angular_distance(orientation, pending.orientation)
+                        <= pending.tolerance
+                {
+                    tracing::info!(lane=?self.state.lane, orientation, "authoritative facing update confirmed; targeted action may be retried");
+                    self.pending_facing = None;
+                }
                 if !delta.changed.is_empty() {
                     tracing::debug!(lane=?self.state.lane, revision=?delta.revision, changed=?delta.changed, "authoritative state updated");
                     self.diagnostic(
@@ -382,6 +420,7 @@ impl LaneEngine {
                 self.pending_accept = None;
                 self.pending_turn_in = None;
                 self.pending_movement = None;
+                self.pending_facing = None;
                 self.pending_quest_action = None;
                 self.current_work = None;
                 self.credited_quest_targets.clear();
@@ -2456,6 +2495,13 @@ impl LaneEngine {
         let original_command = action.command.clone();
         let action_origin = action.origin;
         let mut snapshot = Snapshot::from_state(&self.state.authoritative);
+        if self.pending_facing.is_some()
+            && crate::action::spatial::profile(&original_command).is_some()
+        {
+            self.waiting("targeted action is waiting for authoritative facing confirmation".into());
+            self.last_dispatch = DispatchOutcome::DeferredSpatial;
+            return true;
+        }
         if let GameplayCommand::Loot(target) = &original_command
             && let Some((post_target, _, Some(cached_target))) = &self.post_combat_loot
             && post_target == target
@@ -2733,6 +2779,19 @@ impl LaneEngine {
             ValidationOutcome::Sendable(face) => {
                 tracing::info!(lane=?self.state.lane, orientation=requirement.orientation, tolerance=requirement.tolerance, resume=?original_command, "shared facing precondition queued before targeted action");
                 let sent = self.proxy.send(WorkerToProxy::Action(face)).await.is_ok();
+                if sent {
+                    self.pending_facing = Some(PendingFacing {
+                        mover: self.state.authoritative.control.mover.or_else(|| {
+                            self.state
+                                .authoritative
+                                .session
+                                .character_guid
+                                .map(EntityId)
+                        }),
+                        orientation: requirement.orientation,
+                        tolerance: requirement.tolerance,
+                    });
+                }
                 self.last_dispatch = if sent {
                     DispatchOutcome::DeferredSpatial
                 } else {
@@ -2763,6 +2822,7 @@ impl LaneEngine {
         self.pending_turn_in = None;
         self.last_turn_in_search_query = None;
         self.pending_movement = None;
+        self.pending_facing = None;
         self.pending_quest_action = None;
         self.search_attempts.clear();
         self.search_retry_after.clear();
@@ -2911,6 +2971,92 @@ mod tests {
             },
         );
         test_engine(Mission::quest(MissionId(9)), authoritative)
+    }
+
+    #[tokio::test]
+    async fn targeted_action_waits_for_authoritative_facing_update() {
+        let target = EntityId(9);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.position.player = Some(wow_domain::WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::GameObject,
+                interactable: true,
+                position: Some(wow_domain::WorldPosition {
+                    map: 0,
+                    point: Vec3::new(0.0, 2.0, 0.0),
+                    orientation: 0.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(9)), authoritative);
+
+        assert!(
+            engine
+                .propose_command(GameplayCommand::UseGameObject(target), true)
+                .await
+        );
+        assert_eq!(engine.last_dispatch, DispatchOutcome::DeferredSpatial);
+        let WorkerToProxy::Action(facing) =
+            proxy.try_recv().expect("facing action should be queued")
+        else {
+            panic!("expected facing action")
+        };
+        assert!(matches!(
+            facing.command(),
+            GameplayCommand::FaceDirection { orientation }
+                if (*orientation - std::f32::consts::FRAC_PI_2).abs() < 1.0e-5
+        ));
+
+        assert!(
+            engine
+                .propose_command(GameplayCommand::UseGameObject(target), true)
+                .await
+        );
+        assert_eq!(engine.last_dispatch, DispatchOutcome::DeferredSpatial);
+        assert!(
+            proxy.try_recv().is_err(),
+            "interaction must wait for server facing confirmation"
+        );
+
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::PlayerPosition {
+                    position: wow_domain::WorldPosition {
+                        map: 0,
+                        point: Vec3::new(0.0, 0.0, 0.0),
+                        orientation: std::f32::consts::FRAC_PI_2,
+                    },
+                    moving: false,
+                    flags: 0,
+                    client_time: 0,
+                },
+            ))
+            .await;
+        assert!(
+            engine
+                .propose_command(GameplayCommand::UseGameObject(target), true)
+                .await
+        );
+        let WorkerToProxy::Action(interaction) = proxy
+            .try_recv()
+            .expect("interaction should be queued after facing confirmation")
+        else {
+            panic!("expected interaction action after facing confirmation")
+        };
+        assert_eq!(
+            interaction.command(),
+            &GameplayCommand::UseGameObject(target)
+        );
     }
 
     #[tokio::test]

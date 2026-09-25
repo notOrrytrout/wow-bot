@@ -891,6 +891,8 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             GameplayCommand::CastGameObject { target, report_use: true, .. } => Some(*target),
                             _ => None,
                         };
+                        let publish_movement_prediction =
+                            should_publish_movement_prediction(&command);
                         let movement_context = gameplay_movement_context(
                             controlled_mover,
                             controlled_position,
@@ -915,12 +917,17 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                     if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &report).await { break Err(e); }
                                 }
                                 if let Some((position, moving, flags, client_time)) = movement {
-                                    if controlled_mover.is_some() {
-                                        controlled_position = Some(position);
-                                        let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::ControlledMover { mover: controlled_mover, position: Some(position), flags })).await;
-                                    } else {
-                                        canonical_position = Some(position);
-                                        let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition { position, moving, flags, client_time })).await;
+                                    // A set-facing packet is only a request. Keep the last
+                                    // server-observed orientation until the upstream object
+                                    // update confirms the turn.
+                                    if publish_movement_prediction {
+                                        if controlled_mover.is_some() {
+                                            controlled_position = Some(position);
+                                            let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::ControlledMover { mover: controlled_mover, position: Some(position), flags })).await;
+                                        } else {
+                                            canonical_position = Some(position);
+                                            let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition { position, moving, flags, client_time })).await;
+                                        }
                                     }
                                     last_bot_visual = Some((position, frame.opcode, std::time::Instant::now()));
                                     if let Ok(opcode) = u16::try_from(frame.opcode) {
@@ -1287,7 +1294,9 @@ async fn run_headless_world_session(
                                 }
                                 write_client_frame(&mut writer, &mut enc, &frame).await?;
                                 tracing::info!(account=%account.config.account_name, opcode=frame.opcode, "headless bot gameplay packet transmitted");
-                                if let Some((position, moving, flags, client_time)) = movement {
+                                if should_publish_movement_prediction(&command)
+                                    && let Some((position, moving, flags, client_time)) = movement
+                                {
                                     if controlled_mover.is_some() {
                                         controlled_position = Some(position);
                                         let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::ControlledMover { mover: controlled_mover, position: Some(position), flags })).await;
@@ -1531,6 +1540,10 @@ fn bot_targeted_cast(command: &GameplayCommand) -> Option<(u32, Option<EntityId>
     }
 }
 
+fn should_publish_movement_prediction(command: &GameplayCommand) -> bool {
+    !matches!(command, GameplayCommand::FaceDirection { .. })
+}
+
 #[derive(Clone, Copy)]
 struct GameplayMovementContext {
     mover: Option<EntityId>,
@@ -1601,6 +1614,16 @@ mod gameplay_movement_context_tests {
         assert_eq!(context.mover, Some(EntityId(1)));
         assert_eq!(context.position, Some(player_position));
         assert_eq!(context.flags, 0x10);
+    }
+
+    #[test]
+    fn facing_request_does_not_publish_a_predicted_position() {
+        assert!(!should_publish_movement_prediction(
+            &GameplayCommand::FaceDirection { orientation: 1.0 }
+        ));
+        assert!(should_publish_movement_prediction(
+            &GameplayCommand::MoveTo(Vec3::new(1.0, 2.0, 3.0))
+        ));
     }
 }
 
