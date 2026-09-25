@@ -6,8 +6,9 @@ pub mod validation;
 pub use azerothcore::{
     AzerothCoreCatalog, CatalogProvenance, FishingItem, GatherNode, GeneratorSource,
     HashedSourceFile, KnowledgeEntityKind, QuestActionHintCandidate, QuestCatalogSource,
-    QuestItemUseRule, QuestKnowledge, QuestSpellRule, TrainerService, VendorKind, VendorService,
-    WorldDataSource, embedded_azerothcore_catalog, load_azerothcore_catalog,
+    QuestItemUseRule, QuestKnowledge, QuestSpellRule, QuestStartLocation, TrainerService,
+    VendorKind, VendorService, WorldDataSource, embedded_azerothcore_catalog,
+    load_azerothcore_catalog,
 };
 
 /// Embedded, versioned AzerothCore static knowledge catalog.

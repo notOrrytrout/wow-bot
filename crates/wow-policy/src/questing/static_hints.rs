@@ -2,7 +2,7 @@ use wow_domain::Vec3;
 use wow_infra::world_knowledge::{KnowledgeEntityKind, embedded_azerothcore_catalog};
 use wow_state::quests::QuestTargetKind;
 
-pub use wow_infra::world_knowledge::{QuestItemUseRule, QuestSpellRule};
+pub use wow_infra::world_knowledge::{QuestItemUseRule, QuestSpellRule, QuestStartLocation};
 
 #[derive(Clone, Debug)]
 pub struct StaticQuestDefinition {
@@ -32,6 +32,17 @@ pub fn quest_definition(quest: u32) -> Option<StaticQuestDefinition> {
             .map(|item| (item.item, item.required))
             .collect(),
     })
+}
+
+/// Find static quest starter locations for the current map, nearest first.
+/// Static locations guide discovery; live server offers remain authoritative.
+pub fn nearby_quest_starts(
+    map: u32,
+    from: Vec3,
+    class_id: Option<u8>,
+    max_distance: f32,
+) -> Vec<QuestStartLocation> {
+    embedded_azerothcore_catalog().nearby_quest_starts(map, from, class_id, max_distance)
 }
 
 pub fn nearest_target_spawn(

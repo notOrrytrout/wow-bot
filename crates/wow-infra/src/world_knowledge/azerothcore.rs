@@ -215,6 +215,16 @@ pub struct QuestStart {
     pub spawns: Vec<KnowledgeSpawn>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuestStartLocation {
+    pub quest_id: u32,
+    pub giver_entry_id: u32,
+    pub giver_kind: KnowledgeEntityKind,
+    pub giver_name: Option<String>,
+    pub location: Vec3,
+    pub distance: f32,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct QuestTurnIn {
     pub quest_id: u32,
@@ -303,6 +313,18 @@ impl AzerothCoreCatalog {
     }
     pub fn world(&self) -> &WorldKnowledgeData {
         &self.world
+    }
+    /// Return quest giver locations on `map` within `max_distance`, nearest first.
+    /// `class_id` uses 1-based WoW class IDs; unknown classes can use only
+    /// quests with no class restriction.
+    pub fn nearby_quest_starts(
+        &self,
+        map: u32,
+        from: Vec3,
+        class_id: Option<u8>,
+        max_distance: f32,
+    ) -> Vec<QuestStartLocation> {
+        nearby_quest_start_locations(&self.world.quest_starts, map, from, class_id, max_distance)
     }
     pub fn provenance(&self) -> &CatalogProvenance {
         &self.provenance
@@ -483,6 +505,54 @@ impl AzerothCoreCatalog {
     }
 }
 
+fn nearby_quest_start_locations(
+    starts: &[QuestStart],
+    map: u32,
+    from: Vec3,
+    class_id: Option<u8>,
+    max_distance: f32,
+) -> Vec<QuestStartLocation> {
+    if !from.is_finite() || !max_distance.is_finite() || max_distance < 0.0 {
+        return Vec::new();
+    }
+    let class_allowed = |mask: u32| {
+        mask == 0
+            || class_id
+                .filter(|id| (1..=32).contains(id))
+                .is_some_and(|id| mask & (1u32 << (id - 1)) != 0)
+    };
+    let mut locations = starts
+        .iter()
+        .filter(|start| class_allowed(start.allowable_classes))
+        .flat_map(|start| {
+            start.spawns.iter().filter_map(move |spawn| {
+                if spawn.map_id != map {
+                    return None;
+                }
+                let location = Vec3::new(spawn.x, spawn.y, spawn.z);
+                let distance = from.distance(location);
+                (location.is_finite() && distance.is_finite() && distance <= max_distance).then(
+                    || QuestStartLocation {
+                        quest_id: start.quest_id,
+                        giver_entry_id: start.giver_entry_id,
+                        giver_kind: start.giver_kind,
+                        giver_name: start.giver_name.clone(),
+                        location,
+                        distance,
+                    },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    locations.sort_by(|a, b| {
+        a.distance
+            .total_cmp(&b.distance)
+            .then_with(|| a.quest_id.cmp(&b.quest_id))
+            .then_with(|| a.giver_entry_id.cmp(&b.giver_entry_id))
+    });
+    locations
+}
+
 fn closest_by_distance<T>(candidates: impl IntoIterator<Item = (f32, T)>) -> Option<T> {
     candidates
         .into_iter()
@@ -556,6 +626,25 @@ pub fn embedded_azerothcore_catalog() -> &'static AzerothCoreCatalog {
 mod tests {
     use super::*;
 
+    fn quest_start(quest_id: u32, allowable_classes: u32, map_id: u32, x: f32) -> QuestStart {
+        QuestStart {
+            quest_id,
+            giver_entry_id: quest_id + 100,
+            giver_kind: KnowledgeEntityKind::Creature,
+            giver_name: Some(format!("giver-{quest_id}")),
+            allowable_classes,
+            spawns: vec![KnowledgeSpawn {
+                map_id,
+                zone_id: 0,
+                area_id: 0,
+                x,
+                y: 0.0,
+                z: 0.0,
+                orientation: 0.0,
+            }],
+        }
+    }
+
     #[test]
     fn spawn_candidates_are_nearest_first_and_unique() {
         let origin = Vec3::new(0.0, 0.0, 0.0);
@@ -569,6 +658,37 @@ mod tests {
         assert_eq!(
             candidates,
             vec![Vec3::new(2.0, 0.0, 0.0), Vec3::new(9.0, 0.0, 0.0)]
+        );
+    }
+
+    #[test]
+    fn quest_starts_filter_by_class_map_and_horizon_then_sort_nearest_first() {
+        let starts = [
+            quest_start(1, 1 << 2, 1, 8.0), // class 3
+            quest_start(2, 1 << 1, 1, 2.0), // class 2
+            quest_start(3, 0, 2, 1.0),      // other map
+            quest_start(4, 0, 1, 5.0),      // unrestricted
+            quest_start(5, 1 << 2, 1, 11.0),
+        ];
+        let found = nearby_quest_start_locations(&starts, 1, Vec3::default(), Some(3), 10.0);
+        assert_eq!(
+            found.iter().map(|start| start.quest_id).collect::<Vec<_>>(),
+            vec![4, 1]
+        );
+        assert_eq!(found[0].giver_entry_id, 104);
+        assert_eq!(found[0].location, Vec3::new(5.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn unknown_class_only_matches_unrestricted_starters_and_bad_horizons_match_none() {
+        let starts = [quest_start(1, 1, 1, 1.0), quest_start(2, 0, 1, 2.0)];
+        let found = nearby_quest_start_locations(&starts, 1, Vec3::default(), None, 10.0);
+        assert_eq!(
+            found.iter().map(|start| start.quest_id).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(
+            nearby_quest_start_locations(&starts, 1, Vec3::default(), Some(1), f32::NAN).is_empty()
         );
     }
 }

@@ -319,10 +319,12 @@ pub fn movement_requirement(
     }
     if requires_npc_front_approach(command) {
         let destination = npc_front_approach_point(target, NPC_FRONT_STANDOFF)?;
-        (mover.point.distance(destination) > NPC_FRONT_TOLERANCE).then_some(MovementRequirement {
-            destination,
-            acceptable_range: NPC_FRONT_TOLERANCE,
-        })
+        (movement_distance(snapshot, mover.point, destination) > NPC_FRONT_TOLERANCE).then_some(
+            MovementRequirement {
+                destination,
+                acceptable_range: NPC_FRONT_TOLERANCE,
+            },
+        )
     } else if matches!(command, GameplayCommand::Attack(_)) {
         mob_melee_approach_requirement(mover, target)
     } else if let GameplayCommand::Cast {
@@ -356,6 +358,21 @@ pub fn movement_requirement(
                 preferred: profile.approach_range,
             },
         )
+    }
+}
+
+/// Match the lane movement controller's arrival metric for a spatial
+/// prerequisite. Ground movement ignores Z; flight movement uses 3-D distance.
+fn movement_distance(snapshot: &Snapshot, from: Vec3, to: Vec3) -> f32 {
+    let controlled_mover = snapshot.state.control.mover.is_some();
+    let flags = if controlled_mover {
+        snapshot.state.control.movement_flags
+    } else {
+        snapshot.state.position.flags
+    };
+    match wow_navigation::LocomotionMode::from_server_flags(controlled_mover, flags) {
+        wow_navigation::LocomotionMode::Ground => (to.x - from.x).hypot(to.y - from.y),
+        wow_navigation::LocomotionMode::Flight => from.distance(to),
     }
 }
 
@@ -553,6 +570,35 @@ mod tests {
 
         assert_eq!(requirement.destination, Vec3::new(3.0, 0.0, 0.0));
         assert_eq!(requirement.acceptable_range, 0.8);
+    }
+
+    #[test]
+    fn ground_npc_approach_uses_same_xy_arrival_envelope_as_movement() {
+        let mut s = snapshot(
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(3.0, 0.799_881_756, 2.5),
+                orientation: 0.0,
+            },
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(0.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+        );
+        let command = GameplayCommand::TurnInQuest {
+            quest: 170,
+            giver: EntityId(7),
+        };
+
+        // Ground movement reports arrival at horizontal distance 0.799881756,
+        // even though the active mover has a vertical offset from the NPC.
+        assert!(movement_requirement(&s, &command).is_none());
+
+        // Flight remains 3-D: the same offset is outside the interaction envelope.
+        s.state.control.mover = Some(EntityId(9));
+        s.state.control.movement_flags = 0x0200_0000;
+        assert!(movement_requirement(&s, &command).is_some());
     }
 
     #[test]

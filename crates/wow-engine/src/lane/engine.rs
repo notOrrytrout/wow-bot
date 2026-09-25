@@ -46,6 +46,9 @@ enum MovementPurpose {
 }
 
 const TURN_IN_SEARCH_RANGE: f32 = 5.0;
+const QUEST_START_ARRIVAL_RANGE: f32 = 5.0;
+const QUEST_START_EMPTY_LOG_RADIUS_YARDS: f32 = 200.0;
+const QUEST_START_HUB_SWEEP_RADIUS_YARDS: f32 = 40.0;
 const QUEST_SEARCH_ARRIVAL_RANGE: f32 = 18.0;
 const QUEST_TOOL_SEARCH_RANGE: f32 = 12.0;
 const MAX_INTERACTION_RETRIES: usize = 512;
@@ -128,6 +131,7 @@ pub struct LaneEngine {
     pending_quest_action: Option<PendingQuestAction>,
     interaction_retry_after: BTreeMap<(u32, EntityId), (u8, Instant)>,
     search_attempts: BTreeMap<(u32, usize, u32), BTreeSet<(u32, u32, u32)>>,
+    quest_start_search_attempts: BTreeSet<(u32, u32, u32, u32)>,
     search_retry_after: BTreeMap<(u32, usize, u32), Instant>,
     current_work: Option<QuestWorkRuntime>,
     last_wait_reason: Option<String>,
@@ -178,6 +182,7 @@ impl LaneEngine {
             pending_quest_action: None,
             interaction_retry_after: BTreeMap::new(),
             search_attempts: BTreeMap::new(),
+            quest_start_search_attempts: BTreeSet::new(),
             search_retry_after: BTreeMap::new(),
             current_work: None,
             last_wait_reason: None,
@@ -1411,6 +1416,64 @@ impl LaneEngine {
                 .await;
         }
 
+        let available_giver = self
+            .state
+            .authoritative
+            .quests
+            .giver_status
+            .iter()
+            .find(|(giver, status)| {
+                quest_status_available(**status)
+                    && self
+                        .giver_retry_after
+                        .get(giver)
+                        .is_none_or(|(_, until)| *until <= Instant::now())
+            })
+            .map(|(&giver, &status)| (giver, status));
+        if let Some((giver, status)) = available_giver {
+            self.set_work(QuestWorkKey::AcquireQuest { quest: None });
+            tracing::info!(lane=?self.state.lane, ?giver, status, "quest scheduler opening authoritative quest giver");
+            self.pending_giver_interaction = Some((giver, Instant::now()));
+            return self
+                .propose_command(GameplayCommand::Interact(giver), true)
+                .await;
+        }
+
+        if let Some(player) = self.state.authoritative.position.player {
+            let active_quests = &self.state.authoritative.quests.active;
+            let radius = if active_quests.is_empty() {
+                QUEST_START_EMPTY_LOG_RADIUS_YARDS
+            } else {
+                QUEST_START_HUB_SWEEP_RADIUS_YARDS
+            };
+            let class_id = self.state.authoritative.capabilities.class_id;
+            if let Some(start) = wow_policy::questing::static_hints::nearby_quest_starts(
+                player.map,
+                player.point,
+                class_id,
+                radius,
+            )
+            .into_iter()
+            .find(|start| {
+                !self
+                    .quest_start_search_attempts
+                    .contains(&quest_start_search_point_key(player.map, start.location))
+            }) {
+                let work = self.set_work(QuestWorkKey::AcquireQuest { quest: None });
+                tracing::info!(lane=?self.state.lane, work_id=?work.id, quest=start.quest_id, giver_entry=start.giver_entry_id, ?start.giver_kind, ?start.giver_name, x=start.location.x, y=start.location.y, distance=start.distance, radius, "quest scheduler searching static quest starter location");
+                self.queue_movement(
+                    start.location,
+                    QUEST_START_ARRIVAL_RANGE,
+                    Some(GameplayCommand::QueryQuestGivers),
+                    None,
+                    PlanOrigin::SystemPolicy,
+                    work,
+                    MovementPurpose::SearchArea,
+                );
+                return true;
+            }
+        }
+
         let incomplete_quest = self
             .state
             .authoritative
@@ -1433,29 +1496,6 @@ impl LaneEngine {
             .map(|(&quest, _)| quest);
         if let Some(quest) = complete_quest {
             return self.tick_complete_quest(quest).await;
-        }
-
-        let available_giver = self
-            .state
-            .authoritative
-            .quests
-            .giver_status
-            .iter()
-            .find(|(giver, status)| {
-                quest_status_available(**status)
-                    && self
-                        .giver_retry_after
-                        .get(giver)
-                        .is_none_or(|(_, until)| *until <= Instant::now())
-            })
-            .map(|(&giver, &status)| (giver, status));
-        if let Some((giver, status)) = available_giver {
-            self.set_work(QuestWorkKey::AcquireQuest { quest: None });
-            tracing::info!(lane=?self.state.lane, ?giver, status, "quest scheduler opening authoritative quest giver");
-            self.pending_giver_interaction = Some((giver, Instant::now()));
-            return self
-                .propose_command(GameplayCommand::Interact(giver), true)
-                .await;
         }
 
         self.set_work(QuestWorkKey::AcquireQuest { quest: None });
@@ -1923,6 +1963,19 @@ impl LaneEngine {
 
     fn record_search_arrival(&mut self, movement: &PendingMovement) {
         if movement.purpose != MovementPurpose::SearchArea {
+            return;
+        }
+        if matches!(
+            &movement.work.key,
+            QuestWorkKey::AcquireQuest { quest: None }
+        ) {
+            if let Some(player) = self.state.authoritative.position.player {
+                self.quest_start_search_attempts
+                    .insert(quest_start_search_point_key(
+                        player.map,
+                        movement.destination,
+                    ));
+            }
             return;
         }
         let key = match &movement.work.key {
@@ -2833,6 +2886,7 @@ impl LaneEngine {
         self.pending_facing = None;
         self.pending_quest_action = None;
         self.search_attempts.clear();
+        self.quest_start_search_attempts.clear();
         self.search_retry_after.clear();
         self.current_work = None;
         self.last_wait_reason = None;
@@ -2901,6 +2955,10 @@ fn bounded_candidates(mut candidates: Vec<Vec3>, origin: Vec3) -> Vec<Vec3> {
 
 fn search_point_key(point: Vec3) -> (u32, u32, u32) {
     (point.x.to_bits(), point.y.to_bits(), point.z.to_bits())
+}
+fn quest_start_search_point_key(map: u32, point: Vec3) -> (u32, u32, u32, u32) {
+    let (x, y, z) = search_point_key(point);
+    (map, x, y, z)
 }
 fn turn_in_search_arrived(player: Vec3, destination: Vec3) -> bool {
     (destination.x - player.x).hypot(destination.y - player.y) <= TURN_IN_SEARCH_RANGE
@@ -2979,6 +3037,79 @@ mod tests {
             },
         );
         test_engine(Mission::quest(MissionId(9)), authoritative)
+    }
+
+    #[tokio::test]
+    async fn quest_scheduler_searches_static_starters_for_empty_and_active_logs() {
+        let start = [0, 1, 530, 571]
+            .into_iter()
+            .find_map(|map| {
+                wow_policy::questing::static_hints::nearby_quest_starts(
+                    map,
+                    Vec3::default(),
+                    Some(1),
+                    f32::MAX,
+                )
+                .into_iter()
+                .next()
+                .map(|start| (map, start.location))
+            })
+            .expect("the embedded AzerothCore catalog contains quest starters");
+
+        for active_quest in [false, true] {
+            let (map, location) = start;
+            let mut authoritative = wow_state::AuthoritativeState::default();
+            authoritative.session.in_world = true;
+            authoritative.capabilities.class_id = Some(1);
+            authoritative.position.player = Some(wow_domain::WorldPosition {
+                map,
+                point: location,
+                orientation: 0.0,
+            });
+            if active_quest {
+                authoritative
+                    .quests
+                    .active
+                    .insert(7, wow_state::quests::QuestProgress::default());
+            }
+            let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(17)), authoritative);
+
+            assert!(engine.tick_quest().await);
+            let movement = engine
+                .pending_movement
+                .as_ref()
+                .expect("the quest scheduler should search the nearby static starter");
+            assert_eq!(movement.purpose, MovementPurpose::SearchArea);
+            assert_eq!(movement.destination, location);
+            assert_eq!(movement.resume, Some(GameplayCommand::QueryQuestGivers));
+            assert!(matches!(
+                &movement.work.key,
+                QuestWorkKey::AcquireQuest { quest: None }
+            ));
+            assert!(proxy.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn quest_scheduler_queries_server_when_no_static_starters_are_nearby() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.capabilities.class_id = Some(1);
+        authoritative.position.player = Some(wow_domain::WorldPosition {
+            map: u32::MAX,
+            point: Vec3::default(),
+            orientation: 0.0,
+        });
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(18)), authoritative);
+
+        assert!(engine.tick_quest().await);
+        let WorkerToProxy::Action(action) = proxy
+            .try_recv()
+            .expect("the scheduler should request authoritative giver statuses")
+        else {
+            panic!("expected a quest-giver query action")
+        };
+        assert_eq!(action.command(), &GameplayCommand::QueryQuestGivers);
     }
 
     #[tokio::test]
