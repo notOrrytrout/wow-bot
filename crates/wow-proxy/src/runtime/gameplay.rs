@@ -6,6 +6,9 @@ use wow_srp::wrath_header::ServerEncrypterHalf;
 
 use crate::framing::{ClientFrame, ServerFrame, upstream_edge::write_server_frame};
 
+pub(super) const SMSG_FORCE_RUN_SPEED_CHANGE_OPCODE: u16 = 0x00E2;
+const CMSG_FORCE_RUN_SPEED_CHANGE_ACK_OPCODE: u32 = 0x00E3;
+
 pub(super) const SMSG_TIME_SYNC_REQ_OPCODE: u16 = 0x0390;
 const CMSG_TIME_SYNC_RESP_OPCODE: u32 = 0x0391;
 
@@ -150,12 +153,35 @@ pub(super) fn take_bot_cast_failure(
     Some((cast_count, spell, reason, target))
 }
 
-pub(super) fn parse_loot_response(body: &[u8]) -> Option<(u64, u32, Vec<u8>)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LootResponse {
+    pub guid: u64,
+    pub loot_type: u8,
+    pub error: Option<u8>,
+    pub gold: u32,
+    pub slots: Vec<u8>,
+}
+
+pub(super) fn parse_loot_response(body: &[u8]) -> Option<LootResponse> {
     // Wrath SMSG_LOOT_RESPONSE: guid:u64, loot_type:u8, gold:u32,
     // item_count:u8, followed by 22-byte item records beginning with slot:u8.
     let guid = u64::from_le_bytes(body.get(0..8)?.try_into().ok()?);
+    let loot_type = *body.get(8)?;
+    if loot_type == 0 {
+        // Rejections use the short form: guid:u64, loot_type:u8, error:u8.
+        return Some(LootResponse {
+            guid,
+            loot_type,
+            error: body.get(9).copied(),
+            gold: 0,
+            slots: Vec::new(),
+        });
+    }
     let gold = u32::from_le_bytes(body.get(9..13)?.try_into().ok()?);
     let count = usize::from(*body.get(13)?);
+    if count > 18 {
+        return None;
+    }
     let mut cursor = 14usize;
     let mut slots = Vec::with_capacity(count);
     for _ in 0..count {
@@ -164,7 +190,13 @@ pub(super) fn parse_loot_response(body: &[u8]) -> Option<(u64, u32, Vec<u8>)> {
         slots.push(slot);
         cursor += 22;
     }
-    Some((guid, gold, slots))
+    Some(LootResponse {
+        guid,
+        loot_type,
+        error: None,
+        gold,
+        slots,
+    })
 }
 
 pub(super) async fn write_bot_notice<W: tokio::io::AsyncWrite + Unpin>(
@@ -215,6 +247,9 @@ pub(super) fn encode_gameplay_command(
     const CMSG_QUESTGIVER_CHOOSE_REWARD: u32 = 0x018E;
     const CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY: u32 = 0x0417;
     const CMSG_QUEST_QUERY: u32 = 0x005C;
+    const CMSG_ITEM_QUERY_SINGLE: u32 = 0x0056;
+    const CMSG_LIST_INVENTORY: u32 = 0x019E;
+    const CMSG_SELL_ITEM: u32 = 0x01A0;
     match command {
         GameplayCommand::Raw { opcode, body } => Ok(Some((ClientFrame { opcode, body }, None))),
         GameplayCommand::QueryQuestGivers => Ok(Some((
@@ -231,6 +266,41 @@ pub(super) fn encode_gameplay_command(
             },
             None,
         ))),
+        GameplayCommand::QueryItem { item } => {
+            let mut body = item.to_le_bytes().to_vec();
+            body.extend_from_slice(&0u64.to_le_bytes());
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_ITEM_QUERY_SINGLE,
+                    body,
+                },
+                None,
+            )))
+        }
+        GameplayCommand::VendorList { vendor } => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_LIST_INVENTORY,
+                body: raw_guid_body(vendor),
+            },
+            None,
+        ))),
+        GameplayCommand::VendorSell {
+            vendor,
+            item_guid,
+            count,
+            ..
+        } => {
+            let mut body = raw_guid_body(vendor);
+            body.extend_from_slice(&item_guid.0.to_le_bytes());
+            body.extend_from_slice(&count.to_le_bytes());
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_SELL_ITEM,
+                    body,
+                },
+                None,
+            )))
+        }
         GameplayCommand::Interact(entity) => Ok(Some((
             ClientFrame {
                 opcode: CMSG_QUESTGIVER_HELLO,
@@ -511,6 +581,52 @@ pub(super) fn push_packed_guid(body: &mut Vec<u8>, guid: EntityId) {
         }
     }
     body[start] = mask;
+}
+
+pub(super) fn parse_force_run_speed_change(body: &[u8]) -> Option<(EntityId, u32, f32)> {
+    let (&mask, mut rest) = body.split_first()?;
+    let mut guid = 0_u64;
+    for index in 0..8 {
+        if mask & (1 << index) != 0 {
+            let (&byte, tail) = rest.split_first()?;
+            rest = tail;
+            guid |= u64::from(byte) << (index * 8);
+        }
+    }
+    let move_event = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
+    let rest = rest.get(5..)?;
+    let speed = f32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
+    (guid != 0
+        && rest.len() == 4
+        && speed.is_finite()
+        && (0.1..=100.0).contains(&speed))
+    .then_some((EntityId(guid), move_event, speed))
+}
+
+pub(super) fn encode_force_run_speed_change_ack(
+    guid: EntityId,
+    move_event: u32,
+    speed: f32,
+    client_time: u32,
+    position: WorldPosition,
+) -> ClientFrame {
+    let mut body = Vec::with_capacity(42);
+    push_packed_guid(&mut body, guid);
+    body.extend_from_slice(&move_event.to_le_bytes());
+    // MovementInfo with no movement flags, followed by the confirmed speed.
+    body.extend_from_slice(&0_u32.to_le_bytes());
+    body.extend_from_slice(&0_u16.to_le_bytes());
+    body.extend_from_slice(&client_time.to_le_bytes());
+    body.extend_from_slice(&position.point.x.to_le_bytes());
+    body.extend_from_slice(&position.point.y.to_le_bytes());
+    body.extend_from_slice(&position.point.z.to_le_bytes());
+    body.extend_from_slice(&position.orientation.to_le_bytes());
+    body.extend_from_slice(&0.0_f32.to_le_bytes());
+    body.extend_from_slice(&speed.to_le_bytes());
+    ClientFrame {
+        opcode: CMSG_FORCE_RUN_SPEED_CHANGE_ACK_OPCODE,
+        body,
+    }
 }
 
 pub(super) fn encode_simple_movement(

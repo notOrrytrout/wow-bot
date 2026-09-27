@@ -6,4 +6,6 @@ pub struct PositionState {
     pub moving: bool,
     pub flags: u32,
     pub client_time: u32,
+    #[serde(default)]
+    pub run_speed_yards_per_second: Option<f32>,
 }

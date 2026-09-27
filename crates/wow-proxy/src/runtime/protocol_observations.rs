@@ -153,7 +153,12 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
     const SMSG_UPDATE_COMBO_POINTS: u32 = 0x039D;
     const MSG_CORPSE_QUERY: u32 = 0x0216;
     const SMSG_CORPSE_RECLAIM_DELAY: u32 = 0x0269;
+    const SMSG_PARTYKILLLOG: u32 = 0x01F5;
+    const SMSG_ITEM_QUERY_SINGLE_RESPONSE: u32 = 0x0058;
+    const SMSG_LIST_INVENTORY: u32 = 0x019F;
     match opcode {
+        SMSG_ITEM_QUERY_SINGLE_RESPONSE => parse_item_template(body).into_iter().collect(),
+        SMSG_LIST_INVENTORY => parse_vendor_list(body).into_iter().collect(),
         SMSG_INITIAL_SPELLS => parse_initial_spells(body),
         SMSG_LEARNED_SPELL => body
             .get(0..4)
@@ -176,8 +181,50 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_UPDATE_COMBO_POINTS => vec![parse_combo_points(body)],
         MSG_CORPSE_QUERY => parse_corpse_query(body).into_iter().collect(),
         SMSG_CORPSE_RECLAIM_DELAY => parse_reclaim_delay(body).into_iter().collect(),
+        SMSG_PARTYKILLLOG => parse_creature_killed(body).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn parse_vendor_list(body: &[u8]) -> Option<ProtocolObservation> {
+    let vendor = u64::from_le_bytes(body.get(..8)?.try_into().ok()?);
+    (vendor != 0).then_some(ProtocolObservation::VendorOpened {
+        vendor: EntityId(vendor),
+    })
+}
+
+fn parse_item_template(body: &[u8]) -> Option<ProtocolObservation> {
+    let mut offset = 0usize;
+    let item = read_u32(body, &mut offset)?;
+    if item == 0 || item & 0x8000_0000 != 0 {
+        return None;
+    }
+    let item_class = read_u32(body, &mut offset)?;
+    read_u32(body, &mut offset)?; // subclass
+    read_u32(body, &mut offset)?; // sound override subclass
+    for _ in 0..4 {
+        let end = body.get(offset..)?.iter().position(|byte| *byte == 0)? + offset + 1;
+        offset = end;
+    }
+    offset = offset.checked_add(4)?; // display id
+    let quality = read_u32(body, &mut offset)?;
+    offset = offset.checked_add(12)?; // flags, flags2, buy price
+    let sell_price = read_u32(body, &mut offset)?;
+    Some(ProtocolObservation::ItemTemplate {
+        item,
+        metadata: wow_state::inventory::ItemTemplateMetadata {
+            item_class,
+            quality,
+            sell_price,
+        },
+    })
+}
+
+fn parse_creature_killed(body: &[u8]) -> Option<ProtocolObservation> {
+    let killer = EntityId(u64::from_le_bytes(body.get(..8)?.try_into().ok()?));
+    let victim = EntityId(u64::from_le_bytes(body.get(8..16)?.try_into().ok()?));
+    (killer.0 != 0 && victim.0 != 0)
+        .then_some(ProtocolObservation::CreatureKilled { killer, victim })
 }
 
 fn parse_spell_start(body: &[u8]) -> Option<ProtocolObservation> {
@@ -456,6 +503,7 @@ pub(super) fn controlled_abilities_observation(
 pub(super) fn quest_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation> {
     const SMSG_QUESTGIVER_STATUS: u32 = 0x0183;
     const SMSG_QUESTGIVER_QUEST_LIST: u32 = 0x0185;
+    const SMSG_GOSSIP_MESSAGE: u32 = 0x017D;
     const SMSG_QUESTGIVER_REQUEST_ITEMS: u32 = 0x018B;
     const SMSG_QUESTGIVER_OFFER_REWARD: u32 = 0x018D;
     const SMSG_QUESTGIVER_QUEST_COMPLETE: u32 = 0x018F;
@@ -465,6 +513,7 @@ pub(super) fn quest_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObserv
         SMSG_QUESTGIVER_STATUS => parse_single_quest_status(body).into_iter().collect(),
         SMSG_QUESTGIVER_STATUS_MULTIPLE => parse_multiple_quest_status(body),
         SMSG_QUESTGIVER_QUEST_LIST => parse_quest_list(body),
+        SMSG_GOSSIP_MESSAGE => parse_gossip_message(body),
         SMSG_QUESTGIVER_REQUEST_ITEMS => parse_quest_request_items(body).into_iter().collect(),
         SMSG_QUESTGIVER_OFFER_REWARD => parse_quest_offer_reward(body).into_iter().collect(),
         // The questgiver completion packet is not enough to confirm that the
@@ -542,6 +591,73 @@ pub(super) fn parse_quest_list(body: &[u8]) -> Vec<ProtocolObservation> {
     });
     out.extend(offers);
     out
+}
+
+pub(super) fn parse_gossip_message(body: &[u8]) -> Vec<ProtocolObservation> {
+    const MAX_GOSSIP_ENTRIES: usize = 64;
+
+    let Some(giver) = read_guid(body, 0) else {
+        return Vec::new();
+    };
+    let mut offset = 8usize;
+    if body.get(offset..offset + 8).is_none() {
+        return Vec::new();
+    }
+    offset += 8; // gossip menu ID and NPC text ID
+
+    let Some(gossip_count_bytes) = body.get(offset..offset + 4) else {
+        return Vec::new();
+    };
+    let gossip_count = u32::from_le_bytes(gossip_count_bytes.try_into().unwrap_or([0; 4])) as usize;
+    if gossip_count > MAX_GOSSIP_ENTRIES {
+        return Vec::new();
+    }
+    offset += 4;
+    for _ in 0..gossip_count {
+        if body.get(offset..offset + 10).is_none() {
+            return Vec::new();
+        }
+        offset += 10; // option index, icon, coded, and box money
+        if read_cstring(body, &mut offset).is_none() || read_cstring(body, &mut offset).is_none() {
+            return Vec::new();
+        }
+    }
+
+    let Some(quest_count_bytes) = body.get(offset..offset + 4) else {
+        return Vec::new();
+    };
+    let quest_count = u32::from_le_bytes(quest_count_bytes.try_into().unwrap_or([0; 4])) as usize;
+    if quest_count > MAX_GOSSIP_ENTRIES {
+        return Vec::new();
+    }
+    offset += 4;
+
+    let mut observations = Vec::with_capacity(quest_count + 1);
+    observations.push(ProtocolObservation::QuestGiverListReceived {
+        giver,
+        offer_count: quest_count as u8,
+    });
+    for _ in 0..quest_count {
+        let Some(quest_bytes) = body.get(offset..offset + 4) else {
+            return Vec::new();
+        };
+        let quest = u32::from_le_bytes(quest_bytes.try_into().unwrap_or([0; 4]));
+        let Some(icon_bytes) = body.get(offset + 4..offset + 8) else {
+            return Vec::new();
+        };
+        let icon = u32::from_le_bytes(icon_bytes.try_into().unwrap_or([0; 4]));
+        if body.get(offset + 8..offset + 17).is_none() {
+            return Vec::new();
+        }
+        offset += 17; // quest, icon, level, flags, and repeatable
+        if read_cstring(body, &mut offset).is_none() {
+            return Vec::new();
+        }
+        if quest != 0 {
+            observations.push(ProtocolObservation::QuestOffer { giver, quest, icon });
+        }
+    }
+    observations
 }
 
 pub(super) fn parse_quest_request_items(body: &[u8]) -> Option<ProtocolObservation> {

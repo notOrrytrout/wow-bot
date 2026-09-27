@@ -84,6 +84,12 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.position.client_time = client_time;
             delta.changed.push("position".into());
         }
+        ProtocolObservation::RunSpeedChanged { yards_per_second } => {
+            if yards_per_second.is_finite() && (0.1..=100.0).contains(&yards_per_second) {
+                state.position.run_speed_yards_per_second = Some(yards_per_second);
+                delta.changed.push("position".into());
+            }
+        }
         ProtocolObservation::ControlledMover {
             mover,
             position,
@@ -183,12 +189,22 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             }
             mark_entity_changed(&mut delta, entity, &["entities", "inventory"]);
         }
+        ProtocolObservation::CreatureKilled { victim, .. } => {
+            if let Some(entity) = state.entities.0.get_mut(&victim) {
+                entity.mark_dead();
+                mark_entity_changed(&mut delta, victim, &["entities"]);
+            }
+        }
         ProtocolObservation::InventoryCount { item, count } => {
             if count == 0 {
                 state.inventory.items.remove(&item);
             } else {
                 state.inventory.items.insert(item, count);
             }
+            delta.changed.push("inventory".into());
+        }
+        ProtocolObservation::ItemTemplate { item, metadata } => {
+            state.inventory.item_metadata.insert(item, metadata);
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::InventoryInstances { items } => {
@@ -222,6 +238,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             advance_loot_generation(state, ownership);
             delta.changed.push("inventory".into());
         }
+        ProtocolObservation::LootRejected { .. } => {}
         ProtocolObservation::LootClosed { ownership } => {
             state.inventory.current_loot = None;
             state.inventory.current_loot_owner = None;
@@ -256,14 +273,19 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             ensure_quest_giver(state, giver);
             mark_entity_changed(&mut delta, giver, &["quests", "entities"]);
         }
-        ProtocolObservation::QuestGiverListReceived { .. } => {}
+        ProtocolObservation::QuestGiverListReceived { giver, .. } => {
+            state.quests.offers.retain(|_, offer| offer.giver != giver);
+        }
         ProtocolObservation::QuestOffer { giver, quest, icon } => {
-            state
-                .quests
-                .offers
-                .insert(quest, crate::quests::QuestOffer { giver, icon });
-            ensure_quest_giver(state, giver);
-            mark_entity_changed(&mut delta, giver, &["quests", "entities"]);
+            if !state.quests.active.contains_key(&quest) && !state.quests.completed.contains(&quest)
+            {
+                state
+                    .quests
+                    .offers
+                    .insert(quest, crate::quests::QuestOffer { giver, icon });
+                ensure_quest_giver(state, giver);
+                mark_entity_changed(&mut delta, giver, &["quests", "entities"]);
+            }
         }
         ProtocolObservation::QuestAccepted { quest } => {
             state.quests.active.entry(quest).or_default();
@@ -286,6 +308,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             objectives,
             complete,
         } => {
+            state.quests.offers.remove(&quest);
             state.quests.active.insert(
                 quest,
                 crate::quests::QuestProgress {
@@ -523,6 +546,37 @@ mod tests {
         );
 
         assert_eq!(state.quests.completed, vec![42]);
+    }
+
+    #[test]
+    fn quest_giver_list_does_not_reintroduce_active_or_completed_offers() {
+        let mut state = AuthoritativeState::default();
+        state.quests.active.insert(41, QuestProgress::default());
+        state.quests.completed.push(42);
+
+        reduce(
+            &mut state,
+            ProtocolObservation::QuestGiverListReceived {
+                giver: EntityId(7),
+                offer_count: 3,
+            },
+        );
+        for quest in [41, 42, 43] {
+            reduce(
+                &mut state,
+                ProtocolObservation::QuestOffer {
+                    giver: EntityId(7),
+                    quest,
+                    icon: 0,
+                },
+            );
+        }
+
+        assert_eq!(state.quests.offers.len(), 1);
+        assert_eq!(
+            state.quests.offers.get(&43).map(|offer| offer.giver),
+            Some(EntityId(7))
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub struct ObjectObservationRuntime {
     known_quests: BTreeMap<u32, (bool, Vec<u32>)>,
     known_inventory: BTreeMap<u32, u32>,
     known_inventory_instances: Vec<wow_state::inventory::InventoryItemInstance>,
+    known_backpack_free_slots: Option<u16>,
     known_controlled_mover: Option<EntityId>,
     last_controlled_position: Option<WorldPosition>,
     last_controlled_flags: u32,
@@ -67,6 +68,7 @@ impl ObjectObservationRuntime {
             known_quests: BTreeMap::new(),
             known_inventory: BTreeMap::new(),
             known_inventory_instances: Vec::new(),
+            known_backpack_free_slots: None,
             known_controlled_mover: None,
             last_controlled_position: None,
             last_controlled_flags: 0,
@@ -183,6 +185,16 @@ impl ObjectObservationRuntime {
                     .and_then(|player| map.values().find(|object| object.guid().0 == player.0))
                     .map(backpack_slots_of)
                     .unwrap_or_default();
+                if let Some(player) = self
+                    .player_guid
+                    .and_then(|player| map.values().find(|object| object.guid().0 == player.0))
+                    && let Some(free_slots) = backpack_free_slots_of(player)
+                    && self.known_backpack_free_slots != Some(free_slots)
+                {
+                    observations
+                        .push(ProtocolObservation::InventoryFreeSlots { count: free_slots });
+                    self.known_backpack_free_slots = Some(free_slots);
+                }
                 let equipped_ranged_guid = self
                     .player_guid
                     .and_then(|player| map.values().find(|object| object.guid().0 == player.0))
@@ -505,6 +517,22 @@ fn backpack_slots_of(
         }
     }
     slots
+}
+
+fn backpack_free_slots_of(
+    object: &tentacli::plugins::wow::wotlk::realm::object::Object,
+) -> Option<u16> {
+    let Some(FieldValue::LongArray(values)) = object.player_fields.get(&PlayerField::PackSlot)
+    else {
+        return None;
+    };
+    u16::try_from(
+        values
+            .iter()
+            .filter(|guid| guid.is_none_or(|guid| guid == 0))
+            .count(),
+    )
+    .ok()
 }
 
 fn item_owned_by(

@@ -628,20 +628,18 @@ fn configure_network_topology(config: &mut AppConfig) -> Result<()> {
         false,
     )?;
     if remote_clients {
-        let advertised = detect_reachable_local_ip().unwrap_or_else(|| {
+        let detected = detect_reachable_local_ip();
+        if let Some(address) = detected.as_deref() {
+            println!("Detected LAN address: {address}.");
+        } else {
             tracing::warn!(
                 "could not automatically determine a reachable LAN address for this machine"
             );
-            String::new()
-        });
-        let advertised = if advertised.is_empty() {
-            prompt_required("Hostname or LAN IP that those WoW clients can reach")?
-        } else {
-            println!(
-                "Detected this bot server at {advertised}; remote WoW clients will be directed here."
-            );
-            advertised
-        };
+        }
+        println!(
+            "For clients outside your LAN, enter your public IP address or DNS name. Set router port forwarding to this computer for TCP ports 3725, 8086, and 8088."
+        );
+        let advertised = prompt_client_reachable_host(detected.as_deref())?;
         config.proxy.auth_bind = "0.0.0.0:3725".into();
         config.proxy.world_bind = "0.0.0.0:8086".into();
         config.proxy.transparent_world_bind = "0.0.0.0:8088".into();
@@ -653,6 +651,44 @@ fn configure_network_topology(config: &mut AppConfig) -> Result<()> {
         config.proxy.advertise_host = "127.0.0.1".into();
     }
     Ok(())
+}
+
+fn prompt_client_reachable_host(detected: Option<&str>) -> Result<String> {
+    loop {
+        let prompt = match detected {
+            Some(address) => format!(
+                "Address WoW clients will use (Enter for detected LAN address {address}; type a public IP/domain for Internet clients): "
+            ),
+            None => "Address WoW clients can reach (LAN/public IP or DNS name): ".to_owned(),
+        };
+        let value = prompt_line(&prompt)?;
+        let value = value.trim();
+        let value = if value.is_empty() {
+            detected.unwrap_or_default()
+        } else {
+            value
+        };
+        if valid_client_reachable_host(value) {
+            return Ok(value.to_owned());
+        }
+        println!("Enter an IP address or DNS name without a port, URL scheme, or path.");
+    }
+}
+
+fn valid_client_reachable_host(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    !host.is_empty()
+        && !host.contains("..")
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 fn detect_reachable_local_ip() -> Option<String> {

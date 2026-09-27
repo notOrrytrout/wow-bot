@@ -97,6 +97,18 @@ impl OwnershipSnapshot {
         ) || (self.attended_control == AttendedControlState::Unattended
             && self.mode == ControlMode::Bot)
     }
+
+    /// Whether the session still has bot assistance enabled, including while
+    /// the player temporarily owns movement after taking control.
+    pub fn bot_assistance_armed(self) -> bool {
+        self.requested == ControlMode::Bot
+            && !self.transitioning()
+            && !matches!(
+                self.attended_control,
+                AttendedControlState::PlayerAttachedManualOff
+                    | AttendedControlState::ReclaimingAfterPlayerLogout
+            )
+    }
 }
 
 pub struct AccountOwnership {
@@ -258,5 +270,19 @@ mod tests {
         assert!(!o.commit(a));
         assert!(o.commit(b));
         assert!(o.snapshot().permits(ClientKind::Player));
+    }
+
+    #[test]
+    fn bot_assistance_remains_armed_during_player_movement_takeover_until_bot_off() {
+        let mut ownership = AccountOwnership::default();
+        ownership.player_attached_bot_on();
+        assert!(ownership.snapshot().bot_assistance_armed());
+        ownership.player_movement_takeover();
+        assert!(!ownership.snapshot().bot_allowed());
+        assert!(ownership.snapshot().bot_assistance_armed());
+
+        let ticket = ownership.begin(ControlMode::Manual);
+        assert!(ownership.commit(ticket));
+        assert!(!ownership.snapshot().bot_assistance_armed());
     }
 }

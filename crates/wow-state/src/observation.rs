@@ -23,6 +23,9 @@ pub enum ProtocolObservation {
         flags: u32,
         client_time: u32,
     },
+    RunSpeedChanged {
+        yards_per_second: f32,
+    },
     ControlledMover {
         mover: Option<EntityId>,
         position: Option<WorldPosition>,
@@ -69,9 +72,17 @@ pub enum ProtocolObservation {
     EntityRemoved {
         entity: EntityId,
     },
+    CreatureKilled {
+        killer: EntityId,
+        victim: EntityId,
+    },
     InventoryCount {
         item: u32,
         count: u32,
+    },
+    ItemTemplate {
+        item: u32,
+        metadata: crate::inventory::ItemTemplateMetadata,
     },
     InventoryInstances {
         items: Vec<crate::inventory::InventoryItemInstance>,
@@ -91,6 +102,11 @@ pub enum ProtocolObservation {
     LootOpened {
         target: EntityId,
         ownership: LootOwnership,
+    },
+    LootRejected {
+        target: EntityId,
+        loot_type: u8,
+        error: Option<u8>,
     },
     LootClosed {
         ownership: LootOwnership,

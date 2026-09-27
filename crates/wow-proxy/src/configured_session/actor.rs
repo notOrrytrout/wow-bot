@@ -47,6 +47,7 @@ pub struct ConfiguredSessionActor {
     pub upstream_tx: mpsc::Sender<GameplayCommand>,
     pub supervisor_tx: mpsc::Sender<SupervisorCommand>,
     pub diagnostics: DiagnosticLogger,
+    pub assistance_armed: tokio::sync::watch::Sender<bool>,
 }
 
 impl ConfiguredSessionActor {
@@ -109,6 +110,18 @@ impl ConfiguredSessionActor {
             }
             SessionMessage::PlayerMovement { at } => {
                 self.state.player.moved(at);
+                // A player login places the session in explicit manual-off
+                // mode. Movement from that client must not turn the bot back
+                // into a requested owner or arm an idle resume.
+                if self.state.player.explicit_manual_off {
+                    return false;
+                }
+                // The first real player movement takes control from an active
+                // bot. Later movement packets only refresh the idle deadline;
+                // they must not publish a new ownership generation each time.
+                if !self.state.ownership.snapshot().bot_allowed() {
+                    return false;
+                }
                 self.state.ownership.player_movement_takeover();
                 let owner = self.state.ownership.snapshot();
                 tracing::info!(lane=?self.state.lane, generation=?owner.generation, movement_epoch=?owner.movement_epoch, idle_resume_ms=self.state.player.idle_window.as_millis(), "player movement temporarily took locomotion; bot resume armed");
@@ -374,6 +387,8 @@ impl ConfiguredSessionActor {
 
     async fn publish_ownership(&self) {
         let owner = self.state.ownership.snapshot();
+        self.assistance_armed
+            .send_replace(owner.bot_assistance_armed());
         self.diagnostics.record(
             DiagnosticStream::ProxyMovement,
             self.state.lane,
@@ -420,6 +435,7 @@ mod tests {
             upstream_tx,
             supervisor_tx,
             diagnostics: test_diagnostics(),
+            assistance_armed: tokio::sync::watch::channel(false).0,
         };
         actor
             .handle(SessionMessage::PlayerAttached { connection: 1 })
@@ -454,6 +470,7 @@ mod tests {
         let (worker_tx, mut worker_rx) = mpsc::channel(8);
         let (upstream_tx, _upstream_rx) = mpsc::channel(8);
         let (supervisor_tx, mut supervisor_rx) = mpsc::channel(8);
+        let (assistance_armed, assistance_rx) = tokio::sync::watch::channel(false);
         let mut actor = ConfiguredSessionActor {
             state: ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO),
             rx,
@@ -461,6 +478,7 @@ mod tests {
             upstream_tx,
             supervisor_tx,
             diagnostics: test_diagnostics(),
+            assistance_armed,
         };
         let moved_at = Instant::now();
         actor.state.upstream_connected = true;
@@ -468,6 +486,12 @@ mod tests {
         actor.state.player.moved(moved_at);
         actor.state.ownership.player_attached_bot_on();
         actor.state.ownership.player_movement_takeover();
+        actor.publish_ownership().await;
+        assert!(*assistance_rx.borrow());
+        assert!(matches!(
+            worker_rx.recv().await,
+            Some(ProxyToWorker::OwnershipChanged(owner)) if !owner.bot_allowed
+        ));
 
         actor
             .handle(SessionMessage::Tick(
@@ -487,6 +511,11 @@ mod tests {
             worker_rx.recv().await,
             Some(ProxyToWorker::OwnershipChanged(owner)) if owner.bot_allowed
         ));
+
+        let ticket = actor.state.ownership.begin(ControlMode::Manual);
+        assert!(actor.state.ownership.commit(ticket));
+        actor.publish_ownership().await;
+        assert!(!*assistance_rx.borrow());
     }
 
     #[tokio::test]
@@ -503,6 +532,7 @@ mod tests {
             upstream_tx,
             supervisor_tx,
             diagnostics: test_diagnostics(),
+            assistance_armed: tokio::sync::watch::channel(false).0,
         };
         let moved_at = Instant::now();
         actor.state.upstream_connected = true;
