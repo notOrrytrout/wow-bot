@@ -190,6 +190,7 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::ChooseQuestReward { giver: target, .. }
         | GameplayCommand::CastGameObject { target, .. }
         | GameplayCommand::VendorBuy { vendor: target, .. }
+        | GameplayCommand::VendorList { vendor: target }
         | GameplayCommand::VendorSell { vendor: target, .. } => Some(*target),
         GameplayCommand::Cast {
             target: Some(target),
@@ -216,6 +217,7 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::MailTake { .. }
         | GameplayCommand::QueryQuestGivers
         | GameplayCommand::QueryQuest { .. }
+        | GameplayCommand::QueryItem { .. }
         | GameplayCommand::Chat { .. }
         | GameplayCommand::Raw { .. } => return true,
     };

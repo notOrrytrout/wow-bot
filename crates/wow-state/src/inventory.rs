@@ -16,6 +16,13 @@ pub struct InventoryItemInstance {
     pub count: u32,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemTemplateMetadata {
+    pub item_class: u32,
+    pub quality: u32,
+    pub sell_price: u32,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TradeState {
     pub generation: u64,
@@ -58,6 +65,8 @@ pub struct MailboxState {
 pub struct InventoryState {
     pub items: BTreeMap<u32, u32>,
     pub instances: BTreeMap<EntityId, InventoryItemInstance>,
+    #[serde(default)]
+    pub item_metadata: BTreeMap<u32, ItemTemplateMetadata>,
     pub free_slots: u16,
     pub equipped_ranged_item: Option<u32>,
     pub equipped_items: BTreeMap<u8, u32>,

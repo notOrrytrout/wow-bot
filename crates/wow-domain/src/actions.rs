@@ -59,6 +59,9 @@ pub enum GameplayCommand {
     QueryQuest {
         quest: u32,
     },
+    QueryItem {
+        item: u32,
+    },
     AcceptQuest {
         quest: u32,
         giver: EntityId,
@@ -81,9 +84,13 @@ pub enum GameplayCommand {
         item: u32,
         count: u32,
     },
+    VendorList {
+        vendor: EntityId,
+    },
     VendorSell {
         vendor: EntityId,
         item: u32,
+        item_guid: EntityId,
         count: u32,
     },
     TradeAccept {
