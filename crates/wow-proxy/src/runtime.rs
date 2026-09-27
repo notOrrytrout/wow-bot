@@ -78,6 +78,16 @@ fn rejected_loot_target_without_response(
     if response_seen { None } else { target }
 }
 
+fn encode_body_hex(body: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(body.len().saturating_mul(2));
+    for byte in body {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0F)] as char);
+    }
+    encoded
+}
+
 fn log_loot_wire_packet(account: &str, direction: &str, opcode: u32, body: &[u8]) {
     if !matches!(opcode, 0x0108 | 0x015D..=0x015F | 0x0160..=0x0163) {
         return;
@@ -87,10 +97,7 @@ fn log_loot_wire_packet(account: &str, direction: &str, opcode: u32, body: &[u8]
         .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
         .map(u64::from_le_bytes);
     let release_confirmed = (opcode == 0x0161).then(|| body.get(8).copied()).flatten();
-    let body_hex = body
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<String>();
+    let body_hex = encode_body_hex(body);
     tracing::info!(
         account,
         direction,
@@ -324,22 +331,30 @@ impl ActionLogManager {
         Ok(true)
     }
 
-    async fn packet(&self, account: &str, direction: &str, opcode: u32, body: &[u8]) {
+    async fn packet(&self, account: &str, stream: &str, direction: &str, opcode: u32, body: &[u8]) {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(&account.to_uppercase()) else {
             return;
         };
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
         let fingerprint = body.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         });
-        let _ = writeln!(
-            session.file,
-            "{{\"event\":\"packet\",\"direction\":{:?},\"opcode\":{},\"body_len\":{},\"fingerprint\":{:?}}}",
-            direction,
-            opcode,
-            body.len(),
-            format!("{fingerprint:016X}")
-        );
+        let body_hex = encode_body_hex(body);
+        let record = serde_json::json!({
+            "event": "packet",
+            "unix_ms": unix_ms,
+            "stream": stream,
+            "direction": direction,
+            "opcode": opcode,
+            "body_len": body.len(),
+            "fingerprint": format!("{fingerprint:016X}"),
+            "body_hex": body_hex,
+        });
+        let _ = writeln!(session.file, "{record}");
         let _ = session.file.flush();
     }
 
@@ -907,6 +922,13 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
         tokio::select! {
             client = read_client_frame(&mut dr, &mut down_dec) => {
                 let mut frame = match client { Ok(v)=>v, Err(e)=>break Err(e) };
+                shared.action_logs.packet(
+                    &account_name,
+                    "player",
+                    "C2S",
+                    u32::from(frame.opcode),
+                    &frame.body,
+                ).await;
                 if frame.opcode == 0x0391
                     && let Some((counter, client_time_ms)) = parse_time_sync_response(&frame.body)
                 {
@@ -1072,7 +1094,6 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                 if frame.opcode == 0x015F {
                     let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::LootClosed { ownership: wow_state::observation::LootOwnership::Player })).await;
                 }
-                shared.action_logs.packet(&account_name, "C2S", frame.opcode, &frame.body).await;
                 if frame.opcode == CMSG_WARDEN_DATA::OPCODE { warden.client_to_server(&mut frame.body); }
                 if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &frame).await { break Err(e); }
             }
@@ -1112,6 +1133,13 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         ) {
                             Ok(Some((frame, movement))) => {
                                 tracing::info!(account=%account_name, opcode=frame.opcode, "bot gameplay packet transmitted");
+                                shared.action_logs.packet(
+                                    &account_name,
+                                    "bot",
+                                    "C2S",
+                                    frame.opcode,
+                                    &frame.body,
+                                ).await;
                                 log_loot_wire_packet(&account_name, "bot_to_server", frame.opcode, &frame.body);
                                 if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &frame).await { break Err(e); }
                                 if let Some((spell, target)) = bot_cast {
@@ -1120,6 +1148,13 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                 if let Some(target) = gameobject_report_use {
                                     let report = ClientFrame { opcode: 0x0481, body: target.0.to_le_bytes().to_vec() };
                                     tracing::info!(account=%account_name, opcode=report.opcode, ?target, "bot game-object report-use packet transmitted");
+                                    shared.action_logs.packet(
+                                        &account_name,
+                                        "bot",
+                                        "C2S",
+                                        report.opcode,
+                                        &report.body,
+                                    ).await;
                                     if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &report).await { break Err(e); }
                                 }
                                 if let Some((position, moving, flags, client_time)) = movement {
@@ -1183,6 +1218,13 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             if update.sequence > last_mirrored_sequence.saturating_add(1) {
                                 tracing::warn!(account=%account_name, skipped=update.sequence - last_mirrored_sequence - 1, sequence=update.sequence, "movement mirror fell behind; sending the latest bot position");
                             }
+                            shared.action_logs.packet(
+                                &account_name,
+                                "bot_mirror",
+                                "S2C",
+                                u32::from(update.frame.opcode),
+                                &update.frame.body,
+                            ).await;
                             if let Err(error) = write_server_frame(&mut dw, &mut down_enc, &update.frame)
                                 .await
                                 .with_context(|| format!("failed to mirror bot movement update {} to the player client", update.sequence))
@@ -1200,7 +1242,13 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
             }
             server = read_server_frame(&mut ur, &mut up_dec) => {
                 let mut frame = match server { Ok(v)=>v, Err(e)=>break Err(e) };
-                shared.action_logs.packet(&account_name, "S2C", u32::from(frame.opcode), &frame.body).await;
+                shared.action_logs.packet(
+                    &account_name,
+                    "world",
+                    "S2C",
+                    u32::from(frame.opcode),
+                    &frame.body,
+                ).await;
                 log_loot_wire_packet(&account_name, "server_to_bot", u32::from(frame.opcode), &frame.body);
                 log_bot_cast_progress(
                     &account_name,
@@ -1228,7 +1276,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                 tracing::warn!(account=%account_name, loot_guid=loot.guid, loot_type=loot.loot_type, loot_error=?loot.error, "server rejected bot-owned loot request");
                                 let release = ClientFrame { opcode: CMSG_LOOT_RELEASE_OPCODE, body: loot.guid.to_le_bytes().to_vec() };
                                 log_loot_wire_packet(&account_name, "bot_to_server", release.opcode, &release.body);
-                                shared.action_logs.packet(&account_name, "C2S", release.opcode, &release.body).await;
+                                shared.action_logs.packet(&account_name, "proxy", "C2S", release.opcode, &release.body).await;
                                 if let Err(error) = write_client_frame(&mut uw, &mut up_enc, &release).await { break Err(error); }
                             } else {
                             let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::LootOpened { target: EntityId(loot.guid), ownership: wow_state::observation::LootOwnership::Bot })).await;
@@ -1237,14 +1285,14 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             if loot.gold > 0 {
                                 let money = ClientFrame { opcode: CMSG_LOOT_MONEY_OPCODE, body: Vec::new() };
                                 log_loot_wire_packet(&account_name, "bot_to_server", money.opcode, &money.body);
-                                shared.action_logs.packet(&account_name, "C2S", money.opcode, &money.body).await;
+                                shared.action_logs.packet(&account_name, "proxy", "C2S", money.opcode, &money.body).await;
                                 if let Err(e) = write_client_frame(&mut uw, &mut up_enc, &money).await { break Err(e); }
                             }
                             let mut loot_slot_write_error = None;
                             for slot in loot.slots {
                                 let take = ClientFrame { opcode: CMSG_AUTOSTORE_LOOT_ITEM_OPCODE, body: vec![slot] };
                                 log_loot_wire_packet(&account_name, "bot_to_server", take.opcode, &take.body);
-                                shared.action_logs.packet(&account_name, "C2S", take.opcode, &take.body).await;
+                                shared.action_logs.packet(&account_name, "proxy", "C2S", take.opcode, &take.body).await;
                                 if let Err(error) = write_client_frame(&mut uw, &mut up_enc, &take).await {
                                     loot_slot_write_error = Some(error);
                                     break;
@@ -1256,7 +1304,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             let release = ClientFrame { opcode: CMSG_LOOT_RELEASE_OPCODE, body: loot.guid.to_le_bytes().to_vec() };
                             log_loot_wire_packet(&account_name, "bot_to_server", release.opcode, &release.body);
-                            shared.action_logs.packet(&account_name, "C2S", release.opcode, &release.body).await;
+                            shared.action_logs.packet(&account_name, "proxy", "C2S", release.opcode, &release.body).await;
                             if let Err(e) = write_client_frame(&mut uw, &mut up_enc, &release).await { break Err(e); }
                             }
                         }
@@ -1564,6 +1612,13 @@ async fn run_headless_world_session(
                                     bot_loot_target = Some(target);
                                     bot_loot_response_seen = false;
                                 }
+                                shared.action_logs.packet(
+                                    &account.config.account_name,
+                                    "bot",
+                                    "C2S",
+                                    frame.opcode,
+                                    &frame.body,
+                                ).await;
                                 log_loot_wire_packet(&account.config.account_name, "bot_to_server", frame.opcode, &frame.body);
                                 write_client_frame(&mut writer, &mut enc, &frame).await?;
                                 tracing::info!(account=%account.config.account_name, opcode=frame.opcode, "headless bot gameplay packet transmitted");
@@ -1604,6 +1659,13 @@ async fn run_headless_world_session(
                 let sequence = ping_sequence;
                 ping_sequence = ping_sequence.wrapping_add(1);
                 let frame = make_headless_ping(sequence, 0);
+                shared.action_logs.packet(
+                    &account.config.account_name,
+                    "proxy",
+                    "C2S",
+                    frame.opcode,
+                    &frame.body,
+                ).await;
                 write_client_frame(&mut writer, &mut enc, &frame).await?;
                 pending_ping = Some((sequence, tokio::time::Instant::now()));
                 tracing::debug!(account=%account.config.account_name, sequence, opcode=frame.opcode, "headless client keepalive ping transmitted");
@@ -1612,6 +1674,13 @@ async fn run_headless_world_session(
             server = server_rx.recv() => {
                 let frame = server.context("headless upstream reader ended")??;
                 let opcode = u32::from(frame.opcode);
+                shared.action_logs.packet(
+                    &account.config.account_name,
+                    "world",
+                    "S2C",
+                    opcode,
+                    &frame.body,
+                ).await;
                 log_bot_cast_progress(
                     &account.config.account_name,
                     opcode,
@@ -1636,6 +1705,13 @@ async fn run_headless_world_session(
                             movement_clock.next_timestamp(),
                             position,
                         );
+                        shared.action_logs.packet(
+                            &account.config.account_name,
+                            "proxy",
+                            "C2S",
+                            ack.opcode,
+                            &ack.body,
+                        ).await;
                         write_client_frame(&mut writer, &mut enc, &ack).await?;
                         tracing::info!(
                             account=%account.config.account_name,
@@ -1660,6 +1736,13 @@ async fn run_headless_world_session(
                         counter,
                         movement_clock.current_timestamp(),
                     );
+                    shared.action_logs.packet(
+                        &account.config.account_name,
+                        "proxy",
+                        "C2S",
+                        response.opcode,
+                        &response.body,
+                    ).await;
                     write_client_frame(&mut writer, &mut enc, &response).await?;
                     tracing::debug!(account=%account.config.account_name, counter, "headless movement time synchronization response sent");
                     continue;
@@ -1672,10 +1755,18 @@ async fn run_headless_world_session(
                     push_packed_guid(&mut body, mover);
                     body.extend_from_slice(&flags.to_le_bytes());
                     body.extend_from_slice(&movement_clock.next_timestamp().to_le_bytes());
-                    write_client_frame(&mut writer, &mut enc, &ClientFrame {
+                    let ack = ClientFrame {
                         opcode: 0x00C7,
                         body,
-                    }).await?;
+                    };
+                    shared.action_logs.packet(
+                        &account.config.account_name,
+                        "proxy",
+                        "C2S",
+                        ack.opcode,
+                        &ack.body,
+                    ).await;
+                    write_client_frame(&mut writer, &mut enc, &ack).await?;
                     if let Some(mut position) = canonical_position.or(controlled_position) {
                         position.point = point;
                         position.orientation = orientation;
@@ -1710,7 +1801,9 @@ async fn run_headless_world_session(
                     }
                 }
                 if opcode == 0x01EE && !char_enum_requested {
-                    write_client_frame(&mut writer, &mut enc, &ClientFrame { opcode: 0x0037, body: Vec::new() }).await?;
+                    let request = ClientFrame { opcode: 0x0037, body: Vec::new() };
+                    shared.action_logs.packet(&account.config.account_name, "proxy", "C2S", request.opcode, &request.body).await;
+                    write_client_frame(&mut writer, &mut enc, &request).await?;
                     char_enum_requested = true;
                     tracing::info!(account=%account.config.account_name, "headless character enumeration requested");
                     continue;
@@ -1720,7 +1813,9 @@ async fn run_headless_world_session(
                         .context("configured headless character was not present in SMSG_CHAR_ENUM")?;
                     player_guid = Some(EntityId(guid));
                     object_observer.set_player_guid(EntityId(guid));
-                    write_client_frame(&mut writer, &mut enc, &ClientFrame { opcode: 0x003D, body: guid.to_le_bytes().to_vec() }).await?;
+                    let request = ClientFrame { opcode: 0x003D, body: guid.to_le_bytes().to_vec() };
+                    shared.action_logs.packet(&account.config.account_name, "proxy", "C2S", request.opcode, &request.body).await;
+                    write_client_frame(&mut writer, &mut enc, &request).await?;
                     player_login_requested = true;
                     tracing::info!(account=%account.config.account_name, character=%name, guid=%format_args!("0x{guid:016X}"), "headless configured character login requested");
                     continue;
@@ -1728,10 +1823,12 @@ async fn run_headless_world_session(
                 if opcode == u32::from(SMSG_WARDEN_DATA::OPCODE) {
                     let reply = warden.handle(&frame.body).context("headless Warden exchange failed")?;
                     if let Some(body) = reply.body {
-                        write_client_frame(&mut writer, &mut enc, &ClientFrame {
+                        let response = ClientFrame {
                             opcode: CMSG_WARDEN_DATA::OPCODE,
                             body,
-                        }).await?;
+                        };
+                        shared.action_logs.packet(&account.config.account_name, "proxy", "C2S", u32::from(response.opcode), &response.body).await;
+                        write_client_frame(&mut writer, &mut enc, &response).await?;
                     }
                     if reply.event != "module chunk" {
                         tracing::info!(account=%account.config.account_name, event=reply.event, "headless Warden exchange advanced");
@@ -1748,24 +1845,29 @@ async fn run_headless_world_session(
                             if loot.loot_type == 0 {
                                 let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::LootRejected { target: EntityId(loot.guid), loot_type: loot.loot_type, error: loot.error })).await;
                                 tracing::warn!(account=%account.config.account_name, loot_guid=loot.guid, loot_type=loot.loot_type, loot_error=?loot.error, "server rejected bot-owned loot request");
-                                log_loot_wire_packet(&account.config.account_name, "bot_to_server", 0x015F, &loot.guid.to_le_bytes());
-                                write_client_frame(&mut writer, &mut enc, &ClientFrame { opcode: 0x015F, body: loot.guid.to_le_bytes().to_vec() }).await?;
+                                let release = ClientFrame { opcode: 0x015F, body: loot.guid.to_le_bytes().to_vec() };
+                                shared.action_logs.packet(&account.config.account_name, "proxy", "C2S", release.opcode, &release.body).await;
+                                log_loot_wire_packet(&account.config.account_name, "bot_to_server", release.opcode, &release.body);
+                                write_client_frame(&mut writer, &mut enc, &release).await?;
                             } else {
                             let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::LootOpened { target: EntityId(loot.guid), ownership: wow_state::observation::LootOwnership::Bot })).await;
                             tracing::info!(account=%account.config.account_name, loot_guid=loot.guid, loot_type=loot.loot_type, gold=loot.gold, slots=?loot.slots, "bot loot window opened; collecting items");
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             if loot.gold > 0 {
                                 let money = ClientFrame { opcode: 0x015E, body: Vec::new() };
+                                shared.action_logs.packet(&account.config.account_name, "proxy", "C2S", money.opcode, &money.body).await;
                                 log_loot_wire_packet(&account.config.account_name, "bot_to_server", money.opcode, &money.body);
                                 write_client_frame(&mut writer, &mut enc, &money).await?;
                             }
                             for slot in loot.slots {
                                 let take = ClientFrame { opcode: 0x0108, body: vec![slot] };
+                                shared.action_logs.packet(&account.config.account_name, "proxy", "C2S", take.opcode, &take.body).await;
                                 log_loot_wire_packet(&account.config.account_name, "bot_to_server", take.opcode, &take.body);
                                 write_client_frame(&mut writer, &mut enc, &take).await?;
                             }
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             let release = ClientFrame { opcode: 0x015F, body: loot.guid.to_le_bytes().to_vec() };
+                            shared.action_logs.packet(&account.config.account_name, "proxy", "C2S", release.opcode, &release.body).await;
                             log_loot_wire_packet(&account.config.account_name, "bot_to_server", release.opcode, &release.body);
                             write_client_frame(&mut writer, &mut enc, &release).await?;
                             }
@@ -1823,10 +1925,12 @@ async fn run_headless_world_session(
                     // clock for the lifetime of this world session.
                     // MSG_MOVE_WORLDPORT_ACK has an empty body. The server holds
                     // a far teleport open until this packet arrives.
-                    write_client_frame(&mut writer, &mut enc, &ClientFrame {
+                    let ack = ClientFrame {
                         opcode: 0x00DC,
                         body: Vec::new(),
-                    }).await?;
+                    };
+                    shared.action_logs.packet(&account.config.account_name, "proxy", "C2S", ack.opcode, &ack.body).await;
+                    write_client_frame(&mut writer, &mut enc, &ack).await?;
                     world_transfer_pending = false;
                     tracing::info!(account=%account.config.account_name, opcode, "headless world transfer acknowledged");
                 }

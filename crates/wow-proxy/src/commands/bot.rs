@@ -14,6 +14,7 @@ pub const HELP_LINES: &[&str] = &[
     ".bot party [tank|healer|melee|ranged|support] | .bot raid [tank|healer|melee|ranged|support]",
     ".bot on | .bot off | .bot status | .bot help",
     ".log start | .log mark [label] | .log status | .log stop",
+    ".log start records decoded packet bodies until .log stop",
 ];
 
 pub fn parse(text: &str, mission_id: MissionId) -> Result<Option<BotCommand>, String> {
