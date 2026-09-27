@@ -239,6 +239,7 @@ mod tests {
         let tuning = RuntimeTuning {
             movement: wow_infra::config::runtime_data::MovementTuning {
                 travel_speed_form_min_yards: 35,
+                path_straightness: 1.0,
             },
             ..RuntimeTuning::default()
         };
@@ -318,7 +319,7 @@ mod tests {
             select_travel_action(context, &RuntimeTuning::default()),
             None
         );
-        context.mounted = false;
+        context.mounted = Some(false);
         context.ready_ability = None;
         assert_eq!(
             select_travel_action(context, &RuntimeTuning::default()),

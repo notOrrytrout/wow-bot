@@ -287,12 +287,21 @@ fn validate_economy_command(
                 true,
             ));
         }
-        GameplayCommand::VendorSell { item, count, .. }
-            if !snapshot.state.inventory.has(*item, *count) =>
+        GameplayCommand::VendorSell {
+            item,
+            item_guid,
+            count,
+            ..
+        } if !snapshot
+            .state
+            .inventory
+            .instances
+            .get(item_guid)
+            .is_some_and(|instance| instance.item == *item && instance.count >= *count) =>
         {
             return Err(reject(
                 "missing_item",
-                "sale item quantity is no longer present",
+                "sale item instance or quantity is no longer present",
                 false,
             ));
         }
@@ -403,9 +412,10 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
         | GameplayCommand::TurnInQuest { .. }
         | GameplayCommand::RequestQuestReward { .. }
         | GameplayCommand::ChooseQuestReward { .. } => PermissionSet::QUEST,
-        GameplayCommand::VendorBuy { .. } | GameplayCommand::VendorSell { .. } => {
-            PermissionSet::ECONOMY
-        }
+        GameplayCommand::QueryItem { .. } => PermissionSet::empty(),
+        GameplayCommand::VendorList { .. }
+        | GameplayCommand::VendorBuy { .. }
+        | GameplayCommand::VendorSell { .. } => PermissionSet::ECONOMY,
         GameplayCommand::TradeAccept { .. }
         | GameplayCommand::AuctionBuy { .. }
         | GameplayCommand::MailTake { .. } => {
@@ -552,6 +562,32 @@ mod tests {
         );
         assert!(
             matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "stale_state")
+        );
+    }
+
+    #[test]
+    fn unknown_spell_is_rejected_before_cast_dispatch() {
+        let action = ProposedAction {
+            id: ActionId(3),
+            task: TaskId(3),
+            origin: PlanOrigin::Operator,
+            stamp: base_stamp(),
+            command: GameplayCommand::Cast {
+                spell: 172,
+                target: None,
+            },
+        };
+        let outcome = ActionValidator::validate(
+            &snapshot(),
+            ValidationContext {
+                current: base_stamp(),
+                stage: ActivationStage::Act,
+                permissions: PermissionSet::ALL,
+            },
+            action,
+        );
+        assert!(
+            matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "unknown_spell")
         );
     }
 

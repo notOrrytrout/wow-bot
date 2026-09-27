@@ -20,6 +20,46 @@ use wow_domain::{
 };
 use wow_state::Snapshot;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CorpseLootCheck {
+    Ready,
+    MissingTarget,
+    NotCreature,
+    NotDead,
+    MissingPosition,
+    MissingMover,
+    DifferentMap,
+    OutOfRange,
+}
+
+/// Check the authoritative state that AzerothCore requires before it accepts
+/// a corpse loot request. Use a conservative 3-D center distance so vertical
+/// separation cannot pass a ground-only range check by mistake.
+pub fn check_corpse_loot(snapshot: &Snapshot, target: EntityId) -> CorpseLootCheck {
+    let Some(entity) = snapshot.state.entities.0.get(&target) else {
+        return CorpseLootCheck::MissingTarget;
+    };
+    if entity.kind != wow_state::entities::EntityKind::Unit {
+        return CorpseLootCheck::NotCreature;
+    }
+    if !entity.is_dead() {
+        return CorpseLootCheck::NotDead;
+    }
+    let Some(position) = entity.position else {
+        return CorpseLootCheck::MissingPosition;
+    };
+    let Some(mover) = active_mover(snapshot) else {
+        return CorpseLootCheck::MissingMover;
+    };
+    if mover.map != position.map {
+        return CorpseLootCheck::DifferentMap;
+    }
+    if mover.point.distance(position.point) > INTERACTION_MAX_RANGE {
+        return CorpseLootCheck::OutOfRange;
+    }
+    CorpseLootCheck::Ready
+}
+
 /// Shared spatial contract for a targeted action. Mission code selects the
 /// semantic action; this module owns reusable positioning prerequisites.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -81,6 +121,7 @@ pub fn profile(command: &GameplayCommand) -> Option<SpatialProfile> {
         | GameplayCommand::RequestQuestReward { giver: target, .. }
         | GameplayCommand::ChooseQuestReward { giver: target, .. }
         | GameplayCommand::VendorBuy { vendor: target, .. }
+        | GameplayCommand::VendorList { vendor: target }
         | GameplayCommand::VendorSell { vendor: target, .. } => (
             *target,
             0.0,
@@ -223,6 +264,15 @@ fn range_band_requirement(
     target: WorldPosition,
     band: RangeBand,
 ) -> Option<MovementRequirement> {
+    range_band_requirement_with_metric(mover, target, band, true)
+}
+
+fn range_band_requirement_with_metric(
+    mover: WorldPosition,
+    target: WorldPosition,
+    band: RangeBand,
+    three_dimensional: bool,
+) -> Option<MovementRequirement> {
     if mover.map != target.map
         || !mover.point.is_finite()
         || !target.point.is_finite()
@@ -236,18 +286,25 @@ fn range_band_requirement(
     {
         return None;
     }
-    let distance = mover.point.distance(target.point);
+    let horizontal_distance =
+        (target.point.x - mover.point.x).hypot(target.point.y - mover.point.y);
+    let vertical_distance = if three_dimensional {
+        mover.point.z - target.point.z
+    } else {
+        0.0
+    };
+    let distance = if three_dimensional {
+        mover.point.distance(target.point)
+    } else {
+        horizontal_distance
+    };
     if distance > band.maximum {
         Some(MovementRequirement {
             destination: target.point,
             acceptable_range: band.preferred,
         })
     } else if distance < band.minimum {
-        let dx = mover.point.x - target.point.x;
-        let dy = mover.point.y - target.point.y;
-        let horizontal_distance = dx.hypot(dy);
         let retreat_range = (band.minimum + 2.0).min((band.minimum + band.maximum) / 2.0);
-        let vertical_distance = mover.point.z - target.point.z;
         let horizontal_retreat = (retreat_range * retreat_range
             - vertical_distance * vertical_distance)
             .max(0.0)
@@ -258,7 +315,10 @@ fn range_band_requirement(
             }
             (mover.orientation.cos(), mover.orientation.sin())
         } else {
-            (dx / horizontal_distance, dy / horizontal_distance)
+            (
+                (mover.point.x - target.point.x) / horizontal_distance,
+                (mover.point.y - target.point.y) / horizontal_distance,
+            )
         };
         Some(MovementRequirement {
             destination: Vec3::new(
@@ -303,6 +363,7 @@ fn requires_npc_front_approach(command: &GameplayCommand) -> bool {
             | GameplayCommand::RequestQuestReward { .. }
             | GameplayCommand::ChooseQuestReward { .. }
             | GameplayCommand::VendorBuy { .. }
+            | GameplayCommand::VendorList { .. }
             | GameplayCommand::VendorSell { .. }
     )
 }
@@ -311,6 +372,13 @@ pub fn movement_requirement(
     snapshot: &Snapshot,
     command: &GameplayCommand,
 ) -> Option<MovementRequirement> {
+    if matches!(
+        command,
+        GameplayCommand::MaintainBuff { target, .. }
+            if snapshot.state.session.character_guid.map(EntityId) == Some(*target)
+    ) {
+        return None;
+    }
     let profile = profile(command)?;
     let mover = active_mover(snapshot)?;
     let target = target_position(snapshot, profile.target)?;
@@ -325,8 +393,19 @@ pub fn movement_requirement(
                 acceptable_range: NPC_FRONT_TOLERANCE,
             },
         )
+    } else if matches!(command, GameplayCommand::Loot(_)) {
+        loot_approach_requirement(mover, target, profile)
     } else if matches!(command, GameplayCommand::Attack(_)) {
-        mob_melee_approach_requirement(mover, target)
+        range_band_requirement_with_metric(
+            mover,
+            target,
+            RangeBand {
+                minimum: 0.0,
+                maximum: MOB_MELEE_MAX_RANGE,
+                preferred: MOB_MELEE_APPROACH_RANGE,
+            },
+            movement_uses_3d_distance(snapshot),
+        )
     } else if let GameplayCommand::Cast {
         spell,
         target: Some(_),
@@ -338,7 +417,12 @@ pub fn movement_requirement(
             .0
             .get(&profile.target)
             .is_some_and(|entity| entity.hostile);
-        targeted_spell_approach_requirement(mover, target, *spell, hostile_target)
+        range_band_requirement_with_metric(
+            mover,
+            target,
+            spell_range_band(*spell, hostile_target),
+            movement_uses_3d_distance(snapshot),
+        )
     } else if matches!(
         command,
         GameplayCommand::MaintainBuff { .. }
@@ -347,9 +431,18 @@ pub fn movement_requirement(
                 ..
             }
     ) {
-        mob_cast_approach_requirement(mover, target)
+        range_band_requirement_with_metric(
+            mover,
+            target,
+            RangeBand {
+                minimum: 0.0,
+                maximum: MOB_CAST_MAX_RANGE,
+                preferred: MOB_CAST_APPROACH_RANGE,
+            },
+            movement_uses_3d_distance(snapshot),
+        )
     } else {
-        range_band_requirement(
+        range_band_requirement_with_metric(
             mover,
             target,
             RangeBand {
@@ -357,22 +450,82 @@ pub fn movement_requirement(
                 maximum: profile.maximum_range,
                 preferred: profile.approach_range,
             },
+            movement_uses_3d_distance(snapshot),
         )
     }
 }
 
+/// Report whether a targeted action is authoritatively in range. `None` means
+/// the mover or target position is unavailable, or the action has no spatial profile.
+pub fn is_in_range(snapshot: &Snapshot, command: &GameplayCommand) -> Option<bool> {
+    let profile = profile(command)?;
+    let mover = active_mover(snapshot)?;
+    let target = target_position(snapshot, profile.target)?;
+    if mover.map != target.map {
+        return Some(false);
+    }
+    let distance = if matches!(command, GameplayCommand::Loot(_)) {
+        mover.point.distance(target.point)
+    } else {
+        movement_distance(snapshot, mover.point, target.point)
+    };
+    Some(distance >= profile.minimum_range && distance <= profile.maximum_range)
+}
+
+fn loot_approach_requirement(
+    mover: WorldPosition,
+    target: WorldPosition,
+    profile: SpatialProfile,
+) -> Option<MovementRequirement> {
+    if mover.map != target.map
+        || !mover.point.is_finite()
+        || !target.point.is_finite()
+        || !profile.maximum_range.is_finite()
+        || profile.maximum_range <= 0.0
+    {
+        return None;
+    }
+
+    let distance = mover.point.distance(target.point);
+    if distance <= profile.maximum_range {
+        return None;
+    }
+
+    let vertical_distance = (mover.point.z - target.point.z).abs();
+    if vertical_distance >= profile.maximum_range {
+        return None;
+    }
+    let horizontal_limit =
+        (profile.maximum_range * profile.maximum_range - vertical_distance * vertical_distance)
+            .sqrt();
+    let acceptable_range = profile
+        .approach_range
+        .min((horizontal_limit - 0.25).max(0.25));
+
+    Some(MovementRequirement {
+        destination: target.point,
+        acceptable_range,
+    })
+}
+
 /// Match the lane movement controller's arrival metric for a spatial
 /// prerequisite. Ground movement ignores Z; flight movement uses 3-D distance.
-fn movement_distance(snapshot: &Snapshot, from: Vec3, to: Vec3) -> f32 {
+fn movement_uses_3d_distance(snapshot: &Snapshot) -> bool {
     let controlled_mover = snapshot.state.control.mover.is_some();
     let flags = if controlled_mover {
         snapshot.state.control.movement_flags
     } else {
         snapshot.state.position.flags
     };
-    match wow_navigation::LocomotionMode::from_server_flags(controlled_mover, flags) {
-        wow_navigation::LocomotionMode::Ground => (to.x - from.x).hypot(to.y - from.y),
-        wow_navigation::LocomotionMode::Flight => from.distance(to),
+    wow_navigation::LocomotionMode::from_server_flags(controlled_mover, flags)
+        == wow_navigation::LocomotionMode::Flight
+}
+
+fn movement_distance(snapshot: &Snapshot, from: Vec3, to: Vec3) -> f32 {
+    if movement_uses_3d_distance(snapshot) {
+        from.distance(to)
+    } else {
+        (to.x - from.x).hypot(to.y - from.y)
     }
 }
 
@@ -380,6 +533,13 @@ pub fn facing_requirement(
     snapshot: &Snapshot,
     command: &GameplayCommand,
 ) -> Option<FacingRequirement> {
+    if matches!(
+        command,
+        GameplayCommand::MaintainBuff { target, .. }
+            if snapshot.state.session.character_guid.map(EntityId) == Some(*target)
+    ) {
+        return None;
+    }
     let profile = profile(command)?;
     let tolerance = profile.facing_tolerance?;
     let mover = active_mover(snapshot)?;
@@ -508,6 +668,106 @@ mod tests {
         Snapshot::from_state(&state)
     }
 
+    fn corpse_snapshot(target: WorldPosition) -> Snapshot {
+        let mut snapshot = snapshot(
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(0.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+            target,
+        );
+        snapshot
+            .state
+            .entities
+            .0
+            .get_mut(&EntityId(7))
+            .unwrap()
+            .health = Some((0, 100));
+        snapshot
+    }
+
+    #[test]
+    fn corpse_loot_checks_require_a_present_dead_unit_and_conservative_range() {
+        let nearby = WorldPosition {
+            map: 1,
+            point: Vec3::new(3.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut snapshot = corpse_snapshot(nearby);
+        assert_eq!(
+            check_corpse_loot(&snapshot, EntityId(7)),
+            CorpseLootCheck::Ready
+        );
+
+        snapshot.state.entities.0.remove(&EntityId(7));
+        assert_eq!(
+            check_corpse_loot(&snapshot, EntityId(7)),
+            CorpseLootCheck::MissingTarget
+        );
+
+        let mut snapshot = corpse_snapshot(nearby);
+        snapshot
+            .state
+            .entities
+            .0
+            .get_mut(&EntityId(7))
+            .unwrap()
+            .health = Some((1, 100));
+        assert_eq!(
+            check_corpse_loot(&snapshot, EntityId(7)),
+            CorpseLootCheck::NotDead
+        );
+
+        let mut snapshot = corpse_snapshot(nearby);
+        snapshot
+            .state
+            .entities
+            .0
+            .get_mut(&EntityId(7))
+            .unwrap()
+            .kind = EntityKind::Player;
+        assert_eq!(
+            check_corpse_loot(&snapshot, EntityId(7)),
+            CorpseLootCheck::NotCreature
+        );
+
+        let mut snapshot = corpse_snapshot(nearby);
+        snapshot
+            .state
+            .entities
+            .0
+            .get_mut(&EntityId(7))
+            .unwrap()
+            .position = None;
+        assert_eq!(
+            check_corpse_loot(&snapshot, EntityId(7)),
+            CorpseLootCheck::MissingPosition
+        );
+
+        let mut snapshot = corpse_snapshot(nearby);
+        snapshot.state.position.player = None;
+        assert_eq!(
+            check_corpse_loot(&snapshot, EntityId(7)),
+            CorpseLootCheck::MissingMover
+        );
+
+        let snapshot = corpse_snapshot(WorldPosition {
+            point: Vec3::new(0.0, 0.0, 5.1),
+            ..nearby
+        });
+        assert_eq!(
+            check_corpse_loot(&snapshot, EntityId(7)),
+            CorpseLootCheck::OutOfRange
+        );
+
+        let snapshot = corpse_snapshot(WorldPosition { map: 2, ..nearby });
+        assert_eq!(
+            check_corpse_loot(&snapshot, EntityId(7)),
+            CorpseLootCheck::DifferentMap
+        );
+    }
+
     #[test]
     fn range_and_facing_are_shared_for_targeted_actions() {
         let s = snapshot(
@@ -543,6 +803,45 @@ mod tests {
         );
         let requirement = movement_requirement(&s, &GameplayCommand::Loot(EntityId(7))).unwrap();
         assert_eq!(requirement.acceptable_range, 4.0);
+    }
+
+    #[test]
+    fn authoritative_range_status_distinguishes_arrival_from_missing_or_distant_state() {
+        let mover = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let command = GameplayCommand::Loot(EntityId(7));
+        let nearby = snapshot(
+            mover,
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(3.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+        );
+        assert_eq!(is_in_range(&nearby, &command), Some(true));
+        let distant = snapshot(
+            mover,
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(10.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+        );
+        assert_eq!(is_in_range(&distant, &command), Some(false));
+
+        let mut missing = wow_state::AuthoritativeState::default();
+        missing.entities.0.insert(
+            EntityId(7),
+            EntityState {
+                id: EntityId(7),
+                kind: EntityKind::Unit,
+                ..Default::default()
+            },
+        );
+        assert_eq!(is_in_range(&Snapshot::from_state(&missing), &command), None);
     }
 
     #[test]
@@ -599,6 +898,59 @@ mod tests {
         s.state.control.mover = Some(EntityId(9));
         s.state.control.movement_flags = 0x0200_0000;
         assert!(movement_requirement(&s, &command).is_some());
+    }
+
+    #[test]
+    fn ground_spell_range_uses_horizontal_distance_like_movement_arrival() {
+        let band = spell_range_band(686, true);
+        let horizontal = band.maximum - 1.0;
+        let vertical = band.maximum;
+        let mover = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let target = WorldPosition {
+            map: 1,
+            point: Vec3::new(horizontal, 0.0, vertical),
+            orientation: 0.0,
+        };
+        let command = GameplayCommand::Cast {
+            spell: 686,
+            target: Some(EntityId(7)),
+        };
+        let mut s = snapshot(mover, target);
+
+        assert!(horizontal <= band.maximum);
+        assert!(mover.point.distance(target.point) > band.maximum);
+        assert!(movement_requirement(&s, &command).is_none());
+
+        s.state.control.mover = Some(EntityId(9));
+        s.state.control.movement_flags = 0x0200_0000;
+        assert!(movement_requirement(&s, &command).is_some());
+    }
+
+    #[test]
+    fn self_buff_does_not_move_or_turn_toward_stale_self_position() {
+        let mover = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let stale_self_position = WorldPosition {
+            map: 1,
+            point: Vec3::new(21.5, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut s = snapshot(mover, stale_self_position);
+        s.state.session.character_guid = Some(7);
+        let command = GameplayCommand::MaintainBuff {
+            spell: 687,
+            target: EntityId(7),
+        };
+
+        assert!(movement_requirement(&s, &command).is_none());
+        assert!(facing_requirement(&s, &command).is_none());
     }
 
     #[test]

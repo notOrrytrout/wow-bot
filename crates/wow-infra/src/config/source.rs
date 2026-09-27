@@ -341,6 +341,7 @@ roster_file = "bots.toml"
 
 [runtime_tuning.movement]
 travel_speed_form_min_yards = 30
+path_straightness = 0.75
 
 [runtime_tuning.maintenance]
 auto_mount_enabled = true
@@ -372,6 +373,10 @@ character = "Test Character"
                 .movement
                 .travel_speed_form_min_yards,
             30
+        );
+        assert_eq!(
+            config.runtime.runtime_tuning.movement.path_straightness,
+            0.75
         );
         assert!(config.runtime.runtime_tuning.maintenance.auto_mount_enabled);
         assert_eq!(

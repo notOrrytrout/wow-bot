@@ -57,6 +57,7 @@ struct PendingFacing {
     mover: Option<EntityId>,
     orientation: f32,
     tolerance: f32,
+    started_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,12 +81,16 @@ const QUEST_START_ARRIVAL_RANGE: f32 = 5.0;
 const QUEST_START_EMPTY_LOG_RADIUS_YARDS: f32 = 200.0;
 const QUEST_START_HUB_SWEEP_RADIUS_YARDS: f32 = 40.0;
 const QUEST_SEARCH_ARRIVAL_RANGE: f32 = 18.0;
+const QUEST_ITEM_SOURCE_SEARCH_RADIUS: f32 = 5_000.0;
+const QUEST_SEARCH_ROAM_RADIUS: f32 = 25.0;
 const QUEST_TOOL_SEARCH_RANGE: f32 = 12.0;
 const MAX_INTERACTION_RETRIES: usize = 512;
 const MAX_CORPSE_RECLAIM_ATTEMPTS: u8 = 3;
+const LOOT_ERROR_MASTER_INV_FULL: u8 = 12;
 const CORPSE_HOSTILE_CLEARANCE_YARDS: f32 = 18.0;
 const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MOVEMENT_STEP_INTERVAL: Duration = Duration::from_millis(100);
+const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
 
 #[derive(Clone, Debug)]
@@ -100,6 +105,10 @@ enum PendingQuestAction {
         target: EntityId,
         baseline_generation: u64,
         started: Instant,
+    },
+    CorpseLootDelay {
+        target: EntityId,
+        arrived_at: Instant,
     },
     Loot {
         item: u32,
@@ -161,11 +170,13 @@ pub struct LaneEngine {
     next_movement: u64,
     route_job: Option<RoutePlanJob>,
     pending_facing: Option<PendingFacing>,
+    assumed_facing: Option<(EntityId, f32, Instant)>,
     pending_quest_action: Option<PendingQuestAction>,
     interaction_retry_after: BTreeMap<(u32, EntityId), (u8, Instant)>,
     search_attempts: BTreeMap<(u32, usize, u32), BTreeSet<(u32, u32, u32)>>,
     quest_start_search_attempts: BTreeSet<(u32, u32, u32, u32)>,
     search_retry_after: BTreeMap<(u32, usize, u32), Instant>,
+    search_roam_cursor: BTreeMap<(u32, usize, u32), u8>,
     current_work: Option<QuestWorkRuntime>,
     last_wait_reason: Option<String>,
     last_dispatch: DispatchOutcome,
@@ -176,6 +187,14 @@ pub struct LaneEngine {
     travel_preparation_skipped: Option<(QuestWorkId, WorldPosition)>,
     diagnostics: Option<DiagnosticLogger>,
     credited_quest_targets: BTreeSet<(u32, usize, EntityId)>,
+    loot_retry_after: BTreeMap<EntityId, (u8, Option<Instant>)>,
+    bag_full_loot_targets: BTreeSet<EntityId>,
+    bag_relief_list_pending: bool,
+    bag_relief_sale_pending: Option<(EntityId, u32, Instant)>,
+    bag_relief_rejected_sales: BTreeSet<EntityId>,
+    queried_item_templates: BTreeSet<u32>,
+    looted_corpses: BTreeSet<EntityId>,
+    corpses_ready_to_loot: BTreeSet<EntityId>,
     los_blocked: BTreeSet<EntityId>,
     los_attempts: BTreeMap<EntityId, u8>,
     server_range_recovery: BTreeMap<EntityId, (crate::action::spatial::ServerRangeCorrection, u8)>,
@@ -218,11 +237,13 @@ impl LaneEngine {
             next_movement: 1,
             route_job: None,
             pending_facing: None,
+            assumed_facing: None,
             pending_quest_action: None,
             interaction_retry_after: BTreeMap::new(),
             search_attempts: BTreeMap::new(),
             quest_start_search_attempts: BTreeSet::new(),
             search_retry_after: BTreeMap::new(),
+            search_roam_cursor: BTreeMap::new(),
             current_work: None,
             last_wait_reason: None,
             last_dispatch: DispatchOutcome::Rejected,
@@ -233,6 +254,14 @@ impl LaneEngine {
             travel_preparation_skipped: None,
             diagnostics: None,
             credited_quest_targets: BTreeSet::new(),
+            loot_retry_after: BTreeMap::new(),
+            bag_full_loot_targets: BTreeSet::new(),
+            bag_relief_list_pending: false,
+            bag_relief_sale_pending: None,
+            bag_relief_rejected_sales: BTreeSet::new(),
+            queried_item_templates: BTreeSet::new(),
+            looted_corpses: BTreeSet::new(),
+            corpses_ready_to_loot: BTreeSet::new(),
             los_blocked: BTreeSet::new(),
             los_attempts: BTreeMap::new(),
             server_range_recovery: BTreeMap::new(),
@@ -314,8 +343,197 @@ impl LaneEngine {
     async fn handle(&mut self, msg: LaneMessage) -> bool {
         match msg {
             LaneMessage::Observation(o) => {
+                match &o {
+                    ProtocolObservation::InventoryInstances { items } => {
+                        let before = &self.state.authoritative.inventory.items;
+                        let mut after = std::collections::BTreeMap::<u32, u32>::new();
+                        for instance in items {
+                            *after.entry(instance.item).or_default() += u32::from(instance.count);
+                        }
+                        if before != &after {
+                            let gained: std::collections::BTreeMap<_, _> = after
+                                .iter()
+                                .filter_map(|(item, count)| {
+                                    let increase = count.saturating_sub(
+                                        before.get(item).copied().unwrap_or_default(),
+                                    );
+                                    (increase > 0).then_some((*item, increase))
+                                })
+                                .collect();
+                            let lost: std::collections::BTreeMap<_, _> = before
+                                .iter()
+                                .filter_map(|(item, count)| {
+                                    let decrease = count.saturating_sub(
+                                        after.get(item).copied().unwrap_or_default(),
+                                    );
+                                    (decrease > 0).then_some((*item, decrease))
+                                })
+                                .collect();
+                            tracing::info!(
+                                lane=?self.state.lane,
+                                stacks=items.len(),
+                                free_slots=self.state.authoritative.inventory.free_slots,
+                                ?gained,
+                                ?lost,
+                                "authoritative inventory snapshot changed"
+                            );
+                        }
+                    }
+                    ProtocolObservation::InventoryFreeSlots { count } => {
+                        tracing::info!(
+                            lane=?self.state.lane,
+                            previous=self.state.authoritative.inventory.free_slots,
+                            current=count,
+                            "authoritative inventory free-slot count changed"
+                        );
+                    }
+                    ProtocolObservation::LootOpened { target, ownership } => {
+                        tracing::info!(
+                            lane=?self.state.lane,
+                            ?target,
+                            ?ownership,
+                            loot_generation=self.state.authoritative.inventory.loot_generation,
+                            bot_loot_generation=self.state.authoritative.inventory.bot_loot_generation,
+                            "authoritative loot window opened"
+                        );
+                    }
+                    ProtocolObservation::LootClosed { ownership } => {
+                        tracing::info!(
+                            lane=?self.state.lane,
+                            ?ownership,
+                            target=?self.state.authoritative.inventory.current_loot,
+                            loot_generation=self.state.authoritative.inventory.loot_generation,
+                            bot_loot_generation=self.state.authoritative.inventory.bot_loot_generation,
+                            "authoritative loot window closed"
+                        );
+                    }
+                    ProtocolObservation::QuestProgress {
+                        quest,
+                        objectives,
+                        complete,
+                    } => {
+                        tracing::info!(lane=?self.state.lane, quest, ?objectives, complete, "authoritative quest progress updated");
+                    }
+                    ProtocolObservation::QuestCompleted { quest } => {
+                        tracing::info!(lane=?self.state.lane, quest, "authoritative quest completion received");
+                    }
+                    ProtocolObservation::QuestRemoved { quest } => {
+                        tracing::info!(lane=?self.state.lane, quest, "quest removed from authoritative journal");
+                    }
+                    ProtocolObservation::QuestTurnInDialog { quest, dialog } => {
+                        tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, stage=?dialog.stage, "authoritative quest turn-in dialog updated");
+                    }
+                    _ => {}
+                }
+                if let ProtocolObservation::InventoryInstances { items } = &o {
+                    let missing: Vec<u32> = items
+                        .iter()
+                        .map(|instance| instance.item)
+                        .filter(|item| {
+                            *item != 0
+                                && !self
+                                    .state
+                                    .authoritative
+                                    .inventory
+                                    .item_metadata
+                                    .contains_key(item)
+                                && self.queried_item_templates.insert(*item)
+                        })
+                        .collect();
+                    for item in missing {
+                        self.propose_command(GameplayCommand::QueryItem { item }, false)
+                            .await;
+                    }
+                }
                 if matches!(o, ProtocolObservation::LeftWorld) {
                     self.reset_session_work();
+                }
+                match &o {
+                    ProtocolObservation::LootRejected {
+                        target,
+                        loot_type,
+                        error,
+                    } => {
+                        let full_bag = *error == Some(LOOT_ERROR_MASTER_INV_FULL);
+                        if full_bag {
+                            self.bag_full_loot_targets.insert(*target);
+                            self.loot_retry_after.insert(*target, (u8::MAX, None));
+                            self.bag_relief_list_pending = false;
+                            self.bag_relief_sale_pending = None;
+                            self.bag_relief_rejected_sales.clear();
+                        }
+                        if !full_bag {
+                            let (attempts, _) = self
+                                .loot_retry_after
+                                .get(target)
+                                .copied()
+                                .unwrap_or_default();
+                            let attempts = attempts.saturating_add(1);
+                            let retry_after = match attempts {
+                                1 => Some(Instant::now() + Duration::from_secs(5)),
+                                2 => Some(Instant::now() + Duration::from_secs(20)),
+                                _ => None,
+                            };
+                            self.loot_retry_after
+                                .insert(*target, (attempts, retry_after));
+                        }
+                        if matches!(
+                            self.pending_quest_action,
+                            Some(PendingQuestAction::Loot { target: pending, .. }
+                                | PendingQuestAction::CorpseLoot { target: pending, .. }
+                                | PendingQuestAction::CorpseLootDelay { target: pending, .. })
+                                if pending == *target
+                        ) {
+                            self.pending_quest_action = None;
+                        }
+                        if self
+                            .post_combat_loot
+                            .as_ref()
+                            .is_some_and(|(pending, _, _)| pending == target)
+                        {
+                            self.post_combat_loot = None;
+                        }
+                        if *error == Some(LOOT_ERROR_MASTER_INV_FULL) {
+                            tracing::warn!(lane=?self.state.lane, ?target, loot_type, ?error, "loot was rejected because the inventory is full");
+                        } else {
+                            let (attempts, retry_after) = self
+                                .loot_retry_after
+                                .get(target)
+                                .copied()
+                                .unwrap_or_default();
+                            tracing::warn!(lane=?self.state.lane, ?target, loot_type, ?error, attempts, ?retry_after, "loot request rejected; target will retry after a delay");
+                        }
+                    }
+                    ProtocolObservation::LootOpened {
+                        target,
+                        ownership: wow_state::LootOwnership::Bot,
+                    } => {
+                        self.loot_retry_after.remove(target);
+                    }
+                    ProtocolObservation::EntityUpsert { entity }
+                        if entity.health.is_some_and(|(current, _)| current > 0) =>
+                    {
+                        self.loot_retry_after.remove(&entity.id);
+                        self.looted_corpses.remove(&entity.id);
+                    }
+                    ProtocolObservation::EntityRemoved { entity } => {
+                        self.loot_retry_after.remove(entity);
+                        self.looted_corpses.remove(entity);
+                    }
+                    _ => {}
+                }
+                if let ProtocolObservation::InventoryFreeSlots { count } = &o
+                    && *count > 0
+                {
+                    for target in std::mem::take(&mut self.bag_full_loot_targets) {
+                        self.loot_retry_after.remove(&target);
+                    }
+                    self.bag_relief_list_pending = false;
+                    self.bag_relief_sale_pending = None;
+                    self.bag_relief_rejected_sales.clear();
+                }
+                if matches!(o, ProtocolObservation::VendorOpened { .. }) {
+                    self.bag_relief_list_pending = false;
                 }
                 if let ProtocolObservation::CastFailed {
                     spell,
@@ -473,7 +691,21 @@ impl LaneEngine {
                     } => Some(("controlled_mover", *position, None, *mover)),
                     _ => None,
                 };
+                let owned_kill = match &o {
+                    ProtocolObservation::CreatureKilled { killer, victim }
+                        if self.state.authoritative.session.character_guid == Some(killer.0)
+                            || self.state.authoritative.pet.guid == Some(*killer) =>
+                    {
+                        Some(*victim)
+                    }
+                    _ => None,
+                };
                 let delta = reduce(&mut self.state.authoritative, o);
+                if let Some(target) = owned_kill {
+                    let corpse = self.state.authoritative.entities.0.get(&target).cloned();
+                    self.post_combat_loot = Some((target, Instant::now(), corpse));
+                    tracing::info!(lane=?self.state.lane, ?target, "server kill log credited the player or pet; corpse loot queued before the next target");
+                }
                 if let Some((source, position, client_time, mover)) = movement_position {
                     let source_is_active = match source {
                         "player" => self.state.authoritative.control.mover.is_none(),
@@ -497,6 +729,12 @@ impl LaneEngine {
                     tracing::info!(lane=?self.state.lane, orientation, "authoritative facing update confirmed; targeted action may be retried");
                     self.pending_facing = None;
                 }
+                if facing_observation.is_some_and(|(mover, _)| {
+                    self.assumed_facing
+                        .is_some_and(|(assumed_mover, _, _)| Some(assumed_mover) == mover)
+                }) {
+                    self.assumed_facing = None;
+                }
                 if !delta.changed.is_empty() {
                     tracing::debug!(lane=?self.state.lane, revision=?delta.revision, changed=?delta.changed, "authoritative state updated");
                     self.diagnostic(
@@ -518,9 +756,13 @@ impl LaneEngine {
                 self.cancel_route_job();
                 self.pending_movement = None;
                 self.pending_facing = None;
+                self.assumed_facing = None;
                 self.pending_quest_action = None;
                 self.current_work = None;
                 self.credited_quest_targets.clear();
+                self.loot_retry_after.clear();
+                self.looted_corpses.clear();
+                self.corpses_ready_to_loot.clear();
                 self.los_blocked.clear();
                 self.los_attempts.clear();
                 self.server_range_recovery.clear();
@@ -691,6 +933,11 @@ impl LaneEngine {
         if self.pending_movement.is_some() {
             return self.tick_movement().await;
         }
+        if !self.bag_full_loot_targets.is_empty()
+            && let Some(result) = self.tick_bag_relief(&snapshot).await
+        {
+            return result;
+        }
         if self.maintenance_eligible() {
             if let Some(result) = self.tick_maintenance().await {
                 return result;
@@ -715,6 +962,136 @@ impl LaneEngine {
                 self.tick_group_encounter().await
             }
         }
+    }
+
+    async fn tick_bag_relief(&mut self, snapshot: &Snapshot) -> Option<bool> {
+        let Some(position) = self
+            .state
+            .authoritative
+            .control
+            .active_position(self.state.authoritative.position.player)
+        else {
+            self.waiting(
+                "inventory is full; waiting for the active mover position before vendor travel"
+                    .into(),
+            );
+            return Some(true);
+        };
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let Some((vendor_entry, destination)) = catalog.nearest_vendor(
+            wow_infra::world_knowledge::VendorKind::Sell,
+            position.map,
+            position.point,
+        ) else {
+            self.waiting(format!(
+                "inventory is full; no known sell vendor is available on map {}",
+                position.map
+            ));
+            return Some(true);
+        };
+
+        if let Some(vendor) = self
+            .state
+            .authoritative
+            .entities
+            .0
+            .values()
+            .filter(|entity| {
+                entity.entry == vendor_entry
+                    && entity.kind == wow_state::entities::EntityKind::Unit
+                    && entity.interactable
+            })
+            .filter_map(|entity| entity.position.map(|p| (entity, p)))
+            .filter(|(_, p)| p.map == position.map && p.point.distance(position.point) <= 5.0)
+            .min_by(|(_, a), (_, b)| {
+                a.point
+                    .distance(position.point)
+                    .total_cmp(&b.point.distance(position.point))
+            })
+            .map(|(entity, _)| entity.id)
+        {
+            if snapshot.state.inventory.vendor != Some(vendor) {
+                if !self.bag_relief_list_pending {
+                    self.bag_relief_list_pending = true;
+                    return Some(
+                        self.propose_command(GameplayCommand::VendorList { vendor }, false)
+                            .await,
+                    );
+                }
+                return Some(true);
+            }
+
+            if let Some((guid, baseline, started)) = self.bag_relief_sale_pending {
+                let count = snapshot
+                    .state
+                    .inventory
+                    .instances
+                    .get(&guid)
+                    .map_or(0, |instance| instance.count);
+                if count < baseline {
+                    self.bag_relief_sale_pending = None;
+                } else if started.elapsed() < Duration::from_secs(5) {
+                    return Some(true);
+                } else {
+                    self.bag_relief_rejected_sales.insert(guid);
+                    self.bag_relief_sale_pending = None;
+                }
+            }
+            if let Some(candidate) = wow_policy::economy::vendor::safe_gray_item_sales(snapshot)
+                .into_iter()
+                .filter(|candidate| !self.bag_relief_rejected_sales.contains(&candidate.guid))
+                .next()
+            {
+                let sent = self
+                    .propose_command(
+                        GameplayCommand::VendorSell {
+                            vendor,
+                            item: candidate.item,
+                            item_guid: candidate.guid,
+                            count: candidate.count,
+                        },
+                        false,
+                    )
+                    .await;
+                if sent {
+                    self.bag_relief_sale_pending =
+                        Some((candidate.guid, candidate.count, Instant::now()));
+                }
+                return Some(sent);
+            }
+            self.waiting("inventory is full; vendor visit found no safe gray items to sell".into());
+            return Some(true);
+        }
+
+        if position.point.distance(destination) <= 5.0 {
+            self.waiting(format!(
+                "inventory is full; waiting for vendor entry {vendor_entry} to become visible"
+            ));
+            return Some(true);
+        }
+        let work = self.set_work(QuestWorkKey::TravelToObjective {
+            quest: 0,
+            objective: 0,
+            destination: WorldPosition {
+                map: position.map,
+                point: destination,
+                orientation: 0.0,
+            },
+        });
+        self.queue_world_movement(
+            WorldPosition {
+                map: position.map,
+                point: destination,
+                orientation: 0.0,
+            },
+            5.0,
+            None,
+            None,
+            PlanOrigin::SystemPolicy,
+            work,
+            MovementPurpose::SearchArea,
+        );
+        Some(true)
     }
 
     async fn tick_gather(&mut self, resource: &str) -> bool {
@@ -1957,6 +2334,7 @@ impl LaneEngine {
             let worker_controller = controller.clone();
             let route_start = player;
             let route_destination = movement.destination.point;
+            let path_straightness = self.runtime_tuning.movement.path_straightness;
             let route_planning_permit = permit;
             let stamped = crate::runtime::Stamped {
                 stamp: self.state.stamp(),
@@ -1964,9 +2342,12 @@ impl LaneEngine {
             };
             let task = tokio::task::spawn_blocking(move || {
                 let _permit = route_planning_permit;
-                worker_controller.plan_route_cancellable(route_start, route_destination, &|| {
-                    worker_token.is_cancelled()
-                })
+                worker_controller.plan_route_cancellable_with_straightness(
+                    route_start,
+                    route_destination,
+                    path_straightness,
+                    &|| worker_token.is_cancelled(),
+                )
             });
             self.route_job = Some(RoutePlanJob {
                 token: crate::movement::ReplanToken {
@@ -1982,13 +2363,24 @@ impl LaneEngine {
             self.pending_movement = Some(movement);
             return true;
         }
+        let run_speed = self
+            .state
+            .authoritative
+            .position
+            .run_speed_yards_per_second
+            .filter(|speed| speed.is_finite() && (0.1..=100.0).contains(speed))
+            .unwrap_or(BASE_RUN_SPEED_YARDS_PER_SECOND);
+        let maximum_step = run_speed * MOVEMENT_STEP_INTERVAL.as_secs_f32();
         let step_result = match &self.movement_controller {
-            Some(controller) => controller.next_step(
-                player,
-                movement.destination.point,
-                movement.acceptable_range,
-                locomotion,
-            ),
+            Some(controller) => controller
+                .clone()
+                .with_maximum_step(maximum_step)
+                .next_step(
+                    player,
+                    movement.destination.point,
+                    movement.acceptable_range,
+                    locomotion,
+                ),
             None => Err(wow_navigation::NavigationError::MissingNavigationData),
         };
         let next = match step_result {
@@ -2000,8 +2392,20 @@ impl LaneEngine {
                         "work_id": movement.work.id.0,
                         "locomotion": format!("{locomotion:?}"),
                         "remaining": distance,
+                        "run_speed_yards_per_second": run_speed,
+                        "step_interval_ms": MOVEMENT_STEP_INTERVAL.as_millis(),
                         "purpose": format!("{:?}", movement.purpose),
                         "step_remaining": step.remaining,
+                        "from": {
+                            "x": player.point.x,
+                            "y": player.point.y,
+                            "z": player.point.z,
+                        },
+                        "to": {
+                            "x": step.next.x,
+                            "y": step.next.y,
+                            "z": step.next.z,
+                        },
                     }),
                 );
                 step.next
@@ -2011,6 +2415,10 @@ impl LaneEngine {
                 return true;
             }
             Err(error) => {
+                let no_route = matches!(&error, wow_navigation::NavigationError::NoRoute);
+                if no_route {
+                    movement.route_failures = movement.route_failures.saturating_add(1);
+                }
                 self.diagnostic(
                     DiagnosticStream::Navigation,
                     "movement_step_rejected",
@@ -2019,9 +2427,21 @@ impl LaneEngine {
                         "locomotion": format!("{locomotion:?}"),
                         "purpose": format!("{:?}", movement.purpose),
                         "reason": format!("{error:?}"),
+                        "attempt": movement.route_failures,
                     }),
                 );
+                if no_route
+                    && movement.purpose == MovementPurpose::SearchArea
+                    && movement.route_failures >= 3
+                {
+                    self.record_failed_search_destination(&movement);
+                    tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, x=movement.destination.point.x, y=movement.destination.point.y, attempt=movement.route_failures, "search destination has no route after three step attempts; trying another destination");
+                    self.stop_owned_movement(movement.purpose).await;
+                    self.current_work = None;
+                    return true;
+                }
                 self.waiting(format!("movement step rejected: {error:?}"));
+                movement.last_step = Some(Instant::now());
                 self.pending_movement = Some(movement);
                 return true;
             }
@@ -2066,6 +2486,30 @@ impl LaneEngine {
                 | ObjectiveResolution::GroundedScriptedItemUse { .. }
                 | ObjectiveResolution::GroundedQuestTool { .. }
         )
+    }
+
+    fn next_incomplete_quest(&self) -> Option<u32> {
+        let now = Instant::now();
+        let active = &self.state.authoritative.quests.active;
+        let available = active
+            .iter()
+            .find(|(quest, progress)| {
+                !progress.complete
+                    && !self
+                        .search_retry_after
+                        .iter()
+                        .any(|((retry_quest, _, _), retry_after)| {
+                            retry_quest == *quest && *retry_after > now
+                        })
+            })
+            .map(|(&quest, _)| quest);
+
+        available.or_else(|| {
+            active
+                .iter()
+                .find(|(_, progress)| !progress.complete)
+                .map(|(&quest, _)| quest)
+        })
     }
 
     async fn tick_quest(&mut self) -> bool {
@@ -2158,7 +2602,10 @@ impl LaneEngine {
             .quests
             .offers
             .iter()
-            .next()
+            .find(|(quest, _)| {
+                !self.state.authoritative.quests.active.contains_key(quest)
+                    && !self.state.authoritative.quests.completed.contains(quest)
+            })
             .map(|(&quest, offer)| (quest, offer.giver));
         if let Some((quest, giver)) = offer {
             self.set_work(QuestWorkKey::AcquireQuest { quest: Some(quest) });
@@ -2227,14 +2674,7 @@ impl LaneEngine {
             }
         }
 
-        let incomplete_quest = self
-            .state
-            .authoritative
-            .quests
-            .active
-            .iter()
-            .find(|(_, progress)| !progress.complete)
-            .map(|(&quest, _)| quest);
+        let incomplete_quest = self.next_incomplete_quest();
         if let Some(quest) = incomplete_quest {
             return self.tick_incomplete_quest(quest).await;
         }
@@ -2272,13 +2712,28 @@ impl LaneEngine {
                 .await;
         }
         let snapshot = Snapshot::from_state(&self.state.authoritative);
-        let excluded: BTreeSet<(usize, EntityId)> = self
+        let now = Instant::now();
+        let mut excluded: BTreeSet<(usize, EntityId)> = self
             .credited_quest_targets
             .iter()
             .filter_map(|(credited_quest, objective, target)| {
                 (*credited_quest == quest).then_some((*objective, *target))
             })
             .collect();
+        excluded.extend(
+            self.looted_corpses
+                .iter()
+                .map(|target| (usize::MAX, *target)),
+        );
+        excluded.extend(
+            self.loot_retry_after
+                .iter()
+                .filter_map(|(target, (_, retry_after))| {
+                    retry_after
+                        .is_none_or(|deadline| now < deadline)
+                        .then_some((usize::MAX, *target))
+                }),
+        );
         match resolve_with_exclusions(&snapshot, quest, &excluded) {
             ObjectiveResolution::WaitingForDefinition => {
                 self.waiting(format!(
@@ -2603,7 +3058,10 @@ impl LaneEngine {
                     &candidates,
                     arrived.then_some(destination.point),
                 ) else {
-                    self.waiting(format!("quest {quest} exhausted nearby {source} hints for objective {objective}; waiting before a bounded retry"));
+                    let origin = current_pos.unwrap_or(destination.point);
+                    let roam = self.next_search_roam_destination(key, origin);
+                    tracing::info!(lane=?self.state.lane, quest, objective, x=roam.x, y=roam.y, "quest objective search found no new hint; roaming before another search");
+                    self.queue_search_movement(roam, work).await;
                     return true;
                 };
                 tracing::info!(lane=?self.state.lane, quest, objective, work_id=?work.id, %source, x=destination.x, y=destination.y, "quest scheduler starting bounded objective-area travel");
@@ -2624,7 +3082,7 @@ impl LaneEngine {
                     .position
                     .player
                     .map(|player| player.point);
-                let candidates = bounded_candidates(
+                let candidates = bounded_candidates_within(
                     destinations
                         .into_iter()
                         .filter(|position| {
@@ -2637,6 +3095,7 @@ impl LaneEngine {
                         .map(|position| position.point)
                         .collect(),
                     current_pos.unwrap_or_default(),
+                    QUEST_ITEM_SOURCE_SEARCH_RADIUS,
                 );
                 let reached_destination = current_pos.and_then(|position| {
                     candidates
@@ -2648,7 +3107,10 @@ impl LaneEngine {
                 let Some(destination) =
                     self.next_search_destination(key, &candidates, reached_destination)
                 else {
-                    self.waiting(format!("quest {quest} exhausted nearby loot-source hints for item {item} at {current}/{required}; waiting before a bounded retry"));
+                    let origin = current_pos.unwrap_or_default();
+                    let roam = self.next_search_roam_destination(key, origin);
+                    tracing::info!(lane=?self.state.lane, quest, item, current, required, x=roam.x, y=roam.y, "quest item search found no new source hint; roaming before another search");
+                    self.queue_search_movement(roam, work).await;
                     return true;
                 };
                 if reached_destination != Some(destination) {
@@ -2803,6 +3265,31 @@ impl LaneEngine {
             .insert(search_point_key(movement.destination.point));
     }
 
+    fn record_failed_search_destination(&mut self, movement: &PendingMovement) {
+        if matches!(
+            &movement.work.key,
+            QuestWorkKey::AcquireQuest { quest: None }
+        ) {
+            self.quest_start_search_attempts
+                .insert(quest_start_search_point_key(
+                    movement.destination.map,
+                    movement.destination.point,
+                ));
+            return;
+        }
+        let key = match &movement.work.key {
+            QuestWorkKey::TravelToObjective {
+                quest, objective, ..
+            } => (*quest, *objective, 0),
+            QuestWorkKey::CollectItem { quest, item } => (*quest, usize::MAX, *item),
+            _ => return,
+        };
+        self.search_attempts
+            .entry(key)
+            .or_default()
+            .insert(search_point_key(movement.destination.point));
+    }
+
     fn defer_quest_giver(&mut self, giver: EntityId) {
         let attempts = self
             .giver_retry_after
@@ -2908,8 +3395,19 @@ impl LaneEngine {
         }
         tried.clear();
         self.search_retry_after
-            .insert(key, now + Duration::from_secs(30));
+            .insert(key, now + Duration::from_secs(5));
         None
+    }
+
+    fn next_search_roam_destination(&mut self, key: (u32, usize, u32), origin: Vec3) -> Vec3 {
+        let cursor = self.search_roam_cursor.entry(key).or_default();
+        let angle = f32::from(*cursor % 8) * std::f32::consts::FRAC_PI_4;
+        *cursor = cursor.wrapping_add(1);
+        Vec3::new(
+            origin.x + angle.cos() * QUEST_SEARCH_ROAM_RADIUS,
+            origin.y + angle.sin() * QUEST_SEARCH_ROAM_RADIUS,
+            origin.z,
+        )
     }
 
     fn pending_quest_action_blocks(&mut self) -> bool {
@@ -2917,6 +3415,27 @@ impl LaneEngine {
             return false;
         };
         match pending {
+            PendingQuestAction::CorpseLootDelay { target, arrived_at } => {
+                if self.state.authoritative.inventory.current_loot == Some(target)
+                    && matches!(
+                        self.state.authoritative.inventory.current_loot_owner,
+                        Some(wow_state::LootOwnership::Player)
+                    )
+                {
+                    self.pending_quest_action = None;
+                    self.post_combat_loot = None;
+                    return false;
+                }
+                if arrived_at.elapsed() < Duration::from_secs(1) {
+                    self.waiting(format!(
+                        "reached corpse {target}; waiting one second before looting"
+                    ));
+                    return true;
+                }
+                self.pending_quest_action = None;
+                self.corpses_ready_to_loot.insert(target);
+                false
+            }
             PendingQuestAction::Combat {
                 target,
                 target_state,
@@ -2979,10 +3498,11 @@ impl LaneEngine {
                     self.post_combat_loot = None;
                     return false;
                 }
-                if generation > baseline_generation
+                if generation.saturating_sub(baseline_generation) >= 2
                     && self.state.authoritative.inventory.current_loot.is_none()
                 {
                     tracing::info!(lane=?self.state.lane, ?target, baseline_generation, generation, "authoritative bot-owned post-combat loot transaction completed");
+                    self.looted_corpses.insert(target);
                     self.pending_quest_action = None;
                     self.post_combat_loot = None;
                     return false;
@@ -3020,16 +3540,28 @@ impl LaneEngine {
                         self.state.authoritative.inventory.current_loot_owner,
                         Some(wow_state::LootOwnership::Player)
                     );
-                let transaction_completed = generation > baseline_generation
-                    && self.state.authoritative.inventory.current_loot.is_none();
                 let gone = !self.state.authoritative.entities.0.contains_key(&target);
                 if player_superseded {
                     tracing::info!(lane=?self.state.lane, item, ?target, "pending bot loot was superseded by player loot; cancelling without bot-success credit");
                     self.pending_quest_action = None;
                     return false;
                 }
-                if current > baseline_count || gone || transaction_completed {
-                    tracing::info!(lane=?self.state.lane, item, ?target, baseline_count, current, baseline_generation, generation, transaction_completed, gone, "authoritative loot progress observed");
+                let transaction_completed = generation.saturating_sub(baseline_generation) >= 2
+                    && self.state.authoritative.inventory.current_loot.is_none();
+                if current > baseline_count {
+                    tracing::info!(lane=?self.state.lane, item, ?target, baseline_count, current, baseline_generation, generation, "authoritative quest item count increased after looting");
+                    self.looted_corpses.insert(target);
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if transaction_completed {
+                    tracing::info!(lane=?self.state.lane, item, ?target, baseline_count, current, baseline_generation, generation, "loot transaction closed without increasing the required quest item count");
+                    self.looted_corpses.insert(target);
+                    self.pending_quest_action = None;
+                    return false;
+                }
+                if gone {
+                    tracing::warn!(lane=?self.state.lane, item, ?target, baseline_count, current, "corpse disappeared before the required quest item count increased");
                     self.pending_quest_action = None;
                     return false;
                 }
@@ -3295,6 +3827,105 @@ impl LaneEngine {
         command: GameplayCommand,
         pending: PendingQuestAction,
     ) -> bool {
+        if let (GameplayCommand::Loot(target), PendingQuestAction::CorpseLoot { .. }) =
+            (&command, &pending)
+        {
+            let corpse_was_ready_to_loot = self.corpses_ready_to_loot.remove(target);
+            if !corpse_was_ready_to_loot {
+                let mut snapshot = Snapshot::from_state(&self.state.authoritative);
+                if let Some((post_target, _, Some(cached_target))) = &self.post_combat_loot
+                    && post_target == target
+                {
+                    snapshot
+                        .state
+                        .entities
+                        .0
+                        .entry(*target)
+                        .or_insert_with(|| cached_target.clone());
+                }
+                match crate::action::spatial::is_in_range(&snapshot, &command) {
+                    Some(true) => {
+                        let _ = self
+                            .propose_command(GameplayCommand::StopMovement, false)
+                            .await;
+                        self.pending_quest_action = Some(PendingQuestAction::CorpseLootDelay {
+                            target: *target,
+                            arrived_at: Instant::now(),
+                        });
+                        self.waiting(format!(
+                            "reached corpse {target}; waiting one second before looting"
+                        ));
+                        return true;
+                    }
+                    None => {
+                        self.waiting(format!("corpse {target} loot is waiting for authoritative mover and target positions"));
+                        return true;
+                    }
+                    Some(false) => {}
+                }
+            }
+            if corpse_was_ready_to_loot && self.state.authoritative.position.moving {
+                let _ = self
+                    .propose_command(GameplayCommand::StopMovement, false)
+                    .await;
+                self.pending_quest_action = Some(PendingQuestAction::CorpseLootDelay {
+                    target: *target,
+                    arrived_at: Instant::now(),
+                });
+                self.waiting(format!(
+                    "reached corpse {target}; waiting for movement to stop before looting"
+                ));
+                return true;
+            }
+
+            if corpse_was_ready_to_loot {
+                let snapshot = Snapshot::from_state(&self.state.authoritative);
+                let check = crate::action::spatial::check_corpse_loot(&snapshot, *target);
+                if check != crate::action::spatial::CorpseLootCheck::Ready {
+                    let target_is_alive = self
+                        .state
+                        .authoritative
+                        .entities
+                        .0
+                        .get(target)
+                        .is_some_and(|entity| entity.health.is_some_and(|(health, _)| health > 0));
+                    if matches!(
+                        check,
+                        crate::action::spatial::CorpseLootCheck::MissingTarget
+                            | crate::action::spatial::CorpseLootCheck::NotCreature
+                    ) || target_is_alive
+                    {
+                        self.post_combat_loot = None;
+                        self.pending_quest_action = None;
+                        self.corpses_ready_to_loot.remove(target);
+                    }
+                    if check == crate::action::spatial::CorpseLootCheck::OutOfRange {
+                        self.corpses_ready_to_loot.remove(target);
+                        if crate::action::spatial::movement_requirement(&snapshot, &command)
+                            .is_some()
+                        {
+                            tracing::info!(
+                                lane=?self.state.lane,
+                                ?target,
+                                "corpse is outside loot range; handing it to shared movement"
+                            );
+                        } else {
+                            tracing::warn!(lane=?self.state.lane, ?target, ?check, "corpse loot request blocked by authoritative precondition check");
+                            self.waiting(format!(
+                                "corpse {target} is not ready to loot: {check:?}"
+                            ));
+                            return true;
+                        }
+                    } else {
+                        tracing::warn!(lane=?self.state.lane, ?target, ?check, "corpse loot request blocked by authoritative precondition check");
+                        self.waiting(format!(
+                            "corpse {target} is not ready to loot: {check:?}"
+                        ));
+                        return true;
+                    }
+                }
+            }
+        }
         self.last_dispatch = DispatchOutcome::Rejected;
         if !self.propose_command(command, true).await {
             return false;
@@ -3377,12 +4008,44 @@ impl LaneEngine {
         let original_command = action.command.clone();
         let action_origin = action.origin;
         let mut snapshot = Snapshot::from_state(&self.state.authoritative);
-        if self.pending_facing.is_some()
-            && crate::action::spatial::profile(&original_command).is_some()
-        {
-            self.waiting("targeted action is waiting for authoritative facing confirmation".into());
-            self.last_dispatch = DispatchOutcome::DeferredSpatial;
-            return true;
+        if crate::action::spatial::profile(&original_command).is_some() {
+            if let Some(pending) = self.pending_facing {
+                if pending.started_at.elapsed() < Duration::from_secs(1) {
+                    self.waiting(
+                        "targeted action is waiting for authoritative facing confirmation".into(),
+                    );
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                }
+                tracing::warn!(lane=?self.state.lane, mover=?pending.mover, orientation=pending.orientation, "facing request had no authoritative update after one second; using the sent direction for action validation");
+                if let Some(mover) = pending.mover {
+                    self.assumed_facing = Some((
+                        mover,
+                        pending.orientation,
+                        Instant::now() + Duration::from_secs(30),
+                    ));
+                }
+                self.pending_facing = None;
+            }
+            if let (Some((mover, orientation, expires_at)), Some(player)) =
+                (self.assumed_facing, snapshot.state.position.player.as_mut())
+                && expires_at > Instant::now()
+                && self.state.authoritative.control.mover.is_none()
+                && self
+                    .state
+                    .authoritative
+                    .session
+                    .character_guid
+                    .map(EntityId)
+                    == Some(mover)
+            {
+                player.orientation = orientation;
+            } else if self
+                .assumed_facing
+                .is_some_and(|(_, _, expires_at)| expires_at <= Instant::now())
+            {
+                self.assumed_facing = None;
+            }
         }
         if let GameplayCommand::Loot(target) = &original_command
             && let Some((post_target, _, Some(cached_target))) = &self.post_combat_loot
@@ -3672,6 +4335,7 @@ impl LaneEngine {
                         }),
                         orientation: requirement.orientation,
                         tolerance: requirement.tolerance,
+                        started_at: Instant::now(),
                     });
                 }
                 self.last_dispatch = if sent {
@@ -3710,10 +4374,16 @@ impl LaneEngine {
         self.search_attempts.clear();
         self.quest_start_search_attempts.clear();
         self.search_retry_after.clear();
+        self.search_roam_cursor.clear();
         self.current_work = None;
         self.last_wait_reason = None;
         self.last_dispatch = DispatchOutcome::Rejected;
         self.credited_quest_targets.clear();
+        self.loot_retry_after.clear();
+        self.bag_full_loot_targets.clear();
+        self.queried_item_templates.clear();
+        self.looted_corpses.clear();
+        self.corpses_ready_to_loot.clear();
         self.los_blocked.clear();
         self.los_attempts.clear();
         self.server_range_recovery.clear();
@@ -3767,8 +4437,16 @@ fn giver_retry_delay(attempts: u8) -> Duration {
     )
 }
 
-fn bounded_candidates(mut candidates: Vec<Vec3>, origin: Vec3) -> Vec<Vec3> {
-    candidates.retain(|point| point.is_finite() && point.distance(origin) <= 250.0);
+fn bounded_candidates(candidates: Vec<Vec3>, origin: Vec3) -> Vec<Vec3> {
+    bounded_candidates_within(candidates, origin, 250.0)
+}
+
+fn bounded_candidates_within(
+    mut candidates: Vec<Vec3>,
+    origin: Vec3,
+    max_distance: f32,
+) -> Vec<Vec3> {
+    candidates.retain(|point| point.is_finite() && point.distance(origin) <= max_distance);
     candidates.sort_by(|a, b| origin.distance(*a).total_cmp(&origin.distance(*b)));
     candidates.dedup();
     candidates.truncate(5);
@@ -3820,6 +4498,49 @@ mod tests {
             activity: ActivityArbiter::default(),
         };
         (LaneEngine::new(state, lane_rx, proxy_tx), proxy_rx)
+    }
+
+    #[tokio::test]
+    async fn full_bag_vendor_relief_travels_to_a_known_sell_vendor() {
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let initial_spawn = catalog
+            .world()
+            .vendor_services
+            .iter()
+            .find(|vendor| vendor.can_sell && !vendor.spawns.is_empty())
+            .and_then(|vendor| vendor.spawns.first().map(|spawn| (vendor.entry_id, spawn)))
+            .expect("the embedded catalog contains a sell vendor spawn");
+        let origin = Vec3::new(
+            initial_spawn.1.x + 50.0,
+            initial_spawn.1.y + 50.0,
+            initial_spawn.1.z,
+        );
+        let (_, destination) = catalog
+            .nearest_vendor(
+                wow_infra::world_knowledge::VendorKind::Sell,
+                initial_spawn.1.map_id,
+                origin,
+            )
+            .expect("the catalog contains a sell vendor on this map");
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.position.player = Some(WorldPosition {
+            map: initial_spawn.1.map_id,
+            point: origin,
+            orientation: 0.0,
+        });
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        engine.bag_full_loot_targets.insert(EntityId(702));
+
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert_eq!(engine.tick_bag_relief(&snapshot).await, Some(true));
+        assert!(proxy.try_recv().is_err());
+        let movement = engine
+            .pending_movement
+            .as_ref()
+            .expect("full-bag relief should queue travel to a vendor");
+        assert_eq!(movement.destination.point, destination);
+        assert_eq!(movement.destination.map, initial_spawn.1.map_id);
     }
 
     #[test]
@@ -3938,6 +4659,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_bag_rejection_blocks_retry_until_space_is_available() {
+        let (mut engine, _proxy_rx) = test_engine(
+            Mission::quest(MissionId(1)),
+            wow_state::AuthoritativeState::default(),
+        );
+        let target = EntityId(77);
+        engine.state.authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::Unit,
+                health: Some((0, 100)),
+                ..Default::default()
+            },
+        );
+        engine.pending_quest_action = Some(PendingQuestAction::CorpseLoot {
+            target,
+            baseline_generation: 0,
+            started: Instant::now(),
+        });
+        engine.post_combat_loot = Some((target, Instant::now(), None));
+
+        assert!(
+            engine
+                .handle(LaneMessage::Observation(
+                    ProtocolObservation::LootRejected {
+                        target,
+                        loot_type: 0,
+                        error: Some(12),
+                    }
+                ))
+                .await
+        );
+        assert_eq!(engine.loot_retry_after[&target], (u8::MAX, None));
+        assert!(engine.bag_full_loot_targets.contains(&target));
+        assert!(engine.pending_quest_action.is_none());
+        assert!(engine.post_combat_loot.is_none());
+
+        assert!(
+            engine
+                .handle(LaneMessage::Observation(
+                    ProtocolObservation::InventoryFreeSlots { count: 0 }
+                ))
+                .await
+        );
+        assert!(engine.bag_full_loot_targets.contains(&target));
+
+        assert!(
+            engine
+                .handle(LaneMessage::Observation(
+                    ProtocolObservation::InventoryFreeSlots { count: 1 }
+                ))
+                .await
+        );
+        assert!(!engine.bag_full_loot_targets.contains(&target));
+        assert!(!engine.loot_retry_after.contains_key(&target));
+
+        assert!(!engine.looted_corpses.contains(&target));
+    }
+
+    #[test]
+    fn quest_loot_does_not_count_a_disappeared_corpse_as_item_progress() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.inventory.items.insert(750, 2);
+        let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        let target = EntityId(78);
+        engine.pending_quest_action = Some(PendingQuestAction::Loot {
+            item: 750,
+            target,
+            baseline_count: 2,
+            baseline_generation: 0,
+            started: Instant::now(),
+        });
+
+        assert!(!engine.pending_quest_action_blocks());
+        assert!(engine.pending_quest_action.is_none());
+        assert!(!engine.looted_corpses.contains(&target));
+    }
+
+    #[test]
+    fn quest_loot_completes_only_after_authoritative_item_count_increases() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.inventory.items.insert(750, 3);
+        let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        let target = EntityId(79);
+        engine.pending_quest_action = Some(PendingQuestAction::Loot {
+            item: 750,
+            target,
+            baseline_count: 2,
+            baseline_generation: 0,
+            started: Instant::now(),
+        });
+
+        assert!(!engine.pending_quest_action_blocks());
+        assert!(engine.pending_quest_action.is_none());
+        assert!(engine.looted_corpses.contains(&target));
+    }
+
+    #[test]
+    fn one_loot_close_without_an_open_does_not_complete_corpse_loot() {
+        let (mut engine, _proxy_rx) = test_engine(
+            Mission::quest(MissionId(1)),
+            wow_state::AuthoritativeState::default(),
+        );
+        let target = EntityId(77);
+        engine.state.authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::Unit,
+                health: Some((0, 100)),
+                ..Default::default()
+            },
+        );
+        engine.pending_quest_action = Some(PendingQuestAction::CorpseLoot {
+            target,
+            baseline_generation: 0,
+            started: Instant::now(),
+        });
+        reduce(
+            &mut engine.state.authoritative,
+            ProtocolObservation::LootClosed {
+                ownership: wow_state::LootOwnership::Bot,
+            },
+        );
+
+        assert!(engine.pending_quest_action_blocks());
+        assert!(!engine.looted_corpses.contains(&target));
+    }
+
+    #[tokio::test]
+    async fn corpse_loot_delay_starts_only_after_authoritative_in_range_arrival() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        let target = EntityId(77);
+        authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::Unit,
+                health: Some((0, 100)),
+                position: None,
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut proxy_rx) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        let dispatch = || PendingQuestAction::CorpseLoot {
+            target,
+            baseline_generation: 0,
+            started: Instant::now(),
+        };
+
+        engine
+            .dispatch_quest_semantic(GameplayCommand::Loot(target), dispatch())
+            .await;
+        assert!(engine.pending_quest_action.is_none());
+        assert!(proxy_rx.try_recv().is_err());
+
+        engine
+            .state
+            .authoritative
+            .entities
+            .0
+            .get_mut(&target)
+            .unwrap()
+            .position = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(3.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        engine
+            .dispatch_quest_semantic(GameplayCommand::Loot(target), dispatch())
+            .await;
+        let Some(PendingQuestAction::CorpseLootDelay { arrived_at, .. }) =
+            engine.pending_quest_action.as_mut()
+        else {
+            panic!("in-range corpse must enter the arrival delay");
+        };
+        let Ok(WorkerToProxy::Action(stop)) = proxy_rx.try_recv() else {
+            panic!("corpse arrival must send a stop movement action");
+        };
+        assert_eq!(stop.command(), &GameplayCommand::StopMovement);
+        *arrived_at = Instant::now() - Duration::from_secs(1);
+        assert!(!engine.pending_quest_action_blocks());
+        assert!(engine.corpses_ready_to_loot.contains(&target));
+        engine.state.authoritative.position.moving = true;
+        engine
+            .dispatch_quest_semantic(GameplayCommand::Loot(target), dispatch())
+            .await;
+        let Ok(WorkerToProxy::Action(stop)) = proxy_rx.try_recv() else {
+            panic!("moving character must receive another stop action");
+        };
+        assert_eq!(stop.command(), &GameplayCommand::StopMovement);
+        let Some(PendingQuestAction::CorpseLootDelay { arrived_at, .. }) =
+            engine.pending_quest_action.as_mut()
+        else {
+            panic!("looting must wait until movement stops");
+        };
+        engine.state.authoritative.position.moving = false;
+        *arrived_at = Instant::now() - Duration::from_secs(1);
+        assert!(!engine.pending_quest_action_blocks());
+
+        engine
+            .dispatch_quest_semantic(GameplayCommand::Loot(target), dispatch())
+            .await;
+        let Ok(WorkerToProxy::Action(loot)) = proxy_rx.try_recv() else {
+            panic!("stopped character must send the loot action");
+        };
+        assert_eq!(loot.command(), &GameplayCommand::Loot(target));
+        assert!(matches!(
+            engine.pending_quest_action,
+            Some(PendingQuestAction::CorpseLoot { target: pending, .. }) if pending == target
+        ));
+    }
+
+    #[test]
+    fn opened_and_closed_loot_marks_corpse_complete() {
+        let (mut engine, _proxy_rx) = test_engine(
+            Mission::quest(MissionId(1)),
+            wow_state::AuthoritativeState::default(),
+        );
+        let target = EntityId(77);
+        engine.pending_quest_action = Some(PendingQuestAction::CorpseLoot {
+            target,
+            baseline_generation: 0,
+            started: Instant::now(),
+        });
+        reduce(
+            &mut engine.state.authoritative,
+            ProtocolObservation::LootOpened {
+                target,
+                ownership: wow_state::LootOwnership::Bot,
+            },
+        );
+        reduce(
+            &mut engine.state.authoritative,
+            ProtocolObservation::LootClosed {
+                ownership: wow_state::LootOwnership::Bot,
+            },
+        );
+
+        assert!(!engine.pending_quest_action_blocks());
+        assert!(engine.looted_corpses.contains(&target));
+    }
+
+    #[tokio::test]
     async fn quest_scheduler_searches_static_starters_for_empty_and_active_logs() {
         let start = [0, 1, 530, 571]
             .into_iter()
@@ -3978,7 +4951,7 @@ mod tests {
                 .as_ref()
                 .expect("the quest scheduler should search the nearby static starter");
             assert_eq!(movement.purpose, MovementPurpose::SearchArea);
-            assert_eq!(movement.destination, location);
+            assert_eq!(movement.destination.point, location);
             assert_eq!(movement.resume, Some(GameplayCommand::QueryQuestGivers));
             assert!(matches!(
                 &movement.work.key,
@@ -4008,6 +4981,67 @@ mod tests {
             panic!("expected a quest-giver query action")
         };
         assert_eq!(action.command(), &GameplayCommand::QueryQuestGivers);
+    }
+
+    #[tokio::test]
+    async fn quest_scheduler_skips_offers_for_active_or_completed_quests() {
+        let active_giver = EntityId(8);
+        let completed_giver = EntityId(9);
+        let available_giver = EntityId(10);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative
+            .quests
+            .active
+            .insert(218, wow_state::quests::QuestProgress::default());
+        authoritative.quests.completed.push(219);
+        authoritative.quests.offers.extend([
+            (
+                218,
+                wow_state::quests::QuestOffer {
+                    giver: active_giver,
+                    icon: 0,
+                },
+            ),
+            (
+                219,
+                wow_state::quests::QuestOffer {
+                    giver: completed_giver,
+                    icon: 0,
+                },
+            ),
+            (
+                220,
+                wow_state::quests::QuestOffer {
+                    giver: available_giver,
+                    icon: 0,
+                },
+            ),
+        ]);
+        for giver in [active_giver, completed_giver, available_giver] {
+            authoritative.entities.0.insert(
+                giver,
+                wow_state::entities::EntityState {
+                    id: giver,
+                    ..Default::default()
+                },
+            );
+        }
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(19)), authoritative);
+
+        assert!(engine.tick_quest().await);
+        let WorkerToProxy::Action(action) = proxy.try_recv().expect("valid offer should be sent")
+        else {
+            panic!("expected a quest acceptance action")
+        };
+        assert_eq!(
+            action.command(),
+            &GameplayCommand::AcceptQuest {
+                quest: 220,
+                giver: available_giver,
+            }
+        );
+        assert_eq!(engine.pending_accept.map(|(quest, _, _)| quest), Some(220));
     }
 
     #[tokio::test]
@@ -4568,7 +5602,7 @@ mod tests {
     }
 
     #[test]
-    fn static_search_advances_after_arrival_and_waits_after_bounded_candidates() {
+    fn static_search_advances_after_arrival_and_sets_a_short_retry() {
         let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(9)), Default::default());
         let key = (456, 0, 0);
         let first = Vec3::new(1.0, 0.0, 0.0);
@@ -4587,7 +5621,33 @@ mod tests {
             engine.next_search_destination(key, &candidates, Some(second)),
             None
         );
-        assert!(engine.search_retry_after[&key] > Instant::now());
+        let retry_after = engine.search_retry_after[&key];
+        assert!(retry_after > Instant::now());
+        assert!(retry_after <= Instant::now() + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn incomplete_quest_selection_skips_quests_during_search_retry() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative
+            .quests
+            .active
+            .insert(182, wow_state::quests::QuestProgress::default());
+        authoritative
+            .quests
+            .active
+            .insert(3361, wow_state::quests::QuestProgress::default());
+        let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(10)), authoritative);
+        engine
+            .search_retry_after
+            .insert((182, 0, 0), Instant::now() + Duration::from_secs(30));
+
+        assert_eq!(engine.next_incomplete_quest(), Some(3361));
+
+        engine
+            .search_retry_after
+            .insert((3361, 0, 0), Instant::now() + Duration::from_secs(30));
+        assert_eq!(engine.next_incomplete_quest(), Some(182));
     }
 
     #[test]
@@ -4609,6 +5669,33 @@ mod tests {
         assert_eq!(candidates.len(), 5);
         assert_eq!(candidates[0], Vec3::new(1.0, 0.0, 0.0));
         assert!(!candidates.contains(&Vec3::new(300.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn item_source_search_keeps_same_map_sources_beyond_local_radius() {
+        let origin = Vec3::default();
+        let distant_source = Vec3::new(280.0, 380.0, 0.0);
+
+        assert!(bounded_candidates(vec![distant_source], origin).is_empty());
+        assert_eq!(
+            bounded_candidates_within(
+                vec![distant_source],
+                origin,
+                QUEST_ITEM_SOURCE_SEARCH_RADIUS,
+            ),
+            vec![distant_source]
+        );
+    }
+
+    #[test]
+    fn exhausted_search_selects_a_nearby_roam_waypoint() {
+        let (mut engine, _proxy_rx) =
+            test_engine(Mission::quest(MissionId(11)), Default::default());
+        let origin = Vec3::new(1.0, 2.0, 3.0);
+        let destination = engine.next_search_roam_destination((182, 0, 0), origin);
+
+        assert!((destination.distance(origin) - QUEST_SEARCH_ROAM_RADIUS).abs() < 0.001);
+        assert_eq!(destination.z, origin.z);
     }
 
     #[test]

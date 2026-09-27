@@ -79,6 +79,50 @@ pub struct PlannedRoute {
     surfaces: Vec<Option<RouteSurface>>,
 }
 
+fn route_length(points: &[[f32; 3]]) -> f32 {
+    points.windows(2).fold(0.0, |length, pair| {
+        let dx = pair[1][0] - pair[0][0];
+        let dy = pair[1][1] - pair[0][1];
+        let dz = pair[1][2] - pair[0][2];
+        length + dx.hypot(dy).hypot(dz)
+    })
+}
+
+fn routine_route_waypoints(start: Vec3, destination: Vec3, straightness: f32) -> Option<[Vec3; 2]> {
+    let dx = destination.x - start.x;
+    let dy = destination.y - start.y;
+    let distance = dx.hypot(dy);
+    if !distance.is_finite() || distance < 20.0 || straightness >= 1.0 {
+        return None;
+    }
+    let offset = (1.0 - straightness) * 12.0;
+    let normal = (-dy / distance, dx / distance);
+    Some([-offset, offset].map(|offset| {
+        Vec3::new(
+            (start.x + destination.x) * 0.5 + normal.0 * offset,
+            (start.y + destination.y) * 0.5 + normal.1 * offset,
+            (start.z + destination.z) * 0.5,
+        )
+    }))
+}
+
+fn planned_route(
+    map: u32,
+    destination: Vec3,
+    points: Vec<Vec3>,
+    surfaces: Vec<Option<RouteSurface>>,
+) -> Result<PlannedRoute, NavigationError> {
+    if points.is_empty() {
+        return Err(NavigationError::NoRoute);
+    }
+    Ok(PlannedRoute {
+        map,
+        destination,
+        points,
+        surfaces,
+    })
+}
+
 impl PlannedRoute {
     pub fn points(&self) -> &[Vec3] {
         &self.points
@@ -240,12 +284,78 @@ impl MovementController {
         destination: Vec3,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<PlannedRoute, NavigationError> {
+        self.plan_route_cancellable_with_straightness(current, destination, 1.0, cancelled)
+    }
+
+    pub fn plan_route_cancellable_with_straightness(
+        &self,
+        current: WorldPosition,
+        destination: Vec3,
+        path_straightness: f32,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<PlannedRoute, NavigationError> {
         let started_at = Instant::now();
         let navigation = self
             .navigation
             .as_ref()
             .ok_or(NavigationError::MissingNavigationData)?;
         let route_cancelled = || cancelled() || started_at.elapsed() >= ROUTE_PLANNING_DEADLINE;
+        let straightness = if path_straightness.is_finite() {
+            path_straightness.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let distance = (destination.x - current.point.x).hypot(destination.y - current.point.y);
+        if let Some(waypoints) = routine_route_waypoints(current.point, destination, straightness) {
+            // Choose a stable side for this route. If that side is not reachable,
+            // try the other side, then fall back to the direct route below.
+            let side = ((current.point.x.to_bits() ^ destination.y.to_bits()) & 1) as usize;
+            for waypoint in [waypoints[side], waypoints[1 - side]] {
+                let Ok(first) = navigation.route_cancellable(
+                    current.map,
+                    (current.point.x, current.point.y, current.point.z),
+                    (waypoint.x, waypoint.y, waypoint.z),
+                    false,
+                    &route_cancelled,
+                ) else {
+                    continue;
+                };
+                let Some(first_endpoint) = first.last().copied() else {
+                    continue;
+                };
+                let Ok(second) = navigation.route_cancellable(
+                    current.map,
+                    (first_endpoint[0], first_endpoint[1], first_endpoint[2]),
+                    (destination.x, destination.y, destination.z),
+                    false,
+                    &route_cancelled,
+                ) else {
+                    continue;
+                };
+                let Some(second_start) = second.first().copied() else {
+                    continue;
+                };
+                if route_length(&[first_endpoint, second_start]) > 0.25 {
+                    continue;
+                }
+                let mut points = first;
+                points.extend(second.into_iter().skip(1));
+                let length = route_length(&points);
+                if !length.is_finite() || length > distance * 2.0 + 40.0 {
+                    continue;
+                }
+                let Ok(surfaces) =
+                    navigation.route_surfaces_cancellable(current.map, &points, &route_cancelled)
+                else {
+                    continue;
+                };
+                let points = points
+                    .into_iter()
+                    .map(|point| Vec3::new(point[0], point[1], point[2]))
+                    .collect();
+                return planned_route(current.map, destination, points, surfaces);
+            }
+        }
         let route_points = navigation
             .route_cancellable(
                 current.map,
@@ -265,12 +375,7 @@ impl MovementController {
         if points.is_empty() {
             return Err(NavigationError::NoRoute);
         }
-        Ok(PlannedRoute {
-            map: current.map,
-            destination,
-            points,
-            surfaces,
-        })
+        planned_route(current.map, destination, points, surfaces)
     }
 
     /// Limit route planning to one active job per shared controller.
@@ -665,6 +770,26 @@ mod tests {
         drop(permit);
         assert!(clone.try_acquire_route_planning_slot().is_ok());
         std::fs::remove_dir_all(maps_dir).unwrap();
+    }
+
+    #[test]
+    fn path_straightness_creates_bounded_waypoint_variants_only_for_long_routes() {
+        let start = Vec3::new(0.0, 0.0, 0.0);
+        let short = Vec3::new(19.9, 0.0, 0.0);
+        let long = Vec3::new(30.0, 0.0, 0.0);
+        assert!(routine_route_waypoints(start, long, 1.0).is_none());
+        assert!(routine_route_waypoints(start, short, 0.5).is_none());
+
+        let variants = routine_route_waypoints(start, long, 0.5).unwrap();
+        assert_eq!(variants[0].x, 15.0);
+        assert_eq!(variants[1].x, 15.0);
+        assert_eq!(variants[0].y, -6.0);
+        assert_eq!(variants[1].y, 6.0);
+        assert!(
+            variants
+                .iter()
+                .all(|point| point.distance(Vec3::new(15.0, 0.0, 0.0)) <= 12.0)
+        );
     }
 
     #[test]

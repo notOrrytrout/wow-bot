@@ -11,6 +11,16 @@
       "maps": null,
       "vmaps": null,
       "mmaps": null
+    },
+    "runtime_tuning": {
+      "movement": {
+        "travel_speed_form_min_yards": 30,
+        "path_straightness": 1.0
+      },
+      "maintenance": {
+        "auto_mount_enabled": false,
+        "mount_min_travel_yards": 80
+      }
     }
   },
   "upstream": {

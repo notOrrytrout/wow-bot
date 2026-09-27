@@ -179,7 +179,7 @@ mod tests {
         }
     }
 
-    fn traversal(max_observations: u8) -> TransportTraversal {
+    fn traversal(max_observations: u16) -> TransportTraversal {
         TransportTraversal {
             transport: EntityId(7),
             boarding_point: pos(0.0, 0.0),

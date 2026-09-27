@@ -60,6 +60,8 @@ pub struct RuntimeTuning {
 #[serde(default, deny_unknown_fields)]
 pub struct MovementTuning {
     pub travel_speed_form_min_yards: u32,
+    /// Prefer direct routes. Lower values allow bounded waypoint variation on long trips.
+    pub path_straightness: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -83,6 +85,7 @@ impl Default for MovementTuning {
     fn default() -> Self {
         Self {
             travel_speed_form_min_yards: 30,
+            path_straightness: 1.0,
         }
     }
 }
@@ -135,6 +138,7 @@ mod tests {
             config.runtime_tuning.movement.travel_speed_form_min_yards,
             30
         );
+        assert_eq!(config.runtime_tuning.movement.path_straightness, 1.0);
         assert!(!config.runtime_tuning.maintenance.auto_mount_enabled);
         assert_eq!(config.runtime_tuning.maintenance.mount_min_travel_yards, 80);
     }

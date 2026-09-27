@@ -65,45 +65,9 @@ pub struct CombatAction {
 }
 
 pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
-    let Some(class_id) = snapshot.state.capabilities.class_id else {
-        return deferred("class_not_authoritative");
-    };
-    let Some(policy) = combat_catalog().classes.get(&class_id) else {
-        return deferred("class_specialization_policy_unavailable");
-    };
-    let tree = snapshot.state.capabilities.specialization_tree;
-    if tree.is_none() && !player_level_is_authoritative(snapshot) {
-        return deferred("specialization_not_authoritative");
-    }
-    let Some((power_type, _)) = player_power(snapshot) else {
-        return deferred("combat_resource_state_unknown");
-    };
-    let priorities = match tree {
-        Some(tree) => {
-            let Some(tree_policy) = policy.trees.get(&tree) else {
-                return deferred("class_specialization_policy_unavailable");
-            };
-            tree_policy.power_policies.get(&power_type).cloned()
-        }
-        None => {
-            // If the level is authoritative but the specialization is not,
-            // use class priorities across trees. Cast only spells that the
-            // server has confirmed the player knows.
-            let mut priorities = Vec::new();
-            for tree_policy in policy.trees.values() {
-                if let Some(families) = tree_policy.power_policies.get(&power_type) {
-                    for family in families {
-                        if !priorities.contains(family) {
-                            priorities.push(*family);
-                        }
-                    }
-                }
-            }
-            (!priorities.is_empty()).then_some(priorities)
-        }
-    };
-    let Some(priorities) = priorities else {
-        return deferred("combat_resource_type_mismatch");
+    let (class_id, tree, priorities) = match rotation_profile(snapshot) {
+        Ok(profile) => profile,
+        Err(reason) => return deferred(reason),
     };
 
     for family_id in priorities {
@@ -115,6 +79,17 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
         }) else {
             continue;
         };
+        if crate::combat::spells::metadata(spell).is_some_and(|metadata| {
+            metadata.damage_over_time
+                && owned_dot_is_active(
+                    snapshot,
+                    target,
+                    metadata.family_id,
+                    snapshot.state.session.character_guid.map(EntityId),
+                )
+        }) {
+            continue;
+        }
         if crate::combat::readiness::check_spell_readiness(
             snapshot,
             spell,
@@ -143,6 +118,50 @@ pub fn select(snapshot: &Snapshot, target: EntityId) -> CombatDecision {
     } else {
         deferred("no_safe_offensive_fallback")
     }
+}
+
+fn rotation_profile(snapshot: &Snapshot) -> Result<(u8, Option<u8>, Vec<u32>), &'static str> {
+    let class_id = snapshot
+        .state
+        .capabilities
+        .class_id
+        .ok_or("class_not_authoritative")?;
+    let policy = combat_catalog()
+        .classes
+        .get(&class_id)
+        .ok_or("class_specialization_policy_unavailable")?;
+    let tree = snapshot.state.capabilities.specialization_tree;
+    if tree.is_none() && !player_level_is_authoritative(snapshot) {
+        return Err("specialization_not_authoritative");
+    }
+    if tree.is_some_and(|tree| !policy.trees.contains_key(&tree)) {
+        return Err("class_specialization_policy_unavailable");
+    }
+    let (power_type, _) = player_power(snapshot).ok_or("combat_resource_state_unknown")?;
+    let priorities = match tree {
+        Some(tree) => policy
+            .trees
+            .get(&tree)
+            .and_then(|tree| tree.power_policies.get(&power_type))
+            .cloned(),
+        None => {
+            // With authoritative level but no specialization, merge this class's
+            // priorities. The server-known spell list still controls each cast.
+            let mut priorities = Vec::new();
+            for tree_policy in policy.trees.values() {
+                if let Some(families) = tree_policy.power_policies.get(&power_type) {
+                    for family in families {
+                        if !priorities.contains(family) {
+                            priorities.push(*family);
+                        }
+                    }
+                }
+            }
+            (!priorities.is_empty()).then_some(priorities)
+        }
+    }
+    .ok_or("combat_resource_type_mismatch")?;
+    Ok((class_id, tree, priorities))
 }
 
 /// Describe why known offensive spells cannot produce an action. Call this
@@ -326,6 +345,7 @@ fn select_ranged_attack_fallback(
     now_ms: u64,
 ) -> Option<u32> {
     const MIN_RANGED_ATTACK_RANGE_YARDS: f32 = 5.5;
+    let player = snapshot.state.session.character_guid.map(EntityId);
 
     let mut candidates = snapshot
         .state
@@ -335,6 +355,10 @@ fn select_ranged_attack_fallback(
         .filter_map(|spell| crate::combat::spells::metadata(*spell))
         .filter(|spell| spell.classes.contains(&class_id))
         .filter(|spell| spell.attack_spell)
+        .filter(|spell| {
+            !spell.damage_over_time
+                || !owned_dot_is_active(snapshot, target, spell.family_id, player)
+        })
         .filter(|spell| spell.id != 5019)
         .filter_map(|spell| {
             let (_, maximum) = crate::combat::spells::range_for(spell.id, true)?;
@@ -458,6 +482,10 @@ pub fn select_action(snapshot: &Snapshot, target: EntityId) -> Result<CombatActi
         return Ok(cast_action(spell, utility_target, combat_cycle(snapshot)));
     }
 
+    if let Some(spell) = select_damage_over_time(snapshot, target) {
+        return Ok(cast_action(spell, target, combat_cycle(snapshot)));
+    }
+
     let cycle = combat_cycle(snapshot);
     match select(snapshot, target) {
         CombatDecision::Cast { spell, target } => Ok(cast_action(spell, target, cycle)),
@@ -468,6 +496,77 @@ pub fn select_action(snapshot: &Snapshot, target: EntityId) -> Result<CombatActi
         }),
         CombatDecision::Deferred { reason } => Err(reason),
     }
+}
+
+/// Apply or refresh the highest known DoT in the current combat priorities.
+/// DoTs applied by this player stay active until their refresh window starts.
+fn select_damage_over_time(snapshot: &Snapshot, target: EntityId) -> Option<u32> {
+    let target_state = snapshot.state.entities.0.get(&target)?;
+    if !target_state.hostile || target_state.is_dead() {
+        return None;
+    }
+    let player = snapshot.state.session.character_guid.map(EntityId)?;
+    let (class_id, tree, priorities) = rotation_profile(snapshot).ok()?;
+    let now_ms = Millis::wall_clock_now().0;
+
+    for family in priorities {
+        let Some(family_spells) = crate::combat::spells::family_spells(family) else {
+            continue;
+        };
+        let spell = family_spells.iter().find_map(|spell| {
+            let metadata = crate::combat::spells::metadata(*spell)?;
+            (snapshot.state.capabilities.spells.contains(spell)
+                && metadata.classes.contains(&class_id)
+                && metadata.attack_spell
+                && metadata.damage_over_time
+                && metadata.duration_ms.is_some_and(|duration| duration > 0)
+                && !owned_dot_is_active(snapshot, target, metadata.family_id, Some(player))
+                && crate::combat::readiness::check_spell_readiness(
+                    snapshot,
+                    *spell,
+                    Some(target),
+                    now_ms,
+                )
+                .is_ok()
+                && rotation_reserve_preserved(snapshot, class_id, tree, *spell))
+            .then_some(*spell)
+        });
+        if spell.is_some() {
+            return spell;
+        }
+    }
+    None
+}
+
+fn owned_dot_is_active(
+    snapshot: &Snapshot,
+    target: EntityId,
+    family: u32,
+    player: Option<EntityId>,
+) -> bool {
+    let Some(player) = player else {
+        return false;
+    };
+    snapshot
+        .state
+        .auras
+        .by_entity
+        .get(&target)
+        .is_some_and(|auras| {
+            auras.values().any(|aura| {
+                let same_dot_family = crate::combat::spells::metadata(aura.spell)
+                    .is_some_and(|metadata| metadata.family_id == family);
+                let refresh_window = aura
+                    .max_duration_ms
+                    .map(|duration| (duration / 5).clamp(1_000, 3_000))
+                    .unwrap_or(1_500);
+                aura.caster == Some(player)
+                    && same_dot_family
+                    && aura
+                        .remaining_ms
+                        .is_none_or(|remaining| remaining > refresh_window)
+            })
+        })
 }
 
 /// Select one bounded dispel or refresh an owned crowd-control effect before
@@ -871,6 +970,79 @@ mod tests {
             },
         );
         state
+    }
+
+    #[test]
+    fn dot_selector_uses_highest_known_rank_and_refreshes_before_expiry() {
+        let target = EntityId(9);
+        let mut state = state(9, 0, 0, 100, target);
+        state.entities.0.get_mut(&target).unwrap().hostile = true;
+        state.entities.0.get_mut(&target).unwrap().position = Some(wow_domain::WorldPosition {
+            map: 0,
+            point: wow_domain::Vec3::new(10.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.position.player = Some(wow_domain::WorldPosition {
+            map: 0,
+            point: wow_domain::Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.capabilities.spells.extend([172, 6222, 686]);
+        state.auras.by_entity.entry(target).or_default();
+
+        assert_eq!(
+            select_damage_over_time(&Snapshot::from_state(&state), target),
+            Some(6222)
+        );
+
+        let mut no_known_dot = state.clone();
+        let dot_family = crate::combat::spells::metadata(6222).unwrap().family_id;
+        for spell in crate::combat::spells::family_spells(dot_family).unwrap() {
+            no_known_dot.capabilities.spells.remove(spell);
+        }
+        assert_eq!(
+            select_damage_over_time(&Snapshot::from_state(&no_known_dot), target),
+            None,
+            "an unknown DoT rank must not be selected"
+        );
+        let selected = select_action(&Snapshot::from_state(&no_known_dot), target).unwrap();
+        assert!(!matches!(
+            selected.command,
+            GameplayCommand::Cast { spell, .. }
+                if crate::combat::spells::metadata(spell)
+                    .is_some_and(|metadata| metadata.damage_over_time)
+        ));
+
+        state.auras.by_entity.get_mut(&target).unwrap().insert(
+            0,
+            wow_state::auras::AuraInstance {
+                slot: 0,
+                spell: 6222,
+                positive: Some(false),
+                caster: Some(EntityId(1)),
+                max_duration_ms: Some(15_000),
+                remaining_ms: Some(12_000),
+            },
+        );
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(select_damage_over_time(&snapshot, target), None);
+        assert_eq!(
+            select(&snapshot, target),
+            CombatDecision::Cast { spell: 686, target }
+        );
+
+        state
+            .auras
+            .by_entity
+            .get_mut(&target)
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .remaining_ms = Some(2_000);
+        assert_eq!(
+            select_damage_over_time(&Snapshot::from_state(&state), target),
+            Some(6222)
+        );
     }
 
     #[test]
