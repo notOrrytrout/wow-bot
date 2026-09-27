@@ -510,6 +510,12 @@ impl LaneEngine {
                     } => {
                         self.loot_retry_after.remove(target);
                     }
+                    ProtocolObservation::LootOpened {
+                        target,
+                        ownership: wow_state::LootOwnership::Player,
+                    } => {
+                        self.cancel_player_superseded_loot(*target);
+                    }
                     ProtocolObservation::EntityUpsert { entity }
                         if entity.health.is_some_and(|(current, _)| current > 0) =>
                     {
@@ -3689,6 +3695,25 @@ impl LaneEngine {
         }
     }
 
+    fn cancel_player_superseded_loot(&mut self, target: EntityId) {
+        if matches!(
+            self.pending_quest_action,
+            Some(PendingQuestAction::Loot { target: pending, .. }
+                | PendingQuestAction::CorpseLoot { target: pending, .. }
+                | PendingQuestAction::CorpseLootDelay { target: pending, .. })
+                if pending == target
+        ) {
+            self.pending_quest_action = None;
+        }
+        if self
+            .post_combat_loot
+            .as_ref()
+            .is_some_and(|(pending, _, _)| *pending == target)
+        {
+            self.post_combat_loot = None;
+        }
+    }
+
     async fn dispatch_combat_target(&mut self, target: EntityId, recovery: bool) -> bool {
         let snapshot = Snapshot::from_state(&self.state.authoritative);
         let selected = match wow_policy::combat::selector::select_action(&snapshot, target) {
@@ -4908,6 +4933,34 @@ mod tests {
 
         assert!(!engine.pending_quest_action_blocks());
         assert!(engine.looted_corpses.contains(&target));
+    }
+
+    #[tokio::test]
+    async fn player_opened_loot_cancels_matching_bot_loot_intents_without_crediting_success() {
+        let (mut engine, _proxy_rx) = test_engine(
+            Mission::quest(MissionId(1)),
+            wow_state::AuthoritativeState::default(),
+        );
+        let target = EntityId(78);
+        engine.pending_quest_action = Some(PendingQuestAction::CorpseLoot {
+            target,
+            baseline_generation: 0,
+            started: Instant::now(),
+        });
+        engine.post_combat_loot = Some((target, Instant::now(), None));
+
+        assert!(
+            engine
+                .handle(LaneMessage::Observation(ProtocolObservation::LootOpened {
+                    target,
+                    ownership: wow_state::LootOwnership::Player,
+                }))
+                .await
+        );
+
+        assert!(engine.pending_quest_action.is_none());
+        assert!(engine.post_combat_loot.is_none());
+        assert!(!engine.looted_corpses.contains(&target));
     }
 
     #[tokio::test]
