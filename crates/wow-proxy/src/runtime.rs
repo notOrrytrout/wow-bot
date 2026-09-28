@@ -670,7 +670,7 @@ async fn handle_auth(
         .await?;
         shared.auth.put(&key, authenticated.session_key).await;
         shared.record_world_route(peer_ip, WorldRoute::Configured);
-        serve_configured_realms(&shared, &mut downstream, &upstream.realm_name).await
+        serve_configured_realms(&shared, &mut downstream, &upstream.realm_name, peer_ip).await
     } else {
         transparent_auth(shared, challenge, downstream, peer_ip).await
     }
@@ -691,11 +691,10 @@ async fn serve_configured_realms(
     shared: &SharedRuntime,
     stream: &mut TcpStream,
     realm_name: &str,
+    peer_ip: IpAddr,
 ) -> Result<()> {
-    let address = advertised(
-        &shared.config.advertise_host,
-        port_of(&shared.config.auth_bind)?,
-    );
+    let address = downstream_realm_address(&shared, peer_ip)?;
+    tracing::info!(%peer_ip, %address, "selected downstream realm address");
     while tokio_expect_client_message::<CMD_REALM_LIST_Client, _>(&mut *stream)
         .await
         .is_ok()
@@ -775,7 +774,11 @@ async fn transparent_auth(
         for realm in &mut realms.realms {
             if realm.name.eq_ignore_ascii_case(&shared.config.realm_name) {
                 realm.address = advertised(
-                    &shared.config.advertise_host,
+                    realm_advertise_host(
+                        peer_ip,
+                        &shared.config.upstream_world_host,
+                        &shared.config.advertise_host,
+                    ),
                     port_of(&shared.config.auth_bind)?,
                 );
             }
@@ -783,6 +786,34 @@ async fn transparent_auth(
         realms.tokio_write(&mut downstream).await?;
     }
     Ok(())
+}
+
+fn downstream_realm_address(shared: &SharedRuntime, peer_ip: IpAddr) -> Result<String> {
+    Ok(advertised(
+        realm_advertise_host(
+            peer_ip,
+            &shared.config.upstream_world_host,
+            &shared.config.advertise_host,
+        ),
+        port_of(&shared.config.auth_bind)?,
+    ))
+}
+
+fn realm_advertise_host<'a>(peer_ip: IpAddr, local_host: &'a str, remote_host: &'a str) -> &'a str {
+    if is_local_network(peer_ip) {
+        // The upstream world host is the LAN address for the colocated
+        // AzerothCore and proxy setup. Remote clients use the public proxy host.
+        local_host
+    } else {
+        remote_host
+    }
+}
+
+fn is_local_network(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
 }
 
 async fn handle_world(
@@ -2432,6 +2463,35 @@ mod runtime_chat_tests {
         assert_eq!(advertised("2001:db8::1", 3724), "[2001:db8::1]:3724");
     }
 
+    #[test]
+    fn local_clients_get_local_realm_host_and_remote_clients_get_public_host() {
+        let lan_client = IpAddr::from([10, 0, 0, 222]);
+        let remote_client = IpAddr::from([68, 44, 101, 193]);
+
+        assert_eq!(
+            realm_advertise_host(lan_client, "10.0.0.133", "game.example.test"),
+            "10.0.0.133"
+        );
+        assert_eq!(
+            realm_advertise_host(remote_client, "10.0.0.133", "game.example.test"),
+            "game.example.test"
+        );
+        assert_eq!(
+            advertised(
+                realm_advertise_host(lan_client, "10.0.0.133", "game.example.test"),
+                3725
+            ),
+            "10.0.0.133:3725"
+        );
+        assert_eq!(
+            advertised(
+                realm_advertise_host(remote_client, "10.0.0.133", "game.example.test"),
+                3725
+            ),
+            "game.example.test:3725"
+        );
+    }
+
     fn chat_body(chat_type: u32, target: Option<&str>, message: &str) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&chat_type.to_le_bytes());
@@ -2612,6 +2672,49 @@ mod quest_protocol_tests {
             u32::from_le_bytes(frame.body[6..10].try_into().unwrap()),
             0x0000_0800
         );
+    }
+
+    #[test]
+    fn movement_starts_once_then_uses_heartbeats_until_stop() {
+        let mut movement_clock = MovementClock::default();
+        let position = WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let (start, state) = encode_gameplay_command(
+            GameplayCommand::MoveTo(Vec3::new(0.7, 0.0, 0.0)),
+            Some(EntityId(1)),
+            Some(position),
+            0,
+            &mut movement_clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(start.opcode, 0x00B5);
+        let (position, moving, flags, _) = state.unwrap();
+        assert!(moving);
+        let (heartbeat, state) = encode_gameplay_command(
+            GameplayCommand::MoveTo(Vec3::new(1.4, 0.0, 0.0)),
+            Some(EntityId(1)),
+            Some(position),
+            flags,
+            &mut movement_clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(heartbeat.opcode, 0x00EE);
+        let (position, _, flags, _) = state.unwrap();
+        let (stop, _) = encode_gameplay_command(
+            GameplayCommand::StopMovement,
+            Some(EntityId(1)),
+            Some(position),
+            flags,
+            &mut movement_clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(stop.opcode, 0x00B7);
     }
 
     #[test]

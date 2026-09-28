@@ -417,23 +417,36 @@ impl MovementController {
         acceptable_range: f32,
         mode: LocomotionMode,
     ) -> Result<Option<MovementStep>, NavigationError> {
+        self.next_step_with_3d_arrival(current, destination, acceptable_range, mode, false)
+    }
+
+    pub fn next_step_with_3d_arrival(
+        &self,
+        current: WorldPosition,
+        destination: Vec3,
+        acceptable_range: f32,
+        mode: LocomotionMode,
+        use_3d_arrival: bool,
+    ) -> Result<Option<MovementStep>, NavigationError> {
         if mode == LocomotionMode::Flight {
             self.clear_route();
-            return next_step(
+            return next_step_with_3d_arrival(
                 current.point,
                 destination,
                 self.maximum_step,
                 acceptable_range,
                 mode,
+                use_3d_arrival,
             );
         }
         let Some(navigation) = self.navigation.as_ref() else {
-            let Some(mut step) = next_step(
+            let Some(mut step) = next_step_with_3d_arrival(
                 current.point,
                 destination,
                 self.maximum_step,
                 acceptable_range,
                 LocomotionMode::Ground,
+                use_3d_arrival,
             )?
             else {
                 return Ok(None);
@@ -449,15 +462,26 @@ impl MovementController {
         };
         let (waypoint, route_index) =
             self.ground_route_waypoint(navigation, current, destination)?;
-        let raw = self.routed_ground_step(current, waypoint, destination, acceptable_range)?;
+        let raw = self.routed_ground_step(
+            current,
+            waypoint,
+            destination,
+            acceptable_range,
+            use_3d_arrival,
+        )?;
         let Some(mut step) = raw else {
             // We reached this corridor waypoint. Advance once and immediately
             // calculate toward the next one so the 250 ms clock does not stall.
             self.advance_route_cursor(current.point);
             let (waypoint, route_index) =
                 self.ground_route_waypoint(navigation, current, destination)?;
-            let Some(mut step) =
-                self.routed_ground_step(current, waypoint, destination, acceptable_range)?
+            let Some(mut step) = self.routed_ground_step(
+                current,
+                waypoint,
+                destination,
+                acceptable_range,
+                use_3d_arrival,
+            )?
             else {
                 return Ok(None);
             };
@@ -510,6 +534,7 @@ impl MovementController {
         waypoint: Vec3,
         destination: Vec3,
         acceptable_range: f32,
+        use_3d_arrival: bool,
     ) -> Result<Option<MovementStep>, NavigationError> {
         let final_waypoint = waypoint.distance(destination) <= ROUTE_DESTINATION_EPSILON;
         let step_range = if final_waypoint {
@@ -517,12 +542,13 @@ impl MovementController {
         } else {
             INTERMEDIATE_WAYPOINT_RANGE
         };
-        next_step(
+        next_step_with_3d_arrival(
             current.point,
             waypoint,
             self.maximum_step,
             step_range,
             LocomotionMode::Ground,
+            use_3d_arrival,
         )
     }
 
@@ -704,6 +730,24 @@ pub fn next_step(
     acceptable_range: f32,
     mode: LocomotionMode,
 ) -> Result<Option<MovementStep>, NavigationError> {
+    next_step_with_3d_arrival(
+        current,
+        destination,
+        maximum_step,
+        acceptable_range,
+        mode,
+        false,
+    )
+}
+
+pub fn next_step_with_3d_arrival(
+    current: Vec3,
+    destination: Vec3,
+    maximum_step: f32,
+    acceptable_range: f32,
+    mode: LocomotionMode,
+    use_3d_arrival: bool,
+) -> Result<Option<MovementStep>, NavigationError> {
     if !current.is_finite()
         || !destination.is_finite()
         || !maximum_step.is_finite()
@@ -718,14 +762,22 @@ pub fn next_step(
             let dx = destination.x - current.x;
             let dy = destination.y - current.y;
             let horizontal = dx.hypot(dy);
-            if horizontal <= acceptable_range {
+            let distance = if use_3d_arrival {
+                current.distance(destination)
+            } else {
+                horizontal
+            };
+            if distance <= acceptable_range {
                 return Ok(None);
+            }
+            if horizontal <= f32::EPSILON {
+                return Err(NavigationError::NoRoute);
             }
             let step = maximum_step.min((horizontal - acceptable_range).max(0.25));
             let scale = step / horizontal.max(0.001);
             Ok(Some(MovementStep {
                 next: Vec3::new(current.x + dx * scale, current.y + dy * scale, current.z),
-                remaining: horizontal,
+                remaining: distance,
             }))
         }
         LocomotionMode::Flight => {
@@ -805,6 +857,26 @@ mod tests {
         .unwrap();
         assert_eq!(s.next.z, 10.0);
     }
+
+    #[test]
+    fn ground_search_can_continue_when_xy_is_close_but_3d_distance_is_outside_range() {
+        let current = Vec3::new(0.0, 0.0, 0.0);
+        let destination = Vec3::new(3.0, 0.0, 10.0);
+
+        assert!(
+            next_step(current, destination, 1.0, 5.0, LocomotionMode::Ground)
+                .unwrap()
+                .is_none()
+        );
+
+        let step =
+            next_step_with_3d_arrival(current, destination, 1.0, 5.0, LocomotionMode::Ground, true)
+                .unwrap()
+                .unwrap();
+        assert!(step.remaining > 5.0);
+        assert!(step.next.x > current.x);
+    }
+
     #[test]
     fn flight_advances_z() {
         let s = next_step(

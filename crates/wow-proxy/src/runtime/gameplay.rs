@@ -236,6 +236,7 @@ pub(super) fn encode_gameplay_command(
     const CMSG_USE_ITEM: u32 = 0x00AB;
     const CMSG_GAMEOBJ_USE: u32 = 0x00B1;
     const MSG_MOVE_STOP: u32 = 0x00B7;
+    const MSG_MOVE_START_FORWARD: u32 = 0x00B5;
     const MSG_MOVE_SET_FACING: u32 = 0x00DA;
     const MSG_MOVE_HEARTBEAT: u32 = 0x00EE;
     const CMSG_ATTACKSWING: u32 = 0x0141;
@@ -498,7 +499,11 @@ pub(super) fn encode_gameplay_command(
             );
             Ok(Some((
                 ClientFrame {
-                    opcode: MSG_MOVE_HEARTBEAT,
+                    opcode: if base_movement_flags & 0x0000_0001 == 0 {
+                        MSG_MOVE_START_FORWARD
+                    } else {
+                        MSG_MOVE_HEARTBEAT
+                    },
                     body,
                 },
                 Some((position, true, flags, movement_time)),

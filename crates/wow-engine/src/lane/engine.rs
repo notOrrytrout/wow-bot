@@ -90,6 +90,7 @@ const LOOT_ERROR_MASTER_INV_FULL: u8 = 12;
 const CORPSE_HOSTILE_CLEARANCE_YARDS: f32 = 18.0;
 const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MOVEMENT_STEP_INTERVAL: Duration = Duration::from_millis(100);
+const MOVEMENT_STEP_EARLY_TOLERANCE: Duration = Duration::from_millis(10);
 const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
 
@@ -490,6 +491,7 @@ impl LaneEngine {
                             .post_combat_loot
                             .as_ref()
                             .is_some_and(|(pending, _, _)| pending == target)
+                            && *error == Some(LOOT_ERROR_MASTER_INV_FULL)
                         {
                             self.post_combat_loot = None;
                         }
@@ -913,7 +915,7 @@ impl LaneEngine {
                 .as_ref()
                 .is_some_and(|movement| movement.purpose == MovementPurpose::SurvivalApproach)
             {
-                return self.tick_movement().await;
+                return true;
             }
             if self.pending_movement.is_some() {
                 tracing::info!(lane=?self.state.lane, ?attacker, "survival attacker preempted voluntary movement");
@@ -937,7 +939,7 @@ impl LaneEngine {
             self.current_work = None;
         }
         if self.pending_movement.is_some() {
-            return self.tick_movement().await;
+            return true;
         }
         if !self.bag_full_loot_targets.is_empty()
             && let Some(result) = self.tick_bag_relief(&snapshot).await
@@ -1884,7 +1886,9 @@ impl LaneEngine {
         }
         if movement
             .last_step
-            .is_some_and(|at| at.elapsed() < MOVEMENT_STEP_INTERVAL)
+            .is_some_and(|at| {
+                at.elapsed() < MOVEMENT_STEP_INTERVAL - MOVEMENT_STEP_EARLY_TOLERANCE
+            })
         {
             self.pending_movement = Some(movement);
             return true;
@@ -2087,7 +2091,11 @@ impl LaneEngine {
         };
         let locomotion =
             wow_navigation::LocomotionMode::from_server_flags(controlled_mover, movement_flags);
+        let use_3d_arrival = matches!(&movement.work.key, QuestWorkKey::TurnIn { .. });
         let distance = match locomotion {
+            wow_navigation::LocomotionMode::Ground if use_3d_arrival => {
+                player.point.distance(movement.destination.point)
+            }
             wow_navigation::LocomotionMode::Ground => (movement.destination.point.x
                 - player.point.x)
                 .hypot(movement.destination.point.y - player.point.y),
@@ -2376,16 +2384,17 @@ impl LaneEngine {
             .run_speed_yards_per_second
             .filter(|speed| speed.is_finite() && (0.1..=100.0).contains(speed))
             .unwrap_or(BASE_RUN_SPEED_YARDS_PER_SECOND);
-        let maximum_step = run_speed * MOVEMENT_STEP_INTERVAL.as_secs_f32();
+        let maximum_step = movement_step_distance(run_speed, movement.last_step, Instant::now());
         let step_result = match &self.movement_controller {
             Some(controller) => controller
                 .clone()
                 .with_maximum_step(maximum_step)
-                .next_step(
+                .next_step_with_3d_arrival(
                     player,
                     movement.destination.point,
                     movement.acceptable_range,
                     locomotion,
+                    use_3d_arrival,
                 ),
             None => Err(wow_navigation::NavigationError::MissingNavigationData),
         };
@@ -2523,6 +2532,24 @@ impl LaneEngine {
             return true;
         }
         if let Some((target, completed_at, cached_target)) = self.post_combat_loot.clone() {
+            if self.bag_full_loot_targets.contains(&target) {
+                self.waiting(format!(
+                    "post-combat corpse {target} is waiting for free inventory space"
+                ));
+                return true;
+            }
+            if self
+                .loot_retry_after
+                .get(&target)
+                .is_some_and(|(_, retry_after)| {
+                    retry_after.is_some_and(|deadline| deadline > Instant::now())
+                })
+            {
+                self.waiting(format!(
+                    "post-combat corpse {target} is waiting for its loot retry delay"
+                ));
+                return true;
+            }
             let corpse_present = self
                 .state
                 .authoritative
@@ -4424,6 +4451,14 @@ impl LaneEngine {
     }
 }
 
+fn movement_step_distance(run_speed: f32, last_step: Option<Instant>, now: Instant) -> f32 {
+    let elapsed = last_step
+        .map(|at| now.saturating_duration_since(at))
+        .unwrap_or(MOVEMENT_STEP_INTERVAL)
+        .clamp(MOVEMENT_STEP_INTERVAL, Duration::from_millis(250));
+    run_speed * elapsed.as_secs_f32()
+}
+
 fn corpse_reclaim_is_safe(
     entities: &BTreeMap<EntityId, wow_state::entities::EntityState>,
     player: EntityId,
@@ -4486,7 +4521,7 @@ fn quest_start_search_point_key(map: u32, point: Vec3) -> (u32, u32, u32, u32) {
     (map, x, y, z)
 }
 fn turn_in_search_arrived(player: Vec3, destination: Vec3) -> bool {
-    (destination.x - player.x).hypot(destination.y - player.y) <= TURN_IN_SEARCH_RANGE
+    player.distance(destination) <= TURN_IN_SEARCH_RANGE
 }
 fn quest_search_arrived(player: Vec3, destination: Vec3) -> bool {
     player.distance(destination) <= QUEST_SEARCH_ARRIVAL_RANGE
@@ -4566,6 +4601,22 @@ mod tests {
             .expect("full-bag relief should queue travel to a vendor");
         assert_eq!(movement.destination.point, destination);
         assert_eq!(movement.destination.map, initial_spawn.1.map_id);
+    }
+
+    #[test]
+    fn movement_step_uses_elapsed_packet_time_with_a_bounded_gap() {
+        let now = Instant::now();
+        assert!((movement_step_distance(7.0, None, now) - 0.7).abs() < 0.001);
+        assert!(
+            (movement_step_distance(7.0, Some(now - Duration::from_millis(200)), now) - 1.4)
+                .abs()
+                < 0.001
+        );
+        assert!(
+            (movement_step_distance(7.0, Some(now - Duration::from_secs(2)), now) - 1.75)
+                .abs()
+                < 0.001
+        );
     }
 
     #[test]
@@ -4681,6 +4732,81 @@ mod tests {
             },
         );
         test_engine(Mission::quest(MissionId(9)), authoritative)
+    }
+
+    #[tokio::test]
+    async fn rejected_post_combat_loot_keeps_corpse_queued_until_retry_then_loots_it() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        let target = EntityId(77);
+        authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::Unit,
+                health: Some((0, 100)),
+                position: Some(WorldPosition {
+                    map: 0,
+                    point: Vec3::new(2.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut proxy_rx) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        engine.post_combat_loot = Some((target, Instant::now(), None));
+        engine.pending_quest_action = Some(PendingQuestAction::CorpseLoot {
+            target,
+            baseline_generation: 0,
+            started: Instant::now(),
+        });
+
+        assert!(
+            engine
+                .handle(LaneMessage::Observation(
+                    ProtocolObservation::LootRejected {
+                        target,
+                        loot_type: 0,
+                        error: None,
+                    }
+                ))
+                .await
+        );
+        assert!(engine.pending_quest_action.is_none());
+        assert_eq!(
+            engine
+                .post_combat_loot
+                .as_ref()
+                .map(|(queued, _, _)| *queued),
+            Some(target)
+        );
+
+        assert!(engine.tick_quest().await);
+        assert!(proxy_rx.try_recv().is_err());
+
+        engine.loot_retry_after.get_mut(&target).unwrap().1 = Some(Instant::now());
+        assert!(engine.tick_quest().await);
+        let Some(PendingQuestAction::CorpseLootDelay { arrived_at, .. }) =
+            engine.pending_quest_action.as_mut()
+        else {
+            panic!("an in-range corpse must continue through the arrival delay");
+        };
+        *arrived_at = Instant::now() - Duration::from_secs(1);
+        assert!(engine.tick_quest().await);
+        let Ok(WorkerToProxy::Action(stop)) = proxy_rx.try_recv() else {
+            panic!("corpse arrival must stop movement before loot");
+        };
+        assert_eq!(stop.command(), &GameplayCommand::StopMovement);
+        let Ok(WorkerToProxy::Action(loot)) = proxy_rx.try_recv() else {
+            panic!("the retained post-combat corpse must receive a loot request");
+        };
+        assert_eq!(loot.command(), &GameplayCommand::Loot(target));
     }
 
     #[tokio::test]
@@ -5648,8 +5774,12 @@ mod tests {
             Vec3::new(17.8, 0.0, 0.0),
             destination
         ));
-        assert!(turn_in_search_arrived(
+        assert!(!turn_in_search_arrived(
             Vec3::new(4.9, 0.0, 0.0),
+            destination
+        ));
+        assert!(turn_in_search_arrived(
+            Vec3::new(2.0, 0.0, 17.0),
             destination
         ));
     }
