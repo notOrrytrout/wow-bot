@@ -48,6 +48,7 @@ pub struct ConfiguredSessionActor {
     pub supervisor_tx: mpsc::Sender<SupervisorCommand>,
     pub diagnostics: DiagnosticLogger,
     pub assistance_armed: tokio::sync::watch::Sender<bool>,
+    pub ownership_state: tokio::sync::watch::Sender<crate::ownership::OwnershipSnapshot>,
 }
 
 impl ConfiguredSessionActor {
@@ -387,6 +388,7 @@ impl ConfiguredSessionActor {
 
     async fn publish_ownership(&self) {
         let owner = self.state.ownership.snapshot();
+        self.ownership_state.send_replace(owner);
         self.assistance_armed
             .send_replace(owner.bot_assistance_armed());
         self.diagnostics.record(
@@ -436,6 +438,10 @@ mod tests {
             supervisor_tx,
             diagnostics: test_diagnostics(),
             assistance_armed: tokio::sync::watch::channel(false).0,
+            ownership_state: tokio::sync::watch::channel(
+                crate::ownership::AccountOwnership::default().snapshot(),
+            )
+            .0,
         };
         actor
             .handle(SessionMessage::PlayerAttached { connection: 1 })
@@ -479,6 +485,10 @@ mod tests {
             supervisor_tx,
             diagnostics: test_diagnostics(),
             assistance_armed,
+            ownership_state: tokio::sync::watch::channel(
+                crate::ownership::AccountOwnership::default().snapshot(),
+            )
+            .0,
         };
         let moved_at = Instant::now();
         actor.state.upstream_connected = true;
@@ -533,6 +543,10 @@ mod tests {
             supervisor_tx,
             diagnostics: test_diagnostics(),
             assistance_armed: tokio::sync::watch::channel(false).0,
+            ownership_state: tokio::sync::watch::channel(
+                crate::ownership::AccountOwnership::default().snapshot(),
+            )
+            .0,
         };
         let moved_at = Instant::now();
         actor.state.upstream_connected = true;

@@ -601,11 +601,8 @@ pub(super) fn parse_force_run_speed_change(body: &[u8]) -> Option<(EntityId, u32
     let move_event = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
     let rest = rest.get(5..)?;
     let speed = f32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
-    (guid != 0
-        && rest.len() == 4
-        && speed.is_finite()
-        && (0.1..=100.0).contains(&speed))
-    .then_some((EntityId(guid), move_event, speed))
+    (guid != 0 && rest.len() == 4 && speed.is_finite() && (0.1..=100.0).contains(&speed))
+        .then_some((EntityId(guid), move_event, speed))
 }
 
 pub(super) fn encode_force_run_speed_change_ack(
@@ -692,12 +689,18 @@ pub(super) fn decode_simple_movement(body: &[u8]) -> Option<(EntityId, u32, u32,
 
 pub(super) fn movement_matches_bot_visual(
     visual: WorldPosition,
+    visual_mover: EntityId,
     bot_opcode: u32,
+    client_mover: EntityId,
     point: Vec3,
     orientation: f32,
     client_opcode: u32,
 ) -> bool {
-    if !point.is_finite() || !orientation.is_finite() {
+    if visual_mover == EntityId(0)
+        || visual_mover != client_mover
+        || !point.is_finite()
+        || !orientation.is_finite()
+    {
         return false;
     }
     let Some(delta) = Radians::normalized(visual.orientation - orientation).map(|value| value.0)
@@ -705,9 +708,44 @@ pub(super) fn movement_matches_bot_visual(
         return false;
     };
     let angular = delta.min(std::f32::consts::TAU - delta);
-    point.distance(visual.point) <= 0.25
-        && angular <= 0.08
-        && (client_opcode == bot_opcode || client_opcode == 0x00EE)
+    point.distance(visual.point) <= 2.0
+        && angular <= 0.12
+        && (client_opcode == bot_opcode
+            || client_opcode == 0x00EE
+            || (is_explicit_player_movement_intent(client_opcode)
+                && is_explicit_player_movement_intent(bot_opcode)))
+}
+
+/// Check whether a client movement packet is valid physical takeover input.
+/// Passive feedback and correction acknowledgements do not pass this check.
+pub(super) fn validate_player_takeover(
+    opcode: u32,
+    mover: EntityId,
+    flags: u32,
+    expected_mover: Option<EntityId>,
+) -> Result<(), &'static str> {
+    if !is_explicit_player_movement_intent(opcode) {
+        return Err("packet is not explicit player movement intent");
+    }
+    if mover == EntityId(0) || expected_mover != Some(mover) {
+        return Err("movement mover GUID does not match the active player");
+    }
+    if flags & 0x3 == 0x3 || flags & 0xC == 0xC || flags & 0x30 == 0x30 {
+        return Err("movement flags contain contradictory directions");
+    }
+    let required = match opcode {
+        0x0B5 => Some(0x01), // start forward
+        0x0B6 => Some(0x02), // start backward
+        0x0B8 => Some(0x04), // start strafe left
+        0x0B9 => Some(0x08), // start strafe right
+        0x0BC => Some(0x10), // start turn left
+        0x0BD => Some(0x20), // start turn right
+        _ => None,
+    };
+    if required.is_some_and(|flag| flags & flag == 0) {
+        return Err("movement opcode does not match movement flags");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
