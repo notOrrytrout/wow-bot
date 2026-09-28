@@ -162,23 +162,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proxy_defaults_match_example_config() {
-        let example: AppConfig =
-            serde_json::from_str(include_str!("../../../../config.example.json"))
-                .expect("example config should deserialize");
-        let defaults = AppConfig::default();
+    fn example_config_matches_serialized_defaults() {
+        let expected = serde_json::to_string_pretty(&AppConfig::default())
+            .expect("default config should serialize")
+            + "\n";
 
-        assert_eq!(example.upstream.auth_host, defaults.upstream.auth_host);
-        assert_eq!(example.upstream.auth_port, defaults.upstream.auth_port);
-        assert_eq!(example.upstream.world_host, defaults.upstream.world_host);
-        assert_eq!(example.upstream.world_port, defaults.upstream.world_port);
-        assert_eq!(example.proxy.auth_bind, defaults.proxy.auth_bind);
-        assert_eq!(example.proxy.world_bind, defaults.proxy.world_bind);
-        assert_eq!(
-            example.proxy.transparent_world_bind,
-            defaults.proxy.transparent_world_bind
-        );
-        assert_eq!(example.proxy.advertise_host, defaults.proxy.advertise_host);
+        assert_eq!(include_str!("../../../../config.example.json"), expected);
     }
 
     #[test]

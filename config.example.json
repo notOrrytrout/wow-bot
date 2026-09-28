@@ -39,14 +39,5 @@
     "max_pre_auth_connections_per_ip": 8,
     "warden_client_image": null
   },
-  "accounts": [
-    {
-      "lane": 1,
-      "account": 1,
-      "account_name": "YOUR_ACCOUNT",
-      "password": "REPLACE_WITH_ACCOUNT_PASSWORD",
-      "character": "YOUR_CHARACTER",
-      "enabled": true
-    }
-  ]
+  "accounts": []
 }

@@ -81,6 +81,12 @@ Set `WOW_BOT_HOME` to use another writable root. The main log is `wow-bot-data/l
 
 The AzerothCore data directory is a separate, read-only input.
 
+`config.example.json` is generated from the Rust configuration defaults. After changing those defaults, regenerate the example from the workspace root:
+
+```sh
+cargo run -p wow-infra --example generate-config-example
+```
+
 ## Repository layout
 
 | Path | Purpose |
