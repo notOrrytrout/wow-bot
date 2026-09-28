@@ -1903,9 +1903,7 @@ impl LaneEngine {
         }
         if movement
             .last_step
-            .is_some_and(|at| {
-                at.elapsed() < MOVEMENT_STEP_INTERVAL - MOVEMENT_STEP_EARLY_TOLERANCE
-            })
+            .is_some_and(|at| at.elapsed() < MOVEMENT_STEP_INTERVAL - MOVEMENT_STEP_EARLY_TOLERANCE)
         {
             self.pending_movement = Some(movement);
             return true;
@@ -2214,7 +2212,13 @@ impl LaneEngine {
             tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, remaining=distance, purpose=?movement.purpose, "owned movement work reached interaction envelope");
             self.record_search_arrival(&movement);
             self.stop_owned_movement(movement.purpose).await;
-            self.current_work = None;
+            // Keep the quest focus after reaching a search point. Reaching a
+            // hint is not a reason to abandon that quest: the next scheduler
+            // pass must continue searching this objective until it finds a
+            // live target or a movement failure clears the work.
+            if !is_quest_search_work(&movement) {
+                self.current_work = None;
+            }
             if let Some(resume) = movement.resume.take() {
                 let work_key = movement.work.key.clone();
                 tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, command=?resume, work=?work_key, "resuming quest action after movement");
@@ -2501,7 +2505,7 @@ impl LaneEngine {
                     self.record_failed_search_destination(&movement);
                     tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, x=movement.destination.point.x, y=movement.destination.point.y, attempt=movement.route_failures, "search destination has no route after three step attempts; trying another destination");
                     self.stop_owned_movement(movement.purpose).await;
-                    self.current_work = None;
+                    self.clear_quest_search_focus(movement.work.id);
                     return true;
                 }
                 self.waiting(format!("movement step rejected: {error:?}"));
@@ -2555,6 +2559,17 @@ impl LaneEngine {
     fn next_incomplete_quest(&self) -> Option<u32> {
         let now = Instant::now();
         let active = &self.state.authoritative.quests.active;
+        let focused_quest = self.current_work.as_ref().and_then(|work| match &work.key {
+            QuestWorkKey::TravelToObjective { quest, .. }
+            | QuestWorkKey::CollectItem { quest, .. } => active
+                .get(quest)
+                .filter(|progress| !progress.complete)
+                .map(|_| *quest),
+            _ => None,
+        });
+        if focused_quest.is_some() {
+            return focused_quest;
+        }
         let available = active
             .iter()
             .find(|(quest, progress)| {
@@ -3317,6 +3332,16 @@ impl LaneEngine {
         work
     }
 
+    fn clear_quest_search_focus(&mut self, failed_work_id: QuestWorkId) {
+        if self
+            .current_work
+            .as_ref()
+            .is_some_and(|work| work.id == failed_work_id)
+        {
+            self.current_work = None;
+        }
+    }
+
     fn record_search_arrival(&mut self, movement: &PendingMovement) {
         if movement.purpose != MovementPurpose::SearchArea {
             return;
@@ -4027,9 +4052,7 @@ impl LaneEngine {
                         }
                     } else {
                         tracing::warn!(lane=?self.state.lane, ?target, ?check, "corpse loot request blocked by authoritative precondition check");
-                        self.waiting(format!(
-                            "corpse {target} is not ready to loot: {check:?}"
-                        ));
+                        self.waiting(format!("corpse {target} is not ready to loot: {check:?}"));
                         return true;
                     }
                 }
@@ -4967,13 +4990,11 @@ mod tests {
         let now = Instant::now();
         assert!((movement_step_distance(7.0, None, now) - 0.7).abs() < 0.001);
         assert!(
-            (movement_step_distance(7.0, Some(now - Duration::from_millis(200)), now) - 1.4)
-                .abs()
+            (movement_step_distance(7.0, Some(now - Duration::from_millis(200)), now) - 1.4).abs()
                 < 0.001
         );
         assert!(
-            (movement_step_distance(7.0, Some(now - Duration::from_secs(2)), now) - 1.75)
-                .abs()
+            (movement_step_distance(7.0, Some(now - Duration::from_secs(2)), now) - 1.75).abs()
                 < 0.001
         );
     }
@@ -6189,6 +6210,67 @@ mod tests {
         engine
             .search_retry_after
             .insert((3361, 0, 0), Instant::now() + Duration::from_secs(30));
+        assert_eq!(engine.next_incomplete_quest(), Some(182));
+    }
+
+    #[test]
+    fn far_apart_collection_quest_keeps_focus_while_search_is_retrying() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative
+            .quests
+            .active
+            .insert(182, wow_state::quests::QuestProgress::default());
+        authoritative
+            .quests
+            .active
+            .insert(3361, wow_state::quests::QuestProgress::default());
+        let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(10)), authoritative);
+        let nearby = WorldPosition {
+            map: 0,
+            point: Vec3::new(-6509.0, 301.0, 0.0),
+            orientation: 0.0,
+        };
+        let far = WorldPosition {
+            map: 0,
+            point: Vec3::new(-6375.0, 774.0, 0.0),
+            orientation: 0.0,
+        };
+        assert!(nearby.point.distance(far.point) > 400.0);
+
+        engine.set_work(QuestWorkKey::CollectItem {
+            quest: 3361,
+            item: 10438,
+        });
+        engine.search_retry_after.insert(
+            (3361, usize::MAX, 10438),
+            Instant::now() + Duration::from_secs(5),
+        );
+
+        assert_eq!(engine.next_incomplete_quest(), Some(3361));
+    }
+
+    #[test]
+    fn genuine_search_path_failure_clears_focus_and_allows_quest_selection_change() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative
+            .quests
+            .active
+            .insert(182, wow_state::quests::QuestProgress::default());
+        authoritative
+            .quests
+            .active
+            .insert(3361, wow_state::quests::QuestProgress::default());
+        let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(10)), authoritative);
+
+        let failed_search_work = engine.set_work(QuestWorkKey::CollectItem {
+            quest: 3361,
+            item: 10438,
+        });
+        assert_eq!(engine.next_incomplete_quest(), Some(3361));
+
+        // The production no-route branch clears this work after repeated
+        // failures. Without that focus, normal quest ordering can choose 182.
+        engine.clear_quest_search_focus(failed_search_work.id);
         assert_eq!(engine.next_incomplete_quest(), Some(182));
     }
 
