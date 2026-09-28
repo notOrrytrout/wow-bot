@@ -90,6 +90,8 @@ const LOOT_ERROR_MASTER_INV_FULL: u8 = 12;
 const CORPSE_HOSTILE_CLEARANCE_YARDS: f32 = 18.0;
 const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MOVEMENT_STEP_INTERVAL: Duration = Duration::from_millis(100);
+const MOVEMENT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+const MOVEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const MOVEMENT_STEP_EARLY_TOLERANCE: Duration = Duration::from_millis(10);
 const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
@@ -1740,14 +1742,18 @@ impl LaneEngine {
     fn local_world_position(&self, point: Vec3) -> WorldPosition {
         WorldPosition {
             map: self
-                .state
-                .authoritative
-                .control
-                .active_position(self.state.authoritative.position.player)
+                .active_mover_position()
                 .map_or(0, |position| position.map),
             point,
             orientation: 0.0,
         }
+    }
+
+    fn active_mover_position(&self) -> Option<WorldPosition> {
+        self.state
+            .authoritative
+            .control
+            .active_position(self.state.authoritative.position.player)
     }
 
     fn travel_action_for(&self, destination: Vec3) -> Option<wow_policy::travel::TravelAction> {
@@ -2151,7 +2157,11 @@ impl LaneEngine {
             }
         };
 
-        if movement.started_at.elapsed() >= Duration::from_secs(90) {
+        let movement_failure = movement_failure(
+            movement.started_at.elapsed(),
+            movement.last_progress_at.elapsed(),
+        );
+        if movement_failure == Some(MovementFailure::TimedOut) {
             tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, ?locomotion, remaining=distance, "movement operation timed out");
             self.stop_owned_movement(movement.purpose).await;
             self.current_work = None;
@@ -2162,7 +2172,7 @@ impl LaneEngine {
             return true;
         }
 
-        if movement.last_progress_at.elapsed() >= Duration::from_secs(5) {
+        if movement_failure == Some(MovementFailure::Stalled) {
             let reason = if movement.last_position_update_at.elapsed() >= Duration::from_secs(5) {
                 "no_new_authoritative_position"
             } else {
@@ -2483,8 +2493,8 @@ impl LaneEngine {
                 return true;
             }
             Err(error) => {
-                let no_route = matches!(&error, wow_navigation::NavigationError::NoRoute);
-                if no_route {
+                let genuine_path_failure = is_terminal_navigation_failure(&error);
+                if genuine_path_failure {
                     movement.route_failures = movement.route_failures.saturating_add(1);
                 }
                 self.diagnostic(
@@ -2498,12 +2508,12 @@ impl LaneEngine {
                         "attempt": movement.route_failures,
                     }),
                 );
-                if no_route
+                if genuine_path_failure
                     && movement.purpose == MovementPurpose::SearchArea
                     && movement.route_failures >= 3
                 {
                     self.record_failed_search_destination(&movement);
-                    tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, x=movement.destination.point.x, y=movement.destination.point.y, attempt=movement.route_failures, "search destination has no route after three step attempts; trying another destination");
+                    tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, x=movement.destination.point.x, y=movement.destination.point.y, attempt=movement.route_failures, reason=?error, "search destination path failed after three step attempts; trying another destination");
                     self.stop_owned_movement(movement.purpose).await;
                     self.clear_quest_search_focus(movement.work.id);
                     return true;
@@ -2736,7 +2746,7 @@ impl LaneEngine {
                 .await;
         }
 
-        if let Some(player) = self.state.authoritative.position.player {
+        if let Some(player) = self.active_mover_position() {
             let active_quests = &self.state.authoritative.quests.active;
             let radius = if active_quests.is_empty() {
                 QUEST_START_EMPTY_LOG_RADIUS_YARDS
@@ -3015,16 +3025,10 @@ impl LaneEngine {
                     objective: usize::MAX,
                     destination,
                 });
-                if self
-                    .state
-                    .authoritative
-                    .position
-                    .player
-                    .is_some_and(|player| {
-                        player.map == destination.map
-                            && quest_tool_search_arrived(player.point, destination.point)
-                    })
-                {
+                if self.active_mover_position().is_some_and(|player| {
+                    player.map == destination.map
+                        && quest_tool_search_arrived(player.point, destination.point)
+                }) {
                     self.waiting(format!("quest {quest} reached quest-control search area; waiting for live authoritative control object"));
                     return true;
                 }
@@ -3135,12 +3139,7 @@ impl LaneEngine {
                     return true;
                 }
                 let key = (quest, objective, 0);
-                let current_pos = self
-                    .state
-                    .authoritative
-                    .position
-                    .player
-                    .map(|player| player.point);
+                let current_pos = self.active_mover_position().map(|position| position.point);
                 let arrived = current_pos
                     .is_some_and(|position| quest_search_arrived(position, destination.point));
                 let candidates = bounded_candidates(
@@ -3173,21 +3172,13 @@ impl LaneEngine {
             } => {
                 let work = self.set_work(QuestWorkKey::CollectItem { quest, item });
                 let key = (quest, usize::MAX, item);
-                let current_pos = self
-                    .state
-                    .authoritative
-                    .position
-                    .player
-                    .map(|player| player.point);
+                let active_position = self.active_mover_position();
+                let current_pos = active_position.map(|position| position.point);
                 let candidates = bounded_candidates_within(
                     destinations
                         .into_iter()
                         .filter(|position| {
-                            self.state
-                                .authoritative
-                                .position
-                                .player
-                                .is_some_and(|player| player.map == position.map)
+                            active_position.is_some_and(|active| active.map == position.map)
                         })
                         .map(|position| position.point)
                         .collect(),
@@ -3277,7 +3268,7 @@ impl LaneEngine {
                 .propose_command(GameplayCommand::TurnInQuest { quest, giver }, true)
                 .await;
         }
-        if let Some(player) = self.state.authoritative.position.player {
+        if let Some(player) = self.active_mover_position() {
             if let Some(destination) =
                 wow_policy::questing::static_hints::nearest_turn_in(quest, player.map, player.point)
             {
@@ -3350,7 +3341,7 @@ impl LaneEngine {
             &movement.work.key,
             QuestWorkKey::AcquireQuest { quest: None }
         ) {
-            if let Some(player) = self.state.authoritative.position.player {
+            if let Some(player) = self.active_mover_position() {
                 self.quest_start_search_attempts
                     .insert(quest_start_search_point_key(
                         player.map,
@@ -4677,6 +4668,36 @@ fn bounded_candidates_within(
     candidates.dedup();
     candidates.truncate(5);
     candidates
+}
+
+fn is_terminal_navigation_failure(error: &wow_navigation::NavigationError) -> bool {
+    matches!(
+        error,
+        wow_navigation::NavigationError::InvalidCoordinate
+            | wow_navigation::NavigationError::MissingNavigationData
+            | wow_navigation::NavigationError::NoRoute
+            | wow_navigation::NavigationError::FloorDiscontinuity
+            | wow_navigation::NavigationError::RetryExhausted
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MovementFailure {
+    TimedOut,
+    Stalled,
+}
+
+fn movement_failure(
+    movement_elapsed: Duration,
+    no_progress_elapsed: Duration,
+) -> Option<MovementFailure> {
+    if movement_elapsed >= MOVEMENT_OPERATION_TIMEOUT {
+        Some(MovementFailure::TimedOut)
+    } else if no_progress_elapsed >= MOVEMENT_STALL_TIMEOUT {
+        Some(MovementFailure::Stalled)
+    } else {
+        None
+    }
 }
 
 fn search_point_key(point: Vec3) -> (u32, u32, u32) {
@@ -6250,6 +6271,27 @@ mod tests {
     }
 
     #[test]
+    fn quest_navigation_position_prefers_controlled_mover_over_player() {
+        let (mut engine, _proxy_rx) =
+            test_engine(Mission::quest(MissionId(11)), Default::default());
+        let player = WorldPosition {
+            map: 0,
+            point: Vec3::new(10.0, 20.0, 0.0),
+            orientation: 0.0,
+        };
+        let mover = WorldPosition {
+            map: 1,
+            point: Vec3::new(100.0, 200.0, 5.0),
+            orientation: 1.0,
+        };
+        engine.state.authoritative.position.player = Some(player);
+        engine.state.authoritative.control.mover = Some(EntityId(99));
+        engine.state.authoritative.control.mover_position = Some(mover);
+
+        assert_eq!(engine.active_mover_position(), Some(mover));
+    }
+
+    #[test]
     fn genuine_search_path_failure_clears_focus_and_allows_quest_selection_change() {
         let mut authoritative = wow_state::AuthoritativeState::default();
         authoritative
@@ -6293,6 +6335,46 @@ mod tests {
         assert_eq!(candidates.len(), 5);
         assert_eq!(candidates[0], Vec3::new(1.0, 0.0, 0.0));
         assert!(!candidates.contains(&Vec3::new(300.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn navigation_failures_separate_path_errors_from_temporary_planner_errors() {
+        for error in [
+            wow_navigation::NavigationError::InvalidCoordinate,
+            wow_navigation::NavigationError::MissingNavigationData,
+            wow_navigation::NavigationError::NoRoute,
+            wow_navigation::NavigationError::FloorDiscontinuity,
+            wow_navigation::NavigationError::RetryExhausted,
+        ] {
+            assert!(is_terminal_navigation_failure(&error), "{error:?}");
+        }
+        for error in [
+            wow_navigation::NavigationError::RoutePlannerBusy,
+            wow_navigation::NavigationError::RoutePlanningCancelled,
+            wow_navigation::NavigationError::RoutePlanningDeadlineExceeded,
+        ] {
+            assert!(!is_terminal_navigation_failure(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn movement_failure_uses_bounded_stall_and_operation_limits() {
+        assert_eq!(
+            movement_failure(Duration::from_secs(4), Duration::from_secs(4)),
+            None
+        );
+        assert_eq!(
+            movement_failure(Duration::from_secs(5), MOVEMENT_STALL_TIMEOUT),
+            Some(MovementFailure::Stalled)
+        );
+        assert_eq!(
+            movement_failure(MOVEMENT_OPERATION_TIMEOUT, Duration::from_secs(4)),
+            Some(MovementFailure::TimedOut)
+        );
+        assert_eq!(
+            movement_failure(MOVEMENT_OPERATION_TIMEOUT, MOVEMENT_STALL_TIMEOUT),
+            Some(MovementFailure::TimedOut)
+        );
     }
 
     #[test]

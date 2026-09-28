@@ -87,7 +87,10 @@ pub fn resolve_with_exclusions(
     let Some(definition) = snapshot.state.quests.definitions.get(&quest) else {
         return ObjectiveResolution::WaitingForDefinition;
     };
-    let player = snapshot.state.position.player;
+    let player = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player);
 
     if let Some(rule) = static_hints::quest_item_use_rule(quest) {
         let kind: QuestTargetKind = rule.kind.into();
@@ -771,6 +774,53 @@ mod tests {
                 cast_count: 1
             }
         );
+    }
+
+    #[test]
+    fn quest_search_candidates_use_the_controlled_mover_map_and_position() {
+        let mut state = AuthoritativeState::default();
+        state.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(100.0, 200.0, 0.0),
+            orientation: 0.0,
+        });
+        state.control.mover_position = Some(WorldPosition {
+            map: 1,
+            point: Vec3::new(50.0, 60.0, 2.0),
+            orientation: 0.0,
+        });
+        state.quests.active.insert(
+            5441,
+            QuestProgress {
+                complete: false,
+                objectives: vec![0],
+            },
+        );
+        state.quests.definitions.insert(
+            5441,
+            QuestDefinition {
+                quest: 5441,
+                title: "Lazy Peons".into(),
+                poi_map: None,
+                poi_x: None,
+                poi_y: None,
+                targets: vec![QuestTargetObjective {
+                    slot: 0,
+                    kind: QuestTargetKind::Creature,
+                    entry: 10556,
+                    required: 5,
+                    item_drop: 0,
+                    text: "Lazy Peons awakened".into(),
+                }],
+                items: vec![],
+            },
+        );
+
+        let resolution = resolve(&Snapshot::from_state(&state), 5441);
+        let ObjectiveResolution::SearchArea { destination, .. } = resolution else {
+            panic!("expected a static quest search destination");
+        };
+        assert_eq!(destination.map, 1);
     }
 
     #[test]
