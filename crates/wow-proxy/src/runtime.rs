@@ -78,6 +78,23 @@ fn rejected_loot_target_without_response(
     if response_seen { None } else { target }
 }
 
+fn validate_near_teleport_ack(
+    body: &[u8],
+    expected: Option<(EntityId, u32)>,
+    player_guid: Option<EntityId>,
+    controlled_mover: Option<EntityId>,
+) -> Result<(EntityId, u32, u32), &'static str> {
+    let decoded =
+        decode_near_teleport_ack(body).ok_or("malformed near-teleport acknowledgement")?;
+    if expected != Some((decoded.0, decoded.1)) {
+        return Err("near-teleport acknowledgement does not match pending correction");
+    }
+    if player_guid != Some(decoded.0) && controlled_mover != Some(decoded.0) {
+        return Err("near-teleport acknowledgement mover is not controlled by this session");
+    }
+    Ok(decoded)
+}
+
 fn encode_body_hex(body: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(body.len().saturating_mul(2));
@@ -165,8 +182,8 @@ pub struct ManagedLane {
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
-#[derive(Clone)]
-struct MovementMirror {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MovementStamp {
     source: MovementVisualSource,
     session_id: u64,
     sequence: u64,
@@ -174,16 +191,46 @@ struct MovementMirror {
     movement_epoch: u64,
     route_epoch: u64,
     world_generation: u64,
+}
+
+#[derive(Clone)]
+struct MovementMirror {
+    stamp: MovementStamp,
     frame: crate::framing::ServerFrame,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MovementVisualSource {
+    Player,
     Bot,
+    Server,
+    ProxyHandoff,
+}
+
+impl MovementStamp {
+    fn new(
+        source: MovementVisualSource,
+        session_id: u64,
+        sequence: u64,
+        owner: crate::ownership::OwnershipSnapshot,
+        route_epoch: u64,
+        world_generation: u64,
+    ) -> Self {
+        Self {
+            source,
+            session_id,
+            sequence,
+            ownership_generation: owner.generation.get(),
+            movement_epoch: owner.movement_epoch.get(),
+            route_epoch,
+            world_generation,
+        }
+    }
 }
 
 fn movement_visual_is_current(
-    visual: &MovementMirror,
+    stamp: MovementStamp,
+    expected_source: MovementVisualSource,
     session_id: u64,
     ownership_generation: u64,
     movement_epoch: u64,
@@ -191,18 +238,70 @@ fn movement_visual_is_current(
     world_generation: u64,
     last_sequence: u64,
 ) -> bool {
-    visual.source == MovementVisualSource::Bot
-        && visual.session_id == session_id
-        && visual.ownership_generation == ownership_generation
-        && visual.movement_epoch == movement_epoch
-        && visual.route_epoch == route_epoch
-        && visual.world_generation == world_generation
-        && visual.sequence > last_sequence
+    stamp.source == expected_source
+        && stamp.session_id == session_id
+        && stamp.ownership_generation == ownership_generation
+        && stamp.movement_epoch == movement_epoch
+        && stamp.route_epoch == route_epoch
+        && stamp.world_generation == world_generation
+        && stamp.sequence > last_sequence
 }
 
 fn invalidate_movement_mirror(epoch: &mut u64, updates: &watch::Sender<Option<MovementMirror>>) {
     *epoch = epoch.wrapping_add(1).max(1);
     updates.send_replace(None);
+}
+
+fn next_movement_sequence(sequence: &mut u64) -> u64 {
+    *sequence = sequence.wrapping_add(1).max(1);
+    *sequence
+}
+
+fn is_server_movement_visual_opcode(opcode: u32) -> bool {
+    matches!(opcode, 0x00C7 | 0x00DD | 0x02AE)
+}
+
+fn is_movement_observation(observation: &ProtocolObservation) -> bool {
+    matches!(
+        observation,
+        ProtocolObservation::PlayerPosition { .. } | ProtocolObservation::ControlledMover { .. }
+    )
+}
+
+async fn fence_actor_movement(
+    account: &AccountRuntime,
+) -> Option<(wow_domain::MovementEpoch, u64)> {
+    let (committed, receiver) = oneshot::channel();
+    if account
+        .session_tx
+        .send(SessionMessage::WorldTransition { committed })
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    receiver.await.ok()
+}
+
+async fn fence_world_movement(
+    account: &AccountRuntime,
+    world_generation: &mut u64,
+    mirror_epoch: &mut u64,
+    mirror_updates: &watch::Sender<Option<MovementMirror>>,
+) -> bool {
+    *world_generation = world_generation.wrapping_add(1).max(1);
+    invalidate_movement_mirror(mirror_epoch, mirror_updates);
+    match fence_actor_movement(account).await {
+        Some((epoch, committed_world_generation)) => {
+            *world_generation = committed_world_generation;
+            tracing::info!(account=%account.config.account_name, world_generation=*world_generation, movement_epoch=epoch.get(), "movement fenced for world transition");
+            true
+        }
+        None => {
+            tracing::error!(account=%account.config.account_name, world_generation=*world_generation, "world transition movement fence was not committed");
+            false
+        }
+    }
 }
 
 impl Drop for AbortOnDrop {
@@ -215,13 +314,14 @@ impl Drop for AbortOnDrop {
 struct AccountRuntime {
     config: ProxyAccountConfig,
     session_tx: mpsc::Sender<SessionMessage>,
-    command_bus: broadcast::Sender<GameplayCommand>,
+    command_bus: broadcast::Sender<crate::configured_session::GameplayDispatch>,
     supervisor_tx: mpsc::Sender<SupervisorCommand>,
     mission_counter: Arc<AtomicU64>,
     headless_enabled: watch::Sender<bool>,
     headless_active: Arc<std::sync::atomic::AtomicBool>,
     assistance_armed: watch::Sender<bool>,
     ownership_state: watch::Sender<crate::ownership::OwnershipSnapshot>,
+    movement_gate: Arc<tokio::sync::Mutex<()>>,
     player_worlds: Arc<Mutex<PlayerWorlds>>,
 }
 
@@ -516,6 +616,7 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
         let state =
             ConfiguredSessionState::new(lane.config.account, lane.config.lane, lane.config.worker);
         let (ownership_state, _) = watch::channel(state.ownership.snapshot());
+        let movement_gate = Arc::new(tokio::sync::Mutex::new(()));
         let supervisor_for_runtime = lane.supervisor_tx.clone();
         session_actors.push(tokio::spawn(
             ConfiguredSessionActor {
@@ -527,6 +628,10 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
                 diagnostics: diagnostics.clone(),
                 assistance_armed: assistance_armed.clone(),
                 ownership_state: ownership_state.clone(),
+                movement_gate: movement_gate.clone(),
+                world_generation: 1,
+                movement_sequence: 0,
+                last_worker_movement_sequence: None,
             }
             .run(),
         ));
@@ -557,6 +662,7 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
                 headless_active,
                 assistance_armed,
                 ownership_state,
+                movement_gate,
                 player_worlds: Arc::new(Mutex::new(PlayerWorlds::default())),
             },
         );
@@ -974,16 +1080,32 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     let mut movement_clock = MovementClock::default();
     static NEXT_WORLD_SESSION: AtomicU64 = AtomicU64::new(1);
     let movement_session_id = NEXT_WORLD_SESSION.fetch_add(1, Ordering::Relaxed).max(1);
+    let mut movement_world_generation = 1_u64;
     let mut last_bot_visual: Option<(WorldPosition, EntityId, u32, std::time::Instant)> = None;
+    let mut last_bot_command_sequence: Option<(u64, u64, u64)> = None;
+    let mut pending_near_teleport_ack: Option<(EntityId, u32)> = None;
+    let mut pending_movement_corrections: VecDeque<MovementCorrectionExpectation> = VecDeque::new();
     let (movement_mirror_tx, mut movement_mirror_rx) = watch::channel(None::<MovementMirror>);
     let mut movement_mirror_sequence = 0_u64;
     let mut movement_mirror_epoch = 1_u64;
     let mut last_mirrored_sequence = 0_u64;
+    let mut last_player_sequence = 0_u64;
+    let mut last_server_sequence = 0_u64;
     let mut bot_loot_target: Option<EntityId> = None;
     let mut bot_loot_response_seen = false;
     let mut last_bot_cast: Option<(u32, Option<EntityId>, std::time::Instant)> = None;
     let (mut dr, mut dw) = downstream.into_split();
     let (mut ur, mut uw) = upstream.into_split();
+    if !fence_world_movement(
+        &account,
+        &mut movement_world_generation,
+        &mut movement_mirror_epoch,
+        &movement_mirror_tx,
+    )
+    .await
+    {
+        bail!("could not commit initial configured-world movement fence");
+    }
     let result: Result<()> = loop {
         tokio::select! {
             client = read_client_frame(&mut dr, &mut down_dec) => {
@@ -1010,9 +1132,59 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                     }
                 }
                 let mut suppress_client_movement_upstream = false;
+                let mut player_movement_stamp = None;
+                let mut proxy_handoff_stamp = None;
+                if u32::from(frame.opcode) == 0x00C7 {
+                    let expected_ack = pending_near_teleport_ack;
+                    let decoded_ack = validate_near_teleport_ack(
+                        &frame.body,
+                        expected_ack,
+                        player_guid,
+                        controlled_mover,
+                    );
+                    pending_near_teleport_ack = None;
+                    if let Err(reason) = decoded_ack {
+                        tracing::warn!(account=%account_name, source="server_correction", sequence=movement_mirror_sequence, session=movement_session_id, world_generation=movement_world_generation, opcode=frame.opcode, expected_ack=?expected_ack, ownership_generation=?ownership_state.borrow().generation, movement_epoch=?ownership_state.borrow().movement_epoch, reason, "dropped unmatched or malformed near-teleport acknowledgement");
+                        continue;
+                    }
+                    let sequence = next_movement_sequence(&mut movement_mirror_sequence);
+                    proxy_handoff_stamp = Some(MovementStamp::new(
+                        MovementVisualSource::ProxyHandoff,
+                        movement_session_id,
+                        sequence,
+                        *ownership_state.borrow(),
+                        movement_mirror_epoch,
+                        movement_world_generation,
+                    ));
+                    tracing::info!(account=%account_name, source="server_correction", sequence=movement_mirror_sequence, opcode=frame.opcode, mover=?decoded_ack.ok().map(|value| value.0), session=movement_session_id, world_generation=movement_world_generation, ownership_generation=?ownership_state.borrow().generation, movement_epoch=?ownership_state.borrow().movement_epoch, reason="matched pending correction", "accepted validated near-teleport acknowledgement");
+                }
+                if is_movement_correction_ack_opcode(u32::from(frame.opcode)) && u32::from(frame.opcode) != 0x00C7 {
+                    let matched = pending_movement_corrections.iter().position(|expected| {
+                        expected.ack_opcode == u32::from(frame.opcode)
+                            && (player_guid == Some(expected.mover) || controlled_mover == Some(expected.mover))
+                            && validate_movement_correction_ack(u32::from(frame.opcode), &frame.body, *expected).is_ok()
+                    });
+                    if let Some(index) = matched {
+                        let expected = pending_movement_corrections.remove(index).expect("matched correction index exists");
+                        let sequence = next_movement_sequence(&mut movement_mirror_sequence);
+                        proxy_handoff_stamp = Some(MovementStamp::new(
+                            MovementVisualSource::ProxyHandoff,
+                            movement_session_id,
+                            sequence,
+                            *ownership_state.borrow(),
+                            movement_mirror_epoch,
+                            movement_world_generation,
+                        ));
+                        tracing::info!(account=%account_name, source="server_correction", sequence=movement_mirror_sequence, opcode=frame.opcode, mover=?expected.mover, session=movement_session_id, world_generation=movement_world_generation, ownership_generation=?ownership_state.borrow().generation, movement_epoch=?ownership_state.borrow().movement_epoch, reason="matched pending correction", "accepted validated movement correction acknowledgement");
+                    } else {
+                        tracing::warn!(account=%account_name, source="server_correction", sequence=movement_mirror_sequence, opcode=frame.opcode, session=movement_session_id, world_generation=movement_world_generation, ownership_generation=?ownership_state.borrow().generation, movement_epoch=?ownership_state.borrow().movement_epoch, reason="no matching pending correction", "dropped unmatched or malformed movement correction acknowledgement");
+                        continue;
+                    }
+                }
                 if is_player_movement_opcode(frame.opcode) {
+                    let packet_sequence = next_movement_sequence(&mut movement_mirror_sequence);
                     let now = std::time::Instant::now();
-                    let decoded = decode_simple_movement(&frame.body);
+                    let decoded = decode_simple_movement(u32::from(frame.opcode), &frame.body);
                     let bot_locomotion_recent = ownership_state
                         .borrow()
                         .permits(crate::ownership::ClientKind::Bot)
@@ -1028,7 +1200,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         match validate_player_takeover(frame.opcode, guid, flags, player_guid) {
                             Ok(()) => true,
                             Err(reason) if is_explicit_player_movement_intent(frame.opcode) => {
-                                tracing::warn!(account=%account_name, opcode=frame.opcode, mover=?guid, expected_mover=?player_guid, flags, reason, "dropped invalid player movement takeover packet");
+                                tracing::warn!(account=%account_name, source="player", sequence=movement_mirror_sequence, session=movement_session_id, world_generation=movement_world_generation, opcode=frame.opcode, mover=?guid, expected_mover=?player_guid, flags, owner=?ownership_state.borrow().mode, ownership_generation=?ownership_state.borrow().generation, movement_epoch=?ownership_state.borrow().movement_epoch, reason, "dropped invalid player movement takeover packet");
                                 false
                             }
                             Err(_) => false,
@@ -1038,20 +1210,25 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         && !explicit_player_intent
                         && !matching_bot_echo;
 
-                    if matching_bot_echo {
+                    if invalid_explicit_packet {
                         suppress_client_movement_upstream = true;
-                        tracing::trace!(account=%account_name, opcode=frame.opcode, sequence=movement_mirror_sequence, owner="bot", session=movement_session_id, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, "suppressed matching bot-authored movement/facing echo");
-                    } else if invalid_explicit_packet {
-                        suppress_client_movement_upstream = true;
-                        if decoded.is_none() {
-                            tracing::warn!(account=%account_name, opcode=frame.opcode, owner=?ownership_state.borrow().mode, session=movement_session_id, "dropped malformed explicit player movement packet");
-                        }
                     } else if explicit_player_intent {
-                        // A non-echoed start/turn/jump/facing opcode is actual player intent.
-                        tracing::info!(account=%account_name, opcode=frame.opcode, sequence=movement_mirror_sequence, owner="player", session=movement_session_id, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, "accepted validated player movement takeover");
+                        // Validated player intent takes control even if it resembles a recent bot visual.
+                        tracing::info!(account=%account_name, source="player", opcode=frame.opcode, sequence=movement_mirror_sequence, owner=?ownership_state.borrow().mode, session=movement_session_id, world_generation=movement_world_generation, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, reason="validated explicit player intent", "accepted player movement takeover");
                         last_bot_visual = None;
                         invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
-                        let _ = account.session_tx.send(SessionMessage::PlayerMovement { at: now }).await;
+                        let (committed, receiver) = oneshot::channel();
+                        if account.session_tx.send(SessionMessage::PlayerMovement { at: now, committed }).await.is_err() {
+                            tracing::warn!(account=%account_name, opcode=frame.opcode, reason="session actor unavailable", "dropped player movement because ownership handoff could not be committed");
+                            continue;
+                        }
+                        if receiver.await.is_err() {
+                            tracing::warn!(account=%account_name, opcode=frame.opcode, reason="ownership handoff did not commit", "dropped player movement because ownership handoff did not complete");
+                            continue;
+                        }
+                    } else if should_suppress_bot_echo(matching_bot_echo, explicit_player_intent) {
+                        suppress_client_movement_upstream = true;
+                        tracing::trace!(account=%account_name, source="bot", opcode=frame.opcode, sequence=movement_mirror_sequence, owner=?ownership_state.borrow().mode, session=movement_session_id, world_generation=movement_world_generation, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, reason="matched recent bot visual without validated player intent", "suppressed matching bot-authored movement/facing echo");
                     } else if bot_locomotion_recent {
                         // AzerothCore intentionally does not echo the mover's movement
                         // packet back to that same player. We mirror bot movement locally
@@ -1059,7 +1236,31 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         // passive heartbeat/stop feedback. That feedback is not new human
                         // intent and must not fence the bot or overwrite its upstream path.
                         suppress_client_movement_upstream = true;
-                        tracing::trace!(account=%account_name, opcode=frame.opcode, sequence=movement_mirror_sequence, owner="bot", session=movement_session_id, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, "dropped passive client movement feedback during bot locomotion");
+                        tracing::trace!(account=%account_name, source="player", opcode=frame.opcode, sequence=movement_mirror_sequence, owner=?ownership_state.borrow().mode, session=movement_session_id, world_generation=movement_world_generation, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, reason="passive feedback while bot locomotion is active", "dropped passive client movement feedback");
+                    }
+
+                    if decoded.is_none() {
+                        suppress_client_movement_upstream = true;
+                        let owner = *ownership_state.borrow();
+                        tracing::warn!(account=%account_name, source="player", sequence=packet_sequence, session=movement_session_id, opcode=frame.opcode, owner=?owner.mode, attended_control=?owner.attended_control, ownership_generation=owner.generation.get(), movement_epoch=owner.movement_epoch.get(), world_generation=movement_world_generation, reason="malformed movement packet layout", "dropped malformed player movement packet");
+                    } else if decoded.is_some_and(|(guid, _, _, _, _)| player_guid != Some(guid))
+                        && !matching_bot_echo
+                        && !invalid_explicit_packet
+                    {
+                        suppress_client_movement_upstream = true;
+                        let owner = *ownership_state.borrow();
+                        tracing::warn!(account=%account_name, source="player", sequence=packet_sequence, session=movement_session_id, opcode=frame.opcode, mover=?decoded.map(|value| value.0), expected_mover=?player_guid, owner=?owner.mode, attended_control=?owner.attended_control, ownership_generation=owner.generation.get(), movement_epoch=owner.movement_epoch.get(), world_generation=movement_world_generation, reason="mover GUID is not the active player", "dropped player movement packet");
+                    }
+
+                    if !suppress_client_movement_upstream && decoded.is_some() {
+                        player_movement_stamp = Some(MovementStamp::new(
+                            MovementVisualSource::Player,
+                            movement_session_id,
+                            packet_sequence,
+                            *ownership_state.borrow(),
+                            movement_mirror_epoch,
+                            movement_world_generation,
+                        ));
                     }
 
                     if let Some((guid, flags, client_time, point, orientation)) = decoded
@@ -1107,22 +1308,26 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         match crate::commands::parse_local(text, family, true, mission_id) {
                             Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::On))) => {
                                 invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
-                                match account.session_tx.send(SessionMessage::BotOn).await {
-                                    Ok(()) => {
+                                let (committed, receiver) = oneshot::channel();
+                                match account.session_tx.send(SessionMessage::BotOn { committed: Some(committed) }).await {
+                                    Ok(()) if receiver.await == Ok(true) => {
                                         tracing::info!(account=%account_name, command=".bot on", "bot automation enabled");
                                         let _ = write_bot_notice(&mut dw, &mut down_enc, "[wow-bot] automation enabled").await;
                                     }
+                                    Ok(()) => tracing::warn!(account=%account_name, "bot ON ownership change did not commit"),
                                     Err(error) => tracing::error!(account=%account_name, %error, "failed to enable bot automation"),
                                 }
                                 continue;
                             }
                             Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::Off))) => {
                                 invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
-                                match account.session_tx.send(SessionMessage::BotOff).await {
-                                    Ok(()) => {
+                                let (committed, receiver) = oneshot::channel();
+                                match account.session_tx.send(SessionMessage::BotOff { committed: Some(committed) }).await {
+                                    Ok(()) if receiver.await == Ok(true) => {
                                         tracing::info!(account=%account_name, command=".bot off", "bot automation disabled");
                                         let _ = write_bot_notice(&mut dw, &mut down_enc, "[wow-bot] automation disabled").await;
                                     }
+                                    Ok(()) => tracing::warn!(account=%account_name, "bot OFF ownership change did not commit"),
                                     Err(error) => tracing::error!(account=%account_name, %error, "failed to disable bot automation"),
                                 }
                                 continue;
@@ -1178,11 +1383,53 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                     let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::LootClosed { ownership: wow_state::observation::LootOwnership::Player })).await;
                 }
                 if frame.opcode == CMSG_WARDEN_DATA::OPCODE { warden.client_to_server(&mut frame.body); }
-                if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &frame).await { break Err(e); }
+                if let Some(stamp) = player_movement_stamp.or(proxy_handoff_stamp) {
+                    let movement_guard = account.movement_gate.clone().lock_owned().await;
+                    let owner = *ownership_state.borrow();
+                    let source_is_permitted = match stamp.source {
+                        MovementVisualSource::Player => owner.permits(crate::ownership::ClientKind::Player),
+                        MovementVisualSource::ProxyHandoff => !owner.transitioning(),
+                        MovementVisualSource::Bot | MovementVisualSource::Server => false,
+                    };
+                    if !source_is_permitted
+                        || !movement_visual_is_current(
+                            stamp,
+                            stamp.source,
+                            movement_session_id,
+                            owner.generation.get(),
+                            owner.movement_epoch.get(),
+                            movement_mirror_epoch,
+                            movement_world_generation,
+                            last_player_sequence,
+                        )
+                    {
+                        tracing::warn!(account=%account_name, source=?stamp.source, sequence=stamp.sequence, session=stamp.session_id, owner=?owner.mode, ownership_generation=stamp.ownership_generation, movement_epoch=stamp.movement_epoch, world_generation=stamp.world_generation, reason="movement fence changed before upstream write", "dropped stale player movement packet");
+                        continue;
+                    }
+                    if stamp.source == MovementVisualSource::Player {
+                        last_player_sequence = stamp.sequence;
+                    }
+                    let write_result = write_client_frame(&mut uw, &mut up_enc, &frame).await;
+                    drop(movement_guard);
+                    if let Err(error) = write_result { break Err(error); }
+                } else if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &frame).await { break Err(e); }
             }
             command = commands.recv() => {
                 match command {
-                    Ok(command) => {
+                    Ok(dispatch) => {
+                        let owner = *ownership_state.borrow();
+                        if !dispatch.is_current(owner, movement_world_generation)
+                            || !dispatch.is_new_sequence(&mut last_bot_command_sequence)
+                        {
+                            let (generation, movement_epoch, sequence, world_generation) = match &dispatch {
+                                crate::configured_session::GameplayDispatch::BotMovement { generation, movement_epoch, sequence, world_generation, .. } =>
+                                    (Some(generation.get()), Some(movement_epoch.get()), Some(*sequence), Some(*world_generation)),
+                                crate::configured_session::GameplayDispatch::Unfenced(_) => (None, None, None, None),
+                            };
+                            tracing::warn!(account=%account_name, source="bot", sequence, session=movement_session_id, ownership_generation=generation, current_generation=owner.generation.get(), movement_epoch, current_epoch=owner.movement_epoch.get(), world_generation, current_world_generation=movement_world_generation, owner=?owner.mode, attended_control=?owner.attended_control, reason="stale stamp or sequence", "dropped stale bot movement command before upstream routing");
+                            continue;
+                        }
+                        let command = dispatch.command().clone();
                         {
                         if let Some(target) = bot_loot_target_for_command(&command) {
                             bot_loot_target = Some(target);
@@ -1224,6 +1471,15 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                     &frame.body,
                                 ).await;
                                 log_loot_wire_packet(&account_name, "bot_to_server", frame.opcode, &frame.body);
+                                let movement_guard = if dispatch.bot_movement_stamp().is_some() {
+                                    Some(account.movement_gate.clone().lock_owned().await)
+                                } else {
+                                    None
+                                };
+                                if !dispatch.is_current(*ownership_state.borrow(), movement_world_generation) {
+                                    tracing::warn!(account=%account_name, opcode=frame.opcode, "dropped bot movement command after ownership changed during encoding");
+                                    continue;
+                                }
                                 if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &frame).await { break Err(e); }
                                 if let Some((spell, target)) = bot_cast {
                                     tracing::info!(account=%account_name, opcode=frame.opcode, spell, ?target, "bot cast request transmitted");
@@ -1244,7 +1500,11 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                     // A set-facing packet is only a request. Keep the last
                                     // server-observed orientation until the upstream object
                                     // update confirms the turn.
-                                    if publish_movement_prediction {
+                                    let current_owner = *ownership_state.borrow();
+                                    let bot_visual_stamp = dispatch.bot_movement_stamp();
+                                    if publish_movement_prediction
+                                        && (bot_visual_stamp.is_none() || dispatch.is_current(current_owner, movement_world_generation))
+                                    {
                                         shared.action_logs.position(
                                             &account_name,
                                             "bot_prediction",
@@ -1262,23 +1522,33 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                             let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition { position, moving, flags, client_time })).await;
                                         }
                                     }
-                                    last_bot_visual = Some((position, movement_context.mover.unwrap_or(EntityId(0)), frame.opcode, std::time::Instant::now()));
-                                    if let Ok(opcode) = u16::try_from(frame.opcode) {
-                                        movement_mirror_sequence = movement_mirror_sequence.wrapping_add(1).max(1);
-                                        movement_mirror_tx.send_replace(Some(MovementMirror {
-                                            source: MovementVisualSource::Bot,
-                                            session_id: movement_session_id,
-                                            sequence: movement_mirror_sequence,
-                                            ownership_generation: ownership_state.borrow().generation.get(),
-                                            movement_epoch: ownership_state.borrow().movement_epoch.get(),
-                                            route_epoch: movement_mirror_epoch,
-                                            world_generation: movement_session_id,
-                                            frame: crate::framing::ServerFrame { opcode, body: frame.body.clone() },
-                                        }));
-                                    } else {
-                                        tracing::warn!(account=%account_name, opcode=frame.opcode, "bot movement opcode cannot be represented for the client mirror");
+                                    if let Some((generation, epoch, command_sequence, stamped_world_generation)) = bot_visual_stamp {
+                                        if dispatch.is_current(*ownership_state.borrow(), movement_world_generation) {
+                                            last_bot_visual = Some((position, movement_context.mover.unwrap_or(EntityId(0)), frame.opcode, std::time::Instant::now()));
+                                            if let Ok(opcode) = u16::try_from(frame.opcode) {
+                                                let sequence = next_movement_sequence(&mut movement_mirror_sequence);
+                                                let stamp = MovementStamp::new(
+                                                    MovementVisualSource::Bot,
+                                                    movement_session_id,
+                                                    sequence,
+                                                    *ownership_state.borrow(),
+                                                    movement_mirror_epoch,
+                                                    stamped_world_generation,
+                                                );
+                                                movement_mirror_tx.send_replace(Some(MovementMirror {
+                                                    stamp,
+                                                    frame: crate::framing::ServerFrame { opcode, body: frame.body.clone() },
+                                                }));
+                                                tracing::debug!(account=%account_name, source=?stamp.source, sequence=stamp.sequence, command_sequence, session=stamp.session_id, ownership_generation=stamp.ownership_generation, movement_epoch=stamp.movement_epoch, world_generation=stamp.world_generation, reason="accepted", "stamped bot movement visual");
+                                            } else {
+                                                tracing::warn!(account=%account_name, opcode=frame.opcode, "bot movement opcode cannot be represented for the client mirror");
+                                            }
+                                        } else {
+                                            tracing::warn!(account=%account_name, source="bot", command_sequence, session=movement_session_id, ownership_generation=generation.get(), movement_epoch=epoch.get(), world_generation=stamped_world_generation, "dropped movement visual after ownership changed during upstream write");
+                                        }
                                     }
                                 }
+                                drop(movement_guard);
                             }
                             Ok(None) => {}
                             Err(other) => tracing::warn!(account=%account_name, command=%other, "gameplay command has no WotLK encoder yet; command rejected before upstream write"),
@@ -1296,13 +1566,13 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         if let Some(update) = update {
                             let current_owner = *ownership_state.borrow();
                             if !current_owner.permits(crate::ownership::ClientKind::Bot)
-                                || !movement_visual_is_current(&update, movement_session_id, current_owner.generation.get(), current_owner.movement_epoch.get(), movement_mirror_epoch, movement_session_id, last_mirrored_sequence) {
-                                last_mirrored_sequence = last_mirrored_sequence.max(update.sequence);
-                                tracing::debug!(account=%account_name, source=?update.source, sequence=update.sequence, session=update.session_id, current_session=movement_session_id, update_generation=update.ownership_generation, current_generation=?current_owner.generation, update_epoch=update.movement_epoch, current_epoch=?current_owner.movement_epoch, world_generation=update.world_generation, "dropped stale or mismatched movement mirror");
+                                || !movement_visual_is_current(update.stamp, MovementVisualSource::Bot, movement_session_id, current_owner.generation.get(), current_owner.movement_epoch.get(), movement_mirror_epoch, movement_world_generation, last_mirrored_sequence) {
+                                last_mirrored_sequence = last_mirrored_sequence.max(update.stamp.sequence);
+                                tracing::debug!(account=%account_name, source=?update.stamp.source, sequence=update.stamp.sequence, session=update.stamp.session_id, current_session=movement_session_id, update_generation=update.stamp.ownership_generation, current_generation=?current_owner.generation, update_epoch=update.stamp.movement_epoch, current_epoch=?current_owner.movement_epoch, world_generation=update.stamp.world_generation, reason="stale or mismatched movement visual", "dropped movement mirror");
                                 continue;
                             }
-                            if update.sequence > last_mirrored_sequence.saturating_add(1) {
-                                tracing::warn!(account=%account_name, skipped=update.sequence - last_mirrored_sequence - 1, sequence=update.sequence, "movement mirror fell behind; sending the latest bot position");
+                            if update.stamp.sequence > last_mirrored_sequence.saturating_add(1) {
+                                tracing::warn!(account=%account_name, skipped=update.stamp.sequence - last_mirrored_sequence - 1, sequence=update.stamp.sequence, "movement mirror fell behind; sending the latest bot position");
                             }
                             shared.action_logs.packet(
                                 &account_name,
@@ -1311,14 +1581,33 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                 u32::from(update.frame.opcode),
                                 &update.frame.body,
                             ).await;
+                            let movement_guard = account.movement_gate.clone().lock_owned().await;
+                            let owner_before_write = *ownership_state.borrow();
+                            if !owner_before_write.permits(crate::ownership::ClientKind::Bot)
+                                || !movement_visual_is_current(
+                                    update.stamp,
+                                    MovementVisualSource::Bot,
+                                    movement_session_id,
+                                    owner_before_write.generation.get(),
+                                    owner_before_write.movement_epoch.get(),
+                                    movement_mirror_epoch,
+                                    movement_world_generation,
+                                    last_mirrored_sequence,
+                                )
+                            {
+                                last_mirrored_sequence = last_mirrored_sequence.max(update.stamp.sequence);
+                                tracing::debug!(account=%account_name, source=?update.stamp.source, sequence=update.stamp.sequence, session=update.stamp.session_id, ownership_generation=update.stamp.ownership_generation, movement_epoch=update.stamp.movement_epoch, world_generation=update.stamp.world_generation, reason="fence changed before downstream write", "dropped queued movement visual");
+                                continue;
+                            }
                             if let Err(error) = write_server_frame(&mut dw, &mut down_enc, &update.frame)
                                 .await
-                                .with_context(|| format!("failed to mirror bot movement update {} to the player client", update.sequence))
+                                .with_context(|| format!("failed to mirror bot movement update {} to the player client", update.stamp.sequence))
                             {
-                                tracing::error!(account=%account_name, sequence=update.sequence, %error, "player movement mirror failed; closing this world bridge for safe reconnect");
+                                tracing::error!(account=%account_name, sequence=update.stamp.sequence, %error, "player movement mirror failed; closing this world bridge for safe reconnect");
                                 break Err(error);
                             }
-                            last_mirrored_sequence = update.sequence;
+                            last_mirrored_sequence = update.stamp.sequence;
+                            drop(movement_guard);
                         }
                     }
                     Err(_) => {
@@ -1328,6 +1617,47 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
             }
             server = read_server_frame(&mut ur, &mut up_dec) => {
                 let mut frame = match server { Ok(v)=>v, Err(e)=>break Err(e) };
+                if matches!(u32::from(frame.opcode), 0x003E | 0x0236) {
+                    if !fence_world_movement(
+                        &account,
+                        &mut movement_world_generation,
+                        &mut movement_mirror_epoch,
+                        &movement_mirror_tx,
+                    ).await {
+                        break Err(anyhow::anyhow!("world-transition movement fence failed"));
+                    }
+                    last_bot_visual = None;
+                    pending_near_teleport_ack = None;
+                    pending_movement_corrections.clear();
+                }
+                let mut server_movement_stamp = if is_server_movement_visual_opcode(u32::from(frame.opcode)) {
+                    let sequence = next_movement_sequence(&mut movement_mirror_sequence);
+                    Some(MovementStamp::new(
+                        MovementVisualSource::Server,
+                        movement_session_id,
+                        sequence,
+                        *ownership_state.borrow(),
+                        movement_mirror_epoch,
+                        movement_world_generation,
+                    ))
+                } else {
+                    None
+                };
+                if u32::from(frame.opcode) == 0x00C7 {
+                    pending_near_teleport_ack = parse_server_near_teleport(&frame.body)
+                        .map(|(mover, flags, _, _)| (mover, flags))
+                        .filter(|(mover, _)| player_guid == Some(*mover) || controlled_mover == Some(*mover));
+                    if pending_near_teleport_ack.is_none() {
+                        tracing::warn!(account=%account_name, opcode=frame.opcode, "server near-teleport request has an invalid or unexpected mover; client acknowledgement will be rejected");
+                    }
+                } else if let Some(expected) = movement_correction_expectation(u32::from(frame.opcode), &frame.body)
+                    && (player_guid == Some(expected.mover) || controlled_mover == Some(expected.mover))
+                {
+                    if pending_movement_corrections.len() == 64 {
+                        pending_movement_corrections.pop_front();
+                    }
+                    pending_movement_corrections.push_back(expected);
+                }
                 shared.action_logs.packet(
                     &account_name,
                     "world",
@@ -1441,7 +1771,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                     object_observer.set_world(position.map, Some(guid));
                                     canonical_position = Some(*position);
                                     canonical_flags = 0;
-                                    let _ = account.command_bus.send(GameplayCommand::StopMovement);
+                                    let _ = account.command_bus.send(crate::configured_session::GameplayDispatch::Unfenced(GameplayCommand::StopMovement));
                                 }
                                 tracing::info!(account=%account_name, ?guid, "authoritative world-entry observation received");
                                 let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;
@@ -1459,8 +1789,35 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                 forward_protocol_observations(&account, &account_name, u32::from(frame.opcode), &frame.body).await;
                 match object_observer.observe(frame.opcode, &frame.body).await {
                     Ok(observations) => {
+                        if server_movement_stamp.is_none()
+                            && observations.iter().any(is_movement_observation)
+                        {
+                            let sequence = next_movement_sequence(&mut movement_mirror_sequence);
+                            server_movement_stamp = Some(MovementStamp::new(
+                                MovementVisualSource::Server,
+                                movement_session_id,
+                                sequence,
+                                *ownership_state.borrow(),
+                                movement_mirror_epoch,
+                                movement_world_generation,
+                            ));
+                        }
                         for observation in observations {
-                            if let ProtocolObservation::ControlledMover { mover, position, flags } = &observation {
+                            match &observation {
+                            ProtocolObservation::PlayerPosition { position, flags, .. } => {
+                                canonical_position = Some(*position);
+                                canonical_flags = *flags;
+                                shared.action_logs.position(
+                                    &account_name,
+                                    "server_player_position",
+                                    *position,
+                                    player_guid,
+                                    Some(u32::from(frame.opcode)),
+                                    Some(*flags),
+                                    None,
+                                ).await;
+                            }
+                            ProtocolObservation::ControlledMover { mover, position, flags } => {
                                 controlled_mover = *mover;
                                 controlled_position = *position;
                                 controlled_flags = *flags;
@@ -1477,6 +1834,8 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                 }
                                 tracing::info!(account=%account_name, ?controlled_mover, has_position=controlled_position.is_some(), "authoritative controlled mover changed");
                             }
+                            _ => {}
+                            }
                             let _ = account.session_tx.send(SessionMessage::Observation(observation)).await;
                         }
                     }
@@ -1484,7 +1843,29 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                 }
                 if u32::from(frame.opcode) == SMSG_WARDEN_DATA::OPCODE { warden.server_to_client(&mut frame.body); }
                 if !suppress_bot_loot_frame {
-                    if let Err(e)=write_server_frame(&mut dw, &mut down_enc, &frame).await { break Err(e); }
+                    if let Some(stamp) = server_movement_stamp {
+                        let movement_guard = account.movement_gate.clone().lock_owned().await;
+                        let owner = *ownership_state.borrow();
+                        if owner.transitioning()
+                            || !movement_visual_is_current(
+                                stamp,
+                                MovementVisualSource::Server,
+                                movement_session_id,
+                                owner.generation.get(),
+                                owner.movement_epoch.get(),
+                                movement_mirror_epoch,
+                                movement_world_generation,
+                                last_server_sequence,
+                            )
+                        {
+                            tracing::warn!(account=%account_name, source=?stamp.source, sequence=stamp.sequence, session=stamp.session_id, owner=?owner.mode, ownership_generation=stamp.ownership_generation, movement_epoch=stamp.movement_epoch, world_generation=stamp.world_generation, reason="movement fence changed before downstream write", "dropped stale server movement visual");
+                            continue;
+                        }
+                        last_server_sequence = stamp.sequence;
+                        let write_result = write_server_frame(&mut dw, &mut down_enc, &frame).await;
+                        drop(movement_guard);
+                        if let Err(error) = write_result { break Err(error); }
+                    } else if let Err(e)=write_server_frame(&mut dw, &mut down_enc, &frame).await { break Err(e); }
                 }
             }
         }
@@ -1638,6 +2019,11 @@ async fn run_headless_world_session(
     let mut char_enum_requested = false;
     let mut player_login_requested = false;
     let mut world_transfer_pending = false;
+    let mut movement_world_generation = fence_actor_movement(&account)
+        .await
+        .context("could not commit initial headless movement fence")?
+        .1;
+    let mut last_bot_command_sequence: Option<(u64, u64, u64)> = None;
     let (server_tx, mut server_rx) = mpsc::channel(8);
     let _server_reader = AbortOnDrop(tokio::spawn(async move {
         loop {
@@ -1667,7 +2053,20 @@ async fn run_headless_world_session(
             }
             command = commands.recv() => {
                 match command {
-                    Ok(command) => {
+                    Ok(dispatch) => {
+                        let owner = *account.ownership_state.borrow();
+                        if !dispatch.is_current(owner, movement_world_generation)
+                            || !dispatch.is_new_sequence(&mut last_bot_command_sequence)
+                        {
+                            let (generation, movement_epoch, sequence, world_generation) = match &dispatch {
+                                crate::configured_session::GameplayDispatch::BotMovement { generation, movement_epoch, sequence, world_generation, .. } =>
+                                    (Some(generation.get()), Some(movement_epoch.get()), Some(*sequence), Some(*world_generation)),
+                                crate::configured_session::GameplayDispatch::Unfenced(_) => (None, None, None, None),
+                            };
+                            tracing::warn!(account=%account.config.account_name, source="bot", sequence, session="headless", ownership_generation=generation, current_generation=owner.generation.get(), movement_epoch, current_epoch=owner.movement_epoch.get(), world_generation, current_world_generation=movement_world_generation, owner=?owner.mode, attended_control=?owner.attended_control, reason="stale stamp or sequence", "dropped stale bot movement command before headless routing");
+                            continue;
+                        }
+                        let command = dispatch.command().clone();
                         if world_transfer_pending
                             && matches!(command, GameplayCommand::MoveTo(_) | GameplayCommand::FaceDirection { .. } | GameplayCommand::StopMovement)
                         {
@@ -1706,6 +2105,15 @@ async fn run_headless_world_session(
                                     &frame.body,
                                 ).await;
                                 log_loot_wire_packet(&account.config.account_name, "bot_to_server", frame.opcode, &frame.body);
+                                let movement_guard = if dispatch.bot_movement_stamp().is_some() {
+                                    Some(account.movement_gate.clone().lock_owned().await)
+                                } else {
+                                    None
+                                };
+                                if !dispatch.is_current(*account.ownership_state.borrow(), movement_world_generation) {
+                                    tracing::warn!(account=%account.config.account_name, opcode=frame.opcode, "dropped bot movement command after ownership changed during headless encoding");
+                                    continue;
+                                }
                                 write_client_frame(&mut writer, &mut enc, &frame).await?;
                                 tracing::info!(account=%account.config.account_name, opcode=frame.opcode, "headless bot gameplay packet transmitted");
                                 if let Some((spell, target)) = bot_cast {
@@ -1732,6 +2140,7 @@ async fn run_headless_world_session(
                                         let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition { position, moving, flags, client_time })).await;
                                     }
                                 }
+                                drop(movement_guard);
                             }
                             Ok(None) => {}
                             Err(reason) => tracing::warn!(account=%account.config.account_name, command=?command, %reason, "headless gameplay command has no encoder"),
@@ -1760,6 +2169,15 @@ async fn run_headless_world_session(
             server = server_rx.recv() => {
                 let frame = server.context("headless upstream reader ended")??;
                 let opcode = u32::from(frame.opcode);
+                if matches!(opcode, 0x003E | 0x0236) {
+                    match fence_actor_movement(&account).await {
+                        Some((epoch, generation)) => {
+                            movement_world_generation = generation;
+                            tracing::info!(account=%account.config.account_name, movement_epoch=epoch.get(), world_generation=generation, opcode, "headless movement fenced for world transition");
+                        }
+                        None => bail!("headless world-transition movement fence failed"),
+                    }
+                }
                 shared.action_logs.packet(
                     &account.config.account_name,
                     "world",
@@ -1859,7 +2277,7 @@ async fn run_headless_world_session(
                         if player_guid == Some(mover) {
                             canonical_position = Some(position);
                             canonical_flags = flags;
-                            let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition {
+                                    let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition {
                                 position,
                                 moving: flags != 0,
                                 flags,
@@ -2037,7 +2455,12 @@ async fn run_headless_world_session(
                             } else {
                                 tracing::info!(account=%account.config.account_name, ?mission_id, "default headless Quest mission installed after authoritative world entry");
                             }
-                            let _ = account.session_tx.send(SessionMessage::BotOn).await;
+                            let (committed, receiver) = oneshot::channel();
+                            if account.session_tx.send(SessionMessage::BotOn { committed: Some(committed) }).await.is_ok() {
+                                if receiver.await != Ok(true) {
+                                    tracing::warn!(account=%account.config.account_name, "headless bot ON ownership change did not commit");
+                                }
+                            }
                             tracing::info!(account=%account.config.account_name, ?guid, "headless configured character entered world authoritatively; Quest mission and bot ownership requested");
                         }
                     }
@@ -2647,7 +3070,7 @@ mod runtime_chat_tests {
 
     #[test]
     fn movement_mirror_rejects_stale_session_generation_epoch_and_sequence() {
-        let mirror = MovementMirror {
+        let stamp = MovementStamp {
             source: MovementVisualSource::Bot,
             session_id: 3,
             sequence: 4,
@@ -2655,18 +3078,180 @@ mod runtime_chat_tests {
             movement_epoch: 6,
             route_epoch: 8,
             world_generation: 7,
+        };
+        let mirror = MovementMirror {
+            stamp,
             frame: crate::framing::ServerFrame {
                 opcode: 1,
                 body: Vec::new(),
             },
         };
-        assert!(movement_visual_is_current(&mirror, 3, 5, 6, 8, 7, 3));
-        assert!(!movement_visual_is_current(&mirror, 9, 5, 6, 8, 7, 3));
-        assert!(!movement_visual_is_current(&mirror, 3, 8, 6, 8, 7, 3));
-        assert!(!movement_visual_is_current(&mirror, 3, 5, 8, 8, 7, 3));
-        assert!(!movement_visual_is_current(&mirror, 3, 5, 6, 9, 7, 3));
-        assert!(!movement_visual_is_current(&mirror, 3, 5, 6, 8, 8, 3));
-        assert!(!movement_visual_is_current(&mirror, 3, 5, 6, 8, 7, 4));
+        let is_current = |stamp, session, owner, epoch, route, world, last| {
+            movement_visual_is_current(
+                stamp,
+                MovementVisualSource::Bot,
+                session,
+                owner,
+                epoch,
+                route,
+                world,
+                last,
+            )
+        };
+        assert!(is_current(mirror.stamp, 3, 5, 6, 8, 7, 3));
+        assert!(!is_current(mirror.stamp, 9, 5, 6, 8, 7, 3));
+        assert!(!is_current(mirror.stamp, 3, 8, 6, 8, 7, 3));
+        assert!(!is_current(mirror.stamp, 3, 5, 8, 8, 7, 3));
+        assert!(!is_current(mirror.stamp, 3, 5, 6, 9, 7, 3));
+        assert!(!is_current(mirror.stamp, 3, 5, 6, 8, 8, 3));
+        assert!(!is_current(mirror.stamp, 3, 5, 6, 8, 7, 4));
+        assert!(!movement_visual_is_current(
+            mirror.stamp,
+            MovementVisualSource::Player,
+            3,
+            5,
+            6,
+            8,
+            7,
+            3
+        ));
+        assert!(movement_visual_is_current(
+            MovementStamp {
+                source: MovementVisualSource::Player,
+                ..mirror.stamp
+            },
+            MovementVisualSource::Player,
+            3,
+            5,
+            6,
+            8,
+            7,
+            3,
+        ));
+        assert!(movement_visual_is_current(
+            MovementStamp {
+                source: MovementVisualSource::Server,
+                ..mirror.stamp
+            },
+            MovementVisualSource::Server,
+            3,
+            5,
+            6,
+            8,
+            7,
+            3,
+        ));
+        assert!(movement_visual_is_current(
+            MovementStamp {
+                source: MovementVisualSource::ProxyHandoff,
+                ..mirror.stamp
+            },
+            MovementVisualSource::ProxyHandoff,
+            3,
+            5,
+            6,
+            8,
+            7,
+            3,
+        ));
+    }
+
+    #[test]
+    fn takeover_invalidation_removes_queued_movement_visual() {
+        let stamp = MovementStamp {
+            source: MovementVisualSource::Bot,
+            session_id: 3,
+            sequence: 4,
+            ownership_generation: 5,
+            movement_epoch: 6,
+            route_epoch: 8,
+            world_generation: 7,
+        };
+        let mirror = MovementMirror {
+            stamp,
+            frame: crate::framing::ServerFrame {
+                opcode: 1,
+                body: Vec::new(),
+            },
+        };
+        let (updates, mut receiver) = watch::channel(Some(mirror.clone()));
+        let mut route_epoch = 8;
+        invalidate_movement_mirror(&mut route_epoch, &updates);
+        assert!(receiver.borrow_and_update().is_none());
+        assert!(!movement_visual_is_current(
+            mirror.stamp,
+            MovementVisualSource::Bot,
+            3,
+            5,
+            6,
+            route_epoch,
+            7,
+            3,
+        ));
+    }
+
+    #[test]
+    fn movement_sequences_increase_for_each_source_and_server_visuals_are_classified() {
+        let mut sequence = 0;
+        assert_eq!(next_movement_sequence(&mut sequence), 1);
+        assert_eq!(next_movement_sequence(&mut sequence), 2);
+        assert_eq!(next_movement_sequence(&mut sequence), 3);
+        assert!(is_server_movement_visual_opcode(0x00C7));
+        assert!(is_server_movement_visual_opcode(0x00DD));
+        assert!(is_server_movement_visual_opcode(0x02AE));
+        assert!(!is_server_movement_visual_opcode(0x00A9));
+        let position = WorldPosition {
+            map: 0,
+            point: Vec3::default(),
+            orientation: 0.0,
+        };
+        assert!(is_movement_observation(
+            &ProtocolObservation::PlayerPosition {
+                position,
+                moving: true,
+                flags: 1,
+                client_time: 2,
+            }
+        ));
+        assert!(is_movement_observation(
+            &ProtocolObservation::ControlledMover {
+                mover: Some(EntityId(7)),
+                position: Some(position),
+                flags: 1,
+            }
+        ));
+        assert!(!is_movement_observation(&ProtocolObservation::LeftWorld));
+    }
+
+    #[test]
+    fn near_teleport_ack_requires_a_matching_pending_correction() {
+        let mut body = Vec::new();
+        push_packed_guid(&mut body, EntityId(7));
+        body.extend_from_slice(&0x20_u32.to_le_bytes());
+        body.extend_from_slice(&99_u32.to_le_bytes());
+
+        assert_eq!(
+            validate_near_teleport_ack(&body, Some((EntityId(7), 0x20)), Some(EntityId(7)), None,),
+            Ok((EntityId(7), 0x20, 99)),
+        );
+        assert!(validate_near_teleport_ack(&body, None, Some(EntityId(7)), None).is_err());
+        assert!(
+            validate_near_teleport_ack(&body, Some((EntityId(8), 0x20)), Some(EntityId(7)), None)
+                .is_err()
+        );
+        assert!(
+            validate_near_teleport_ack(&body, Some((EntityId(7), 0x21)), Some(EntityId(7)), None)
+                .is_err()
+        );
+        assert!(
+            validate_near_teleport_ack(
+                &body[..body.len() - 1],
+                Some((EntityId(7), 0x20)),
+                Some(EntityId(7)),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

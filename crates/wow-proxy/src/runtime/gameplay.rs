@@ -651,40 +651,239 @@ pub(super) fn encode_simple_movement(
     body
 }
 
-pub(super) fn decode_simple_movement(body: &[u8]) -> Option<(EntityId, u32, u32, Vec3, f32)> {
-    let mask = *body.first()?;
-    let mut cursor = 1usize;
+fn packed_guid(body: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mask = *body.get(*cursor)?;
+    *cursor += 1;
     let mut guid = [0_u8; 8];
-    for (index, slot) in guid.iter_mut().enumerate() {
+    for (index, byte) in guid.iter_mut().enumerate() {
         if mask & (1 << index) != 0 {
-            *slot = *body.get(cursor)?;
-            cursor += 1;
+            *byte = *body.get(*cursor)?;
+            *cursor += 1;
         }
     }
-    let flags = u32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
-    cursor += 4;
-    let _extra = u16::from_le_bytes(body.get(cursor..cursor + 2)?.try_into().ok()?);
-    cursor += 2;
-    let client_time = u32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
-    cursor += 4;
-    let x = f32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
-    cursor += 4;
-    let y = f32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
-    cursor += 4;
-    let z = f32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
-    cursor += 4;
-    let o = f32::from_le_bytes(body.get(cursor..cursor + 4)?.try_into().ok()?);
-    let point = Vec3::new(x, y, z);
-    if !point.is_finite() || !o.is_finite() {
+    Some(u64::from_le_bytes(guid))
+}
+
+fn read_u16(body: &[u8], cursor: &mut usize) -> Option<u16> {
+    let value = u16::from_le_bytes(body.get(*cursor..*cursor + 2)?.try_into().ok()?);
+    *cursor += 2;
+    Some(value)
+}
+
+fn read_u32(body: &[u8], cursor: &mut usize) -> Option<u32> {
+    let value = u32::from_le_bytes(body.get(*cursor..*cursor + 4)?.try_into().ok()?);
+    *cursor += 4;
+    Some(value)
+}
+
+fn read_f32(body: &[u8], cursor: &mut usize) -> Option<f32> {
+    let value = f32::from_le_bytes(body.get(*cursor..*cursor + 4)?.try_into().ok()?);
+    *cursor += 4;
+    value.is_finite().then_some(value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct MovementCorrectionExpectation {
+    pub ack_opcode: u32,
+    pub mover: EntityId,
+    pub counter: u32,
+    pub near_teleport_flags: Option<u32>,
+}
+
+fn decode_movement_info_payload(body: &[u8], cursor: &mut usize) -> Option<(u32, u32, Vec3, f32)> {
+    let flags = read_u32(body, cursor)?;
+    let extra_flags = read_u16(body, cursor)?;
+    let client_time = read_u32(body, cursor)?;
+    let point = Vec3::new(
+        read_f32(body, cursor)?,
+        read_f32(body, cursor)?,
+        read_f32(body, cursor)?,
+    );
+    let orientation = read_f32(body, cursor)?;
+
+    if flags & 0x0000_0200 != 0 {
+        packed_guid(body, cursor)?;
+        for _ in 0..4 {
+            read_f32(body, cursor)?;
+        }
+        read_u32(body, cursor)?;
+        body.get(*cursor)?;
+        *cursor += 1;
+        if extra_flags & 0x0400 != 0 {
+            read_u32(body, cursor)?;
+        }
+    }
+    if flags & (0x0020_0000 | 0x0200_0000) != 0 || extra_flags & 0x0020 != 0 {
+        read_f32(body, cursor)?;
+    }
+    read_u32(body, cursor)?;
+    if flags & 0x0000_1000 != 0 {
+        for _ in 0..4 {
+            read_f32(body, cursor)?;
+        }
+    }
+    if flags & 0x0400_0000 != 0 {
+        read_f32(body, cursor)?;
+    }
+    Some((flags, client_time, point, orientation))
+}
+
+/// Decode one complete WotLK MovementInfo body. Conditional fields follow the
+/// same flags as AzerothCore's WorldSession::ReadMovementInfo.
+pub(super) fn decode_simple_movement(
+    opcode: u32,
+    body: &[u8],
+) -> Option<(EntityId, u32, u32, Vec3, f32)> {
+    let mut cursor = 0usize;
+    let guid = packed_guid(body, &mut cursor)?;
+    let (flags, client_time, point, orientation) = decode_movement_info_payload(body, &mut cursor)?;
+    if cursor != body.len() || guid == 0 || !point.is_finite() || !orientation.is_finite() {
         return None;
     }
-    Some((
-        EntityId(u64::from_le_bytes(guid)),
-        flags,
-        client_time,
-        point,
-        o,
-    ))
+    debug_assert!(is_player_movement_opcode(opcode));
+    Some((EntityId(guid), flags, client_time, point, orientation))
+}
+
+pub(super) fn decode_near_teleport_ack(body: &[u8]) -> Option<(EntityId, u32, u32)> {
+    let mut cursor = 0usize;
+    let guid = packed_guid(body, &mut cursor)?;
+    let flags = read_u32(body, &mut cursor)?;
+    let client_time = read_u32(body, &mut cursor)?;
+    (guid != 0 && cursor == body.len()).then_some((EntityId(guid), flags, client_time))
+}
+
+fn correction_ack_opcode(request_opcode: u32) -> Option<u32> {
+    Some(match request_opcode {
+        0x00C7 => 0x00C7,
+        0x00EF => 0x00F0,
+        0x00E8 => 0x00E9,
+        0x00EA => 0x00EB,
+        0x00E2 => 0x00E3,
+        0x00E4 => 0x00E5,
+        0x00E6 => 0x00E7,
+        0x00F2 | 0x00F3 => 0x02CF,
+        0x00F4 | 0x00F5 => 0x00F6,
+        0x00DE | 0x00DF => 0x02D0,
+        0x02DA => 0x02DB,
+        0x02DC => 0x02DD,
+        0x02DE => 0x02DF,
+        0x0343 | 0x0344 => 0x0345,
+        0x033E | 0x033F => 0x0340,
+        0x0381 => 0x0382,
+        0x0383 => 0x0384,
+        0x045C => 0x045D,
+        0x04CE => 0x04CF,
+        0x04D0 => 0x04D1,
+        0x0516 => 0x0517,
+        _ => return None,
+    })
+}
+
+pub(super) fn is_movement_correction_ack_opcode(opcode: u32) -> bool {
+    matches!(
+        opcode,
+        0x00C7
+            | 0x00E3
+            | 0x00E5
+            | 0x00E7
+            | 0x00E9
+            | 0x00EB
+            | 0x00F0
+            | 0x00F6
+            | 0x02CF
+            | 0x02D0
+            | 0x02DB
+            | 0x02DD
+            | 0x02DF
+            | 0x0340
+            | 0x0345
+            | 0x0382
+            | 0x0384
+            | 0x045D
+            | 0x04CF
+            | 0x04D1
+            | 0x0517
+    )
+}
+
+pub(super) fn movement_correction_expectation(
+    request_opcode: u32,
+    body: &[u8],
+) -> Option<MovementCorrectionExpectation> {
+    let ack_opcode = correction_ack_opcode(request_opcode)?;
+    let mut cursor = 0usize;
+    let mover = EntityId(packed_guid(body, &mut cursor)?);
+    if mover == EntityId(0) {
+        return None;
+    }
+    let counter = read_u32(body, &mut cursor)?;
+    let near_teleport_flags = if request_opcode == 0x00C7 {
+        let (flags, _, _, _) = decode_movement_info_payload(body, &mut cursor)?;
+        if cursor != body.len() {
+            return None;
+        }
+        Some(flags)
+    } else {
+        None
+    };
+    Some(MovementCorrectionExpectation {
+        ack_opcode,
+        mover,
+        counter,
+        near_teleport_flags,
+    })
+}
+
+pub(super) fn validate_movement_correction_ack(
+    opcode: u32,
+    body: &[u8],
+    expectation: MovementCorrectionExpectation,
+) -> Result<EntityId, &'static str> {
+    if opcode != expectation.ack_opcode {
+        return Err("correction acknowledgement opcode does not match pending request");
+    }
+    if opcode == 0x00C7 {
+        let (mover, flags, _) = decode_near_teleport_ack(body)
+            .ok_or("near-teleport acknowledgement has malformed layout")?;
+        if mover != expectation.mover || expectation.near_teleport_flags != Some(flags) {
+            return Err("near-teleport acknowledgement mover or flags do not match request");
+        }
+        return Ok(mover);
+    }
+
+    let mut cursor = 0usize;
+    let mover = EntityId(
+        packed_guid(body, &mut cursor)
+            .ok_or("correction acknowledgement has malformed mover GUID")?,
+    );
+    let counter = read_u32(body, &mut cursor)
+        .ok_or("correction acknowledgement is missing request counter")?;
+    if mover != expectation.mover || counter != expectation.counter {
+        return Err("correction acknowledgement mover or counter does not match request");
+    }
+    decode_movement_info_payload(body, &mut cursor)
+        .ok_or("correction acknowledgement has malformed MovementInfo")?;
+    let tail_len = body.len().saturating_sub(cursor);
+    let expected_tail = match opcode {
+        0x00E3 | 0x00E5 | 0x00E7 | 0x02DB | 0x02DD | 0x02DF | 0x0382 | 0x0384 | 0x045D | 0x0517
+        | 0x00F6 | 0x02CF | 0x02D0 | 0x0345 => 4,
+        0x00E9 | 0x00EB | 0x00F0 => 0,
+        _ => return Err("unsupported movement correction acknowledgement opcode"),
+    };
+    if tail_len != expected_tail {
+        return Err("correction acknowledgement has invalid trailing fields");
+    }
+    if expected_tail == 4 && !matches!(opcode, 0x00F6 | 0x02CF | 0x02D0 | 0x0345) {
+        let value = f32::from_le_bytes(
+            body[cursor..]
+                .try_into()
+                .map_err(|_| "invalid correction value")?,
+        );
+        if !value.is_finite() {
+            return Err("correction acknowledgement value is not finite");
+        }
+    }
+    Ok(mover)
 }
 
 pub(super) fn movement_matches_bot_visual(
@@ -716,6 +915,10 @@ pub(super) fn movement_matches_bot_visual(
                 && is_explicit_player_movement_intent(bot_opcode)))
 }
 
+pub(super) fn should_suppress_bot_echo(matching_echo: bool, validated_player_intent: bool) -> bool {
+    matching_echo && !validated_player_intent
+}
+
 /// Check whether a client movement packet is valid physical takeover input.
 /// Passive feedback and correction acknowledgements do not pass this check.
 pub(super) fn validate_player_takeover(
@@ -730,17 +933,38 @@ pub(super) fn validate_player_takeover(
     if mover == EntityId(0) || expected_mover != Some(mover) {
         return Err("movement mover GUID does not match the active player");
     }
-    if flags & 0x3 == 0x3 || flags & 0xC == 0xC || flags & 0x30 == 0x30 {
+    if flags & 0x3 == 0x3
+        || flags & 0xC == 0xC
+        || flags & 0x30 == 0x30
+        || flags & 0xC0 == 0xC0
+        || flags & 0x00C0_0000 == 0x00C0_0000
+    {
         return Err("movement flags contain contradictory directions");
     }
+    const KNOWN_MOVEMENT_FLAGS: u32 = 0x7FFF_FFFF;
+    const ROOT: u32 = 0x0000_0800;
+    const MOVING_FLAGS: u32 = 0x04C0_30CF;
+    if flags & !KNOWN_MOVEMENT_FLAGS != 0 {
+        return Err("movement flags contain an unsupported bit");
+    }
+    if flags & ROOT != 0 && flags & MOVING_FLAGS != 0 {
+        return Err("rooted movement cannot contain active movement flags");
+    }
     let required = match opcode {
-        0x0B5 => Some(0x01), // start forward
-        0x0B6 => Some(0x02), // start backward
-        0x0B8 => Some(0x04), // start strafe left
-        0x0B9 => Some(0x08), // start strafe right
-        0x0BC => Some(0x10), // start turn left
-        0x0BD => Some(0x20), // start turn right
-        _ => None,
+        0x0B5 => Some(0x01),        // start forward
+        0x0B6 => Some(0x02),        // start backward
+        0x0B8 => Some(0x04),        // start strafe left
+        0x0B9 => Some(0x08),        // start strafe right
+        0x0BB => Some(0x0000_1000), // jump/falling movement info
+        0x0BC => Some(0x10),        // start turn left
+        0x0BD => Some(0x20),        // start turn right
+        0x0BF => Some(0x40),        // start pitch up
+        0x0C0 => Some(0x80),        // start pitch down
+        0x0CA => Some(0x0020_0000), // start swim
+        0x359 => Some(0x0040_0000), // start ascend
+        0x3A7 => Some(0x0080_0000), // start descend
+        0x0DA | 0x0DB => None,      // set facing / pitch: movement state may be unchanged
+        _ => return Err("opcode has no takeover flag policy"),
     };
     if required.is_some_and(|flag| flags & flag == 0) {
         return Err("movement opcode does not match movement flags");
@@ -770,7 +994,8 @@ mod movement_clock_tests {
         .unwrap()
         .unwrap();
 
-        let (_, _, _, _, encoded_orientation) = decode_simple_movement(&frame.body).unwrap();
+        let (_, _, _, _, encoded_orientation) =
+            decode_simple_movement(u32::from(frame.opcode), &frame.body).unwrap();
         let expected = Radians::normalized(-1.0).unwrap().0;
         assert_eq!(frame.opcode, 0x00DA);
         assert!((encoded_orientation - expected).abs() < f32::EPSILON);
@@ -827,6 +1052,119 @@ mod movement_clock_tests {
     fn time_sync_request_reads_counter_and_rejects_short_body() {
         assert_eq!(parse_time_sync_request(&7_u32.to_le_bytes()), Some(7));
         assert_eq!(parse_time_sync_request(&[7, 0, 0]), None);
+    }
+
+    #[test]
+    fn movement_decoder_requires_complete_conditional_fields_and_no_trailing_bytes() {
+        let body = encode_simple_movement(EntityId(7), 0x01, 12, Vec3::new(1.0, 2.0, 3.0), 0.5);
+        assert!(decode_simple_movement(0x0B5, &body).is_some());
+
+        let mut truncated = body.clone();
+        truncated.pop();
+        assert!(decode_simple_movement(0x0B5, &truncated).is_none());
+
+        let mut trailing = body.clone();
+        trailing.push(0);
+        assert!(decode_simple_movement(0x0B5, &trailing).is_none());
+
+        let falling =
+            encode_simple_movement(EntityId(7), 0x1000, 12, Vec3::new(1.0, 2.0, 3.0), 0.5);
+        assert!(decode_simple_movement(0x0BB, &falling).is_none());
+        let mut complete_jump = falling;
+        for value in [1.0_f32, 0.25, 0.75, 7.0] {
+            complete_jump.extend_from_slice(&value.to_le_bytes());
+        }
+        assert!(decode_simple_movement(0x0BB, &complete_jump).is_some());
+    }
+
+    #[test]
+    fn takeover_flag_rules_cover_each_explicit_start_opcode() {
+        let cases = [
+            (0x0B5, 0x01),
+            (0x0B6, 0x02),
+            (0x0B8, 0x04),
+            (0x0B9, 0x08),
+            (0x0BB, 0x1000),
+            (0x0BC, 0x10),
+            (0x0BD, 0x20),
+            (0x0BF, 0x40),
+            (0x0C0, 0x80),
+            (0x0CA, 0x0020_0000),
+            (0x359, 0x0040_0000),
+            (0x3A7, 0x0080_0000),
+        ];
+        for (opcode, required) in cases {
+            assert!(
+                validate_player_takeover(opcode, EntityId(7), required, Some(EntityId(7))).is_ok(),
+                "opcode {opcode:#x}"
+            );
+            assert!(
+                validate_player_takeover(opcode, EntityId(7), 0, Some(EntityId(7))).is_err(),
+                "opcode {opcode:#x}"
+            );
+        }
+        for contradictory in [0x03, 0x0C, 0x30, 0xC0, 0x00C0_0000] {
+            assert!(
+                validate_player_takeover(0x0DA, EntityId(7), contradictory, Some(EntityId(7)))
+                    .is_err()
+            );
+        }
+        assert!(
+            validate_player_takeover(0x0B5, EntityId(7), 0x8000_0001, Some(EntityId(7))).is_err()
+        );
+        assert!(
+            validate_player_takeover(0x0B5, EntityId(7), 0x0000_0801, Some(EntityId(7))).is_err()
+        );
+        assert!(validate_player_takeover(0x0B7, EntityId(7), 0, Some(EntityId(7))).is_err());
+    }
+
+    #[test]
+    fn validated_player_intent_has_precedence_over_echo_match() {
+        assert!(!should_suppress_bot_echo(true, true));
+        assert!(should_suppress_bot_echo(true, false));
+        assert!(!should_suppress_bot_echo(false, false));
+    }
+
+    #[test]
+    fn near_teleport_ack_requires_exact_packed_guid_flags_time_layout() {
+        let mut body = Vec::new();
+        push_packed_guid(&mut body, EntityId(7));
+        body.extend_from_slice(&0x20_u32.to_le_bytes());
+        body.extend_from_slice(&99_u32.to_le_bytes());
+        assert_eq!(
+            decode_near_teleport_ack(&body),
+            Some((EntityId(7), 0x20, 99))
+        );
+        body.push(0);
+        assert_eq!(decode_near_teleport_ack(&body), None);
+    }
+
+    #[test]
+    fn movement_correction_ack_requires_matching_request_and_exact_payload() {
+        let mut request = Vec::new();
+        push_packed_guid(&mut request, EntityId(7));
+        request.extend_from_slice(&19_u32.to_le_bytes());
+        let expected = movement_correction_expectation(0x00E2, &request).unwrap();
+        assert_eq!(expected.ack_opcode, 0x00E3);
+
+        let movement = encode_simple_movement(EntityId(7), 0, 12, Vec3::new(1.0, 2.0, 3.0), 0.5);
+        let mut ack = Vec::new();
+        push_packed_guid(&mut ack, EntityId(7));
+        ack.extend_from_slice(&19_u32.to_le_bytes());
+        ack.extend_from_slice(&movement[2..]);
+        ack.extend_from_slice(&7.0_f32.to_le_bytes());
+        assert_eq!(
+            validate_movement_correction_ack(0x00E3, &ack, expected),
+            Ok(EntityId(7))
+        );
+
+        let mut wrong_counter = ack.clone();
+        wrong_counter[2] = 20;
+        assert!(validate_movement_correction_ack(0x00E3, &wrong_counter, expected).is_err());
+
+        let mut malformed_tail = ack;
+        malformed_tail.pop();
+        assert!(validate_movement_correction_ack(0x00E3, &malformed_tail, expected).is_err());
     }
 }
 
