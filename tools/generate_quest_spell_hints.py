@@ -13,9 +13,9 @@ import hashlib
 import importlib.util
 import json
 import re
-import struct
 from collections import defaultdict
 from pathlib import Path
+from dbc import read_wdbc
 
 
 _BUILDER_PATH = Path(__file__).with_name("build_world_knowledge.py")
@@ -37,27 +37,23 @@ ITEM_TARGET_SUFFIX = re.compile(r"^\s*(on|at|against|upon)\b", re.IGNORECASE)
 
 def spell_names_from_dbc(dbc_path: Path, schema_path: Path) -> dict[str, tuple[str, list[int]]]:
     """Read spell IDs and English names using the matching AzerothCore DBC schema."""
-    data = dbc_path.read_bytes()
-    if len(data) < 20:
-        raise RuntimeError(f"{dbc_path} is too small to be a WDBC file")
-    magic, record_count, field_count, record_size, string_size = struct.unpack_from("<4s4I", data, 0)
-    if magic != b"WDBC" or record_size != field_count * 4:
-        raise RuntimeError(f"{dbc_path} has an unsupported WDBC layout")
+    dbc = read_wdbc(
+        dbc_path,
+        require_exact_record_size=True,
+        string_block_policy="within",
+        error_type=RuntimeError,
+    )
     columns = _BUILDER.table_columns(schema_path)
     name_index = next((i for i, name in enumerate(columns) if name.lower() == "name_lang_enus"), None)
-    if name_index is None or name_index >= field_count:
+    if name_index is None or name_index >= dbc.field_count:
         raise RuntimeError(f"{schema_path} has no compatible Name_Lang_enUS field")
-    strings_at = 20 + record_count * record_size
-    strings = data[strings_at:strings_at + string_size]
-    if len(strings) != string_size:
-        raise RuntimeError(f"{dbc_path} is truncated")
+    strings = dbc.strings
 
     names: dict[str, set[int]] = defaultdict(set)
     display_names: dict[str, str] = {}
-    for row in range(record_count):
-        offset = 20 + row * record_size
-        spell_id = struct.unpack_from("<I", data, offset)[0]
-        string_offset = struct.unpack_from("<I", data, offset + name_index * 4)[0]
+    for record in dbc.integer_rows():
+        spell_id = record[0]
+        string_offset = record[name_index]
         if not spell_id or string_offset >= len(strings):
             continue
         end = strings.find(b"\0", string_offset)

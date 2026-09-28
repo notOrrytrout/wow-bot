@@ -92,6 +92,7 @@ const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MOVEMENT_STEP_INTERVAL: Duration = Duration::from_millis(100);
 const MOVEMENT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const MOVEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
+const QUEST_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MOVEMENT_STEP_EARLY_TOLERANCE: Duration = Duration::from_millis(10);
 const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
@@ -1984,27 +1985,15 @@ impl LaneEngine {
                     self.pending_movement = Some(movement);
                     return true;
                 };
-                let transport = self
-                    .state
-                    .authoritative
-                    .entities
-                    .0
-                    .values()
-                    .filter(|entity| {
-                        entity.entry == entry
-                            && entity.kind == wow_state::entities::EntityKind::GameObject
-                    })
-                    .filter_map(|entity| entity.position.map(|position| (entity, position)))
-                    .filter(|(_, position)| position.map == player.map)
-                    .min_by(|(_, a), (_, b)| {
-                        a.point
-                            .distance(player.point)
-                            .total_cmp(&b.point.distance(player.point))
-                    })
-                    .map(|(entity, _)| entity.id)
-                    // A runtime transport object may enter visibility only near
-                    // the authored terminal. Approach the grounded stop first.
-                    .unwrap_or(EntityId(0));
+                let transport = nearest_visible_gameobject(
+                    &self.state.authoritative.entities.0,
+                    entry,
+                    player.map,
+                    player.point,
+                )
+                // A runtime transport object may enter visibility only near
+                // the authored terminal. Approach the grounded stop first.
+                .unwrap_or(EntityId(0));
                 movement.transport = Some((
                     crate::movement::transport::TransportTraversal {
                         transport,
@@ -2039,23 +2028,12 @@ impl LaneEngine {
                         .map(|entity| entity.id)
                 });
                 let visible_transport = transport_entry.and_then(|entry| {
-                    self.state
-                        .authoritative
-                        .entities
-                        .0
-                        .values()
-                        .filter(|entity| {
-                            entity.entry == entry
-                                && entity.kind == wow_state::entities::EntityKind::GameObject
-                        })
-                        .filter_map(|entity| entity.position.map(|position| (entity, position)))
-                        .filter(|(_, position)| position.map == player.map)
-                        .min_by(|(_, a), (_, b)| {
-                            a.point
-                                .distance(player.point)
-                                .total_cmp(&b.point.distance(player.point))
-                        })
-                        .map(|(entity, _)| entity.id)
+                    nearest_visible_gameobject(
+                        &self.state.authoritative.entities.0,
+                        entry,
+                        player.map,
+                        player.point,
+                    )
                 });
                 if let Some(id) = matched_transport.or(visible_transport) {
                     traversal.transport = id;
@@ -2674,7 +2652,7 @@ impl LaneEngine {
             return true;
         }
         if let Some((quest, giver, at)) = self.pending_accept {
-            if at.elapsed() < Duration::from_secs(10) {
+            if quest_confirmation_waiting(at, Instant::now()) {
                 self.waiting(format!(
                     "awaiting server confirmation for quest {quest} from giver {giver}"
                 ));
@@ -2684,7 +2662,7 @@ impl LaneEngine {
             self.pending_accept = None;
         }
         if let Some((quest, at, step)) = self.pending_turn_in {
-            if at.elapsed() < Duration::from_secs(10) {
+            if quest_confirmation_waiting(at, Instant::now()) {
                 self.waiting(format!("awaiting authoritative server confirmation for quest {quest} turn-in step {step}"));
                 return true;
             }
@@ -2692,7 +2670,7 @@ impl LaneEngine {
             self.pending_turn_in = None;
         }
         if let Some((giver, at)) = self.pending_giver_interaction {
-            if at.elapsed() < Duration::from_secs(10) {
+            if quest_confirmation_waiting(at, Instant::now()) {
                 self.waiting(format!(
                     "quest giver {giver} interaction is awaiting an authoritative quest list"
                 ));
@@ -4616,6 +4594,27 @@ fn movement_step_distance(run_speed: f32, last_step: Option<Instant>, now: Insta
     run_speed * elapsed.as_secs_f32()
 }
 
+fn nearest_visible_gameobject(
+    entities: &BTreeMap<EntityId, wow_state::entities::EntityState>,
+    entry: u32,
+    map: u32,
+    from: Vec3,
+) -> Option<EntityId> {
+    entities
+        .values()
+        .filter(|entity| {
+            entity.entry == entry && entity.kind == wow_state::entities::EntityKind::GameObject
+        })
+        .filter_map(|entity| {
+            entity
+                .position
+                .filter(|position| position.map == map)
+                .map(|position| (entity.id, position.point))
+        })
+        .min_by(|(_, left), (_, right)| left.distance(from).total_cmp(&right.distance(from)))
+        .map(|(id, _)| id)
+}
+
 fn corpse_reclaim_is_safe(
     entities: &BTreeMap<EntityId, wow_state::entities::EntityState>,
     player: EntityId,
@@ -4645,6 +4644,9 @@ fn quest_status_available(status: u8) -> bool {
 }
 fn quest_status_reward(status: u8) -> bool {
     matches!(status, 3 | 6 | 9 | 10)
+}
+fn quest_confirmation_waiting(started: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started) < QUEST_CONFIRMATION_TIMEOUT
 }
 fn giver_retry_delay(attempts: u8) -> Duration {
     Duration::from_secs(
@@ -4732,6 +4734,19 @@ fn is_quest_search_work(movement: &PendingMovement) -> bool {
 mod tests {
     use super::*;
     use crate::activity::ActivityArbiter;
+
+    #[test]
+    fn quest_confirmation_wait_ends_at_the_shared_deadline() {
+        let started = Instant::now();
+        assert!(quest_confirmation_waiting(
+            started,
+            started + QUEST_CONFIRMATION_TIMEOUT - Duration::from_nanos(1)
+        ));
+        assert!(!quest_confirmation_waiting(
+            started,
+            started + QUEST_CONFIRMATION_TIMEOUT
+        ));
+    }
 
     #[tokio::test]
     async fn moved_mob_loot_uses_its_nearby_player_target_position() {

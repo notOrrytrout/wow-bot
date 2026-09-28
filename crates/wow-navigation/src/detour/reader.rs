@@ -1,5 +1,5 @@
 use std::fmt::{Display, Formatter};
-use wow_domain::binary::{u16_le, u32_le};
+use wow_domain::binary::{CStringReadError, cstring_at, u16_le, u32_le};
 
 const MAX_STRING_BYTES: usize = 4096;
 
@@ -129,20 +129,18 @@ impl<'a> PacketReader<'a> {
 
     pub fn cstring(&mut self) -> PacketReadResult<&'a str> {
         let start = self.offset;
-        let remaining = self.bytes.get(start..).unwrap_or_default();
-        let length = remaining
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or(PacketReadError::UnterminatedString { offset: start })?;
-        if length > MAX_STRING_BYTES {
-            return Err(PacketReadError::StringTooLong {
-                offset: start,
-                limit: MAX_STRING_BYTES,
-            });
-        }
-        let value = std::str::from_utf8(&remaining[..length])
-            .map_err(|_| PacketReadError::InvalidUtf8 { offset: start })?;
-        self.offset = start + length + 1;
+        let (value, next) =
+            cstring_at(self.bytes, start, Some(MAX_STRING_BYTES)).map_err(|error| match error {
+                CStringReadError::Unterminated => {
+                    PacketReadError::UnterminatedString { offset: start }
+                }
+                CStringReadError::TooLong { limit, .. } => PacketReadError::StringTooLong {
+                    offset: start,
+                    limit,
+                },
+                CStringReadError::InvalidUtf8 => PacketReadError::InvalidUtf8 { offset: start },
+            })?;
+        self.offset = next;
         Ok(value)
     }
 }
@@ -163,6 +161,41 @@ mod tests {
             Err(PacketReadError::Truncated {
                 offset: 0,
                 needed: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn cstring_uses_shared_reader_and_keeps_navigation_errors() {
+        let mut reader = PacketReader::new(b"name\0tail");
+        assert_eq!(reader.cstring().unwrap(), "name");
+        assert_eq!(reader.remaining(), 4);
+
+        let mut invalid = PacketReader::new(b"\xff\0");
+        assert_eq!(
+            invalid.cstring(),
+            Err(PacketReadError::InvalidUtf8 { offset: 0 })
+        );
+
+        let mut unterminated = PacketReader::new(b"no terminator");
+        assert_eq!(
+            unterminated.cstring(),
+            Err(PacketReadError::UnterminatedString { offset: 0 })
+        );
+
+        let long = vec![b'x'; MAX_STRING_BYTES + 1];
+        let mut too_long = PacketReader::new(&long);
+        assert_eq!(
+            too_long.cstring(),
+            Err(PacketReadError::UnterminatedString { offset: 0 })
+        );
+        let long = [long, vec![0]].concat();
+        let mut too_long = PacketReader::new(&long);
+        assert_eq!(
+            too_long.cstring(),
+            Err(PacketReadError::StringTooLong {
+                offset: 0,
+                limit: MAX_STRING_BYTES,
             })
         );
     }

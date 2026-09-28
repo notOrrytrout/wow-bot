@@ -1,4 +1,8 @@
-use wow_domain::{EntityId, Vec3, WorldPosition, time::Millis};
+use wow_domain::{
+    EntityId, Vec3, WorldPosition,
+    binary::{cstring_at, u32_le_at, u64_le_at},
+    time::Millis,
+};
 use wow_state::ProtocolObservation;
 
 #[cfg(test)]
@@ -137,6 +141,67 @@ mod tests {
 
         assert!(observations.is_empty());
     }
+
+    #[test]
+    fn quest_list_and_gossip_decode_the_same_offer_record() {
+        let mut record = 77_u32.to_le_bytes().to_vec();
+        record.extend_from_slice(&9_u32.to_le_bytes());
+        record.extend_from_slice(&[0; 9]);
+        record.extend_from_slice(b"A quest\0");
+
+        let mut quest_list = 3_u64.to_le_bytes().to_vec();
+        quest_list.extend_from_slice(b"NPC\0");
+        quest_list.extend_from_slice(&[0; 8]);
+        quest_list.push(1);
+        quest_list.extend_from_slice(&record);
+        assert!(matches!(
+            parse_quest_list(&quest_list).as_slice(),
+            [
+                ProtocolObservation::QuestGiverListReceived { offer_count: 1, .. },
+                ProtocolObservation::QuestOffer {
+                    quest: 77,
+                    icon: 9,
+                    ..
+                }
+            ]
+        ));
+
+        let mut gossip = 3_u64.to_le_bytes().to_vec();
+        gossip.extend_from_slice(&[0; 8]);
+        gossip.extend_from_slice(&0_u32.to_le_bytes());
+        gossip.extend_from_slice(&1_u32.to_le_bytes());
+        gossip.extend_from_slice(&record);
+        assert!(matches!(
+            parse_gossip_message(&gossip).as_slice(),
+            [
+                ProtocolObservation::QuestGiverListReceived { offer_count: 1, .. },
+                ProtocolObservation::QuestOffer {
+                    quest: 77,
+                    icon: 9,
+                    ..
+                }
+            ]
+        ));
+
+        let mut offset = 0;
+        assert_eq!(
+            parse_quest_offer_record(&record, &mut offset),
+            Some((77, 9))
+        );
+        assert_eq!(offset, record.len());
+        assert!(parse_quest_offer_record(&record[..record.len() - 1], &mut 0).is_none());
+
+        record[..4].copy_from_slice(&0_u32.to_le_bytes());
+        let mut gossip_zero = 3_u64.to_le_bytes().to_vec();
+        gossip_zero.extend_from_slice(&[0; 8]);
+        gossip_zero.extend_from_slice(&0_u32.to_le_bytes());
+        gossip_zero.extend_from_slice(&1_u32.to_le_bytes());
+        gossip_zero.extend_from_slice(&record);
+        assert!(matches!(
+            parse_gossip_message(&gossip_zero).as_slice(),
+            [ProtocolObservation::QuestGiverListReceived { offer_count: 1, .. }]
+        ));
+    }
 }
 
 pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation> {
@@ -164,7 +229,7 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
             .get(0..4)
             .map(|bytes| {
                 vec![ProtocolObservation::SpellKnown {
-                    spell: u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])),
+                    spell: u32_le_at(bytes, 0).unwrap_or_default(),
                 }]
             })
             .unwrap_or_default(),
@@ -187,7 +252,7 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
 }
 
 fn parse_vendor_list(body: &[u8]) -> Option<ProtocolObservation> {
-    let vendor = u64::from_le_bytes(body.get(..8)?.try_into().ok()?);
+    let vendor = u64_le_at(body, 0)?;
     (vendor != 0).then_some(ProtocolObservation::VendorOpened {
         vendor: EntityId(vendor),
     })
@@ -221,8 +286,8 @@ fn parse_item_template(body: &[u8]) -> Option<ProtocolObservation> {
 }
 
 fn parse_creature_killed(body: &[u8]) -> Option<ProtocolObservation> {
-    let killer = EntityId(u64::from_le_bytes(body.get(..8)?.try_into().ok()?));
-    let victim = EntityId(u64::from_le_bytes(body.get(8..16)?.try_into().ok()?));
+    let killer = EntityId(u64_le_at(body, 0)?);
+    let victim = EntityId(u64_le_at(body, 8)?);
     (killer.0 != 0 && victim.0 != 0)
         .then_some(ProtocolObservation::CreatureKilled { killer, victim })
 }
@@ -289,7 +354,7 @@ fn parse_channel_update(body: &[u8]) -> Option<ProtocolObservation> {
 
 fn read_u32(body: &[u8], offset: &mut usize) -> Option<u32> {
     let end = (*offset).checked_add(4)?;
-    let value = u32::from_le_bytes(body.get(*offset..end)?.try_into().ok()?);
+    let value = u32_le_at(body, *offset)?;
     *offset = end;
     Some(value)
 }
@@ -298,10 +363,10 @@ pub(super) fn parse_corpse_query(body: &[u8]) -> Option<ProtocolObservation> {
     if *body.first()? == 0 {
         return Some(ProtocolObservation::CorpseLocation { position: None });
     }
-    let map = u32::from_le_bytes(body.get(1..5)?.try_into().ok()?);
-    let x = f32::from_le_bytes(body.get(5..9)?.try_into().ok()?);
-    let y = f32::from_le_bytes(body.get(9..13)?.try_into().ok()?);
-    let z = f32::from_le_bytes(body.get(13..17)?.try_into().ok()?);
+    let map = u32_le_at(body, 1)?;
+    let x = f32::from_bits(u32_le_at(body, 5)?);
+    let y = f32::from_bits(u32_le_at(body, 9)?);
+    let z = f32::from_bits(u32_le_at(body, 13)?);
     let point = Vec3::new(x, y, z);
     if !point.is_finite() {
         return None;
@@ -315,7 +380,7 @@ pub(super) fn parse_corpse_query(body: &[u8]) -> Option<ProtocolObservation> {
     })
 }
 pub(super) fn parse_reclaim_delay(body: &[u8]) -> Option<ProtocolObservation> {
-    let delay = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
+    let delay = u32_le_at(body, 0)?;
     Some(ProtocolObservation::CorpseReclaimDelay {
         ready_at_ms: Millis::wall_clock_now().saturating_add(u64::from(delay)).0,
     })
@@ -330,9 +395,8 @@ pub(super) fn parse_spell_cooldowns(body: &[u8]) -> Vec<ProtocolObservation> {
     let starts_global_cooldown = body[8] & 0x01 != 0;
     let mut out = Vec::new();
     while offset + 8 <= body.len() {
-        let spell = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap_or([0; 4]));
-        let cooldown =
-            u32::from_le_bytes(body[offset + 4..offset + 8].try_into().unwrap_or([0; 4]));
+        let spell = u32_le_at(body, offset).unwrap_or_default();
+        let cooldown = u32_le_at(body, offset + 4).unwrap_or_default();
         offset += 8;
         if spell != 0 {
             out.push(ProtocolObservation::SpellCooldown {
@@ -354,7 +418,7 @@ pub(super) fn parse_player_runes(body: &[u8]) -> Option<Vec<wow_state::capabilit
     if body.len() < 4 {
         return None;
     }
-    let count = u32::from_le_bytes(body[0..4].try_into().ok()?) as usize;
+    let count = u32_le_at(body, 0)? as usize;
     if count != 6 || body.len() != 4 + count * 2 {
         return None;
     }
@@ -386,14 +450,16 @@ pub(super) fn parse_initial_spells(body: &[u8]) -> Vec<ProtocolObservation> {
     if body.len() < 3 {
         return Vec::new();
     }
-    let count = u16::from_le_bytes([body[1], body[2]]) as usize;
+    let Some(count) = wow_domain::binary::u16_le_at(body, 1).map(|count| count as usize) else {
+        return Vec::new();
+    };
     if count > 4096 || body.len() < 3 + count.saturating_mul(6) {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(count);
     let mut offset = 3usize;
     for _ in 0..count {
-        let spell = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap_or([0; 4]));
+        let spell = u32_le_at(body, offset).unwrap_or_default();
         offset += 6;
         if spell != 0 {
             out.push(ProtocolObservation::SpellKnown { spell });
@@ -420,7 +486,7 @@ pub(super) fn parse_aura_update(body: &[u8]) -> Option<ProtocolObservation> {
     let entity = read_packed_guid(body, &mut offset)?;
     let slot = *body.get(offset)?;
     offset += 1;
-    let spell = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+    let spell = u32_le_at(body, offset)?;
     let aura = (spell != 0).then_some(wow_state::auras::AuraInstance {
         slot,
         spell,
@@ -439,7 +505,7 @@ pub(super) fn parse_aura_update_all(body: &[u8]) -> Option<ProtocolObservation> 
     while offset < body.len() {
         let slot = *body.get(offset)?;
         offset += 1;
-        let spell = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        let spell = u32_le_at(body, offset)?;
         offset += 4;
         let flags = *body.get(offset)?;
         offset += 1;
@@ -451,9 +517,9 @@ pub(super) fn parse_aura_update_all(body: &[u8]) -> Option<ProtocolObservation> 
             None
         };
         let (max_duration_ms, remaining_ms) = if flags & 0x20 != 0 {
-            let max = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+            let max = u32_le_at(body, offset)?;
             offset += 4;
-            let remaining = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+            let remaining = u32_le_at(body, offset)?;
             offset += 4;
             (Some(max), Some(remaining))
         } else {
@@ -490,7 +556,7 @@ pub(super) fn controlled_abilities_observation(
     let mut offset = 8 + 2 + 4 + 4;
     let mut spells = Vec::new();
     for _ in 0..10 {
-        let packed = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        let packed = u32_le_at(body, offset)?;
         offset += 4;
         let spell = packed & 0x00FF_FFFF;
         if spell != 0 && !spells.contains(&spell) {
@@ -530,10 +596,9 @@ pub(super) fn parse_single_quest_status(body: &[u8]) -> Option<ProtocolObservati
 }
 
 pub(super) fn parse_multiple_quest_status(body: &[u8]) -> Vec<ProtocolObservation> {
-    let Some(count_bytes) = body.get(0..4) else {
+    let Some(count) = u32_le_at(body, 0).map(|count| count as usize) else {
         return Vec::new();
     };
-    let count = u32::from_le_bytes(count_bytes.try_into().unwrap_or([0; 4])) as usize;
     if count > 4096 || body.len() < 4 + count.saturating_mul(9) {
         return Vec::new();
     }
@@ -567,21 +632,9 @@ pub(super) fn parse_quest_list(body: &[u8]) -> Vec<ProtocolObservation> {
     offset += 1;
     let mut offers = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let Some(quest_bytes) = body.get(offset..offset + 4) else {
+        let Some((quest, icon)) = parse_quest_offer_record(body, &mut offset) else {
             return Vec::new();
         };
-        let quest = u32::from_le_bytes(quest_bytes.try_into().unwrap_or([0; 4]));
-        let Some(icon_bytes) = body.get(offset + 4..offset + 8) else {
-            return Vec::new();
-        };
-        let icon = u32::from_le_bytes(icon_bytes.try_into().unwrap_or([0; 4]));
-        if body.get(offset + 8..offset + 17).is_none() {
-            return Vec::new();
-        }
-        offset += 17; // quest, icon, level, flags, repeatable
-        if read_cstring(body, &mut offset).is_none() {
-            return Vec::new();
-        }
         offers.push(ProtocolObservation::QuestOffer { giver, quest, icon });
     }
     let mut out = Vec::with_capacity(offers.len() + 1);
@@ -605,10 +658,9 @@ pub(super) fn parse_gossip_message(body: &[u8]) -> Vec<ProtocolObservation> {
     }
     offset += 8; // gossip menu ID and NPC text ID
 
-    let Some(gossip_count_bytes) = body.get(offset..offset + 4) else {
+    let Some(gossip_count) = u32_le_at(body, offset).map(|count| count as usize) else {
         return Vec::new();
     };
-    let gossip_count = u32::from_le_bytes(gossip_count_bytes.try_into().unwrap_or([0; 4])) as usize;
     if gossip_count > MAX_GOSSIP_ENTRIES {
         return Vec::new();
     }
@@ -623,10 +675,9 @@ pub(super) fn parse_gossip_message(body: &[u8]) -> Vec<ProtocolObservation> {
         }
     }
 
-    let Some(quest_count_bytes) = body.get(offset..offset + 4) else {
+    let Some(quest_count) = u32_le_at(body, offset).map(|count| count as usize) else {
         return Vec::new();
     };
-    let quest_count = u32::from_le_bytes(quest_count_bytes.try_into().unwrap_or([0; 4])) as usize;
     if quest_count > MAX_GOSSIP_ENTRIES {
         return Vec::new();
     }
@@ -638,21 +689,9 @@ pub(super) fn parse_gossip_message(body: &[u8]) -> Vec<ProtocolObservation> {
         offer_count: quest_count as u8,
     });
     for _ in 0..quest_count {
-        let Some(quest_bytes) = body.get(offset..offset + 4) else {
+        let Some((quest, icon)) = parse_quest_offer_record(body, &mut offset) else {
             return Vec::new();
         };
-        let quest = u32::from_le_bytes(quest_bytes.try_into().unwrap_or([0; 4]));
-        let Some(icon_bytes) = body.get(offset + 4..offset + 8) else {
-            return Vec::new();
-        };
-        let icon = u32::from_le_bytes(icon_bytes.try_into().unwrap_or([0; 4]));
-        if body.get(offset + 8..offset + 17).is_none() {
-            return Vec::new();
-        }
-        offset += 17; // quest, icon, level, flags, and repeatable
-        if read_cstring(body, &mut offset).is_none() {
-            return Vec::new();
-        }
         if quest != 0 {
             observations.push(ProtocolObservation::QuestOffer { giver, quest, icon });
         }
@@ -660,18 +699,23 @@ pub(super) fn parse_gossip_message(body: &[u8]) -> Vec<ProtocolObservation> {
     observations
 }
 
+fn parse_quest_offer_record(body: &[u8], offset: &mut usize) -> Option<(u32, u32)> {
+    let quest = u32_le_at(body, *offset)?;
+    let icon = u32_le_at(body, offset.checked_add(4)?)?;
+    body.get(*offset..offset.checked_add(17)?)?;
+    *offset += 17;
+    read_cstring(body, offset)?;
+    Some((quest, icon))
+}
+
 pub(super) fn parse_quest_request_items(body: &[u8]) -> Option<ProtocolObservation> {
     use wow_state::quests::{QuestTurnInDialog, QuestTurnInStage};
     let giver = read_guid(body, 0)?;
-    let quest = u32::from_le_bytes(body.get(8..12)?.try_into().ok()?);
+    let quest = u32_le_at(body, 8)?;
     if body.len() < 28 {
         return None;
     }
-    let completion_code = u32::from_le_bytes(
-        body.get(body.len().checked_sub(16)?..body.len().checked_sub(12)?)?
-            .try_into()
-            .ok()?,
-    );
+    let completion_code = u32_le_at(body, body.len().checked_sub(16)?)?;
     Some(ProtocolObservation::QuestTurnInDialog {
         quest,
         dialog: QuestTurnInDialog {
@@ -686,14 +730,14 @@ pub(super) fn parse_quest_request_items(body: &[u8]) -> Option<ProtocolObservati
 pub(super) fn parse_quest_offer_reward(body: &[u8]) -> Option<ProtocolObservation> {
     use wow_state::quests::{QuestTurnInDialog, QuestTurnInStage};
     let giver = read_guid(body, 0)?;
-    let quest = u32::from_le_bytes(body.get(8..12)?.try_into().ok()?);
+    let quest = u32_le_at(body, 8)?;
     let mut offset = 12usize;
     let _title = read_cstring(body, &mut offset)?;
     let _reward_text = read_cstring(body, &mut offset)?;
     offset = offset.checked_add(1 + 4 + 4)?;
-    let emote_count = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?) as usize;
+    let emote_count = u32_le_at(body, offset)? as usize;
     offset = offset.checked_add(4 + emote_count.checked_mul(8)?)?;
-    let reward_choices = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+    let reward_choices = u32_le_at(body, offset)?;
     Some(ProtocolObservation::QuestTurnInDialog {
         quest,
         dialog: QuestTurnInDialog {
@@ -713,9 +757,7 @@ pub(super) fn parse_quest_query_response(body: &[u8]) -> Option<ProtocolObservat
     }
     let read_u32 = |index: usize| -> Option<u32> {
         let offset = index.checked_mul(4)?;
-        Some(u32::from_le_bytes(
-            body.get(offset..offset + 4)?.try_into().ok()?,
-        ))
+        u32_le_at(body, offset)
     };
     let quest = read_u32(0)?;
     let poi_map_raw = read_u32(61)?;
@@ -730,13 +772,13 @@ pub(super) fn parse_quest_query_response(body: &[u8]) -> Option<ProtocolObservat
 
     let mut raw_targets = Vec::with_capacity(4);
     for _ in 0..4 {
-        let encoded = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        let encoded = u32_le_at(body, offset)?;
         offset += 4;
-        let required = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        let required = u32_le_at(body, offset)?;
         offset += 4;
-        let item_drop = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        let item_drop = u32_le_at(body, offset)?;
         offset += 4;
-        let _source_count = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        let _source_count = u32_le_at(body, offset)?;
         offset += 4;
         let (kind, entry) = if encoded & 0x8000_0000 != 0 {
             (QuestTargetKind::GameObject, encoded & 0x7FFF_FFFF)
@@ -747,9 +789,9 @@ pub(super) fn parse_quest_query_response(body: &[u8]) -> Option<ProtocolObservat
     }
     let mut items = Vec::new();
     for _ in 0..6 {
-        let item = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        let item = u32_le_at(body, offset)?;
         offset += 4;
-        let required = u32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?);
+        let required = u32_le_at(body, offset)?;
         offset += 4;
         if item != 0 && required != 0 {
             items.push(QuestItemObjective { item, required });
@@ -795,18 +837,13 @@ pub(super) fn parse_quest_query_response(body: &[u8]) -> Option<ProtocolObservat
 }
 
 pub(super) fn read_cstring<'a>(body: &'a [u8], offset: &mut usize) -> Option<&'a str> {
-    let rest = body.get(*offset..)?;
-    let end = rest.iter().position(|b| *b == 0)?;
-    let text = std::str::from_utf8(rest.get(..end)?).ok()?;
-    *offset += end + 1;
+    let (text, next) = cstring_at(body, *offset, None).ok()?;
+    *offset = next;
     Some(text)
 }
 
 fn read_guid(body: &[u8], offset: usize) -> Option<EntityId> {
-    let end = offset.checked_add(8)?;
-    Some(EntityId(u64::from_le_bytes(
-        body.get(offset..end)?.try_into().ok()?,
-    )))
+    Some(EntityId(u64_le_at(body, offset)?))
 }
 
 fn parse_quest_status_entry(body: &[u8], offset: usize) -> Option<ProtocolObservation> {

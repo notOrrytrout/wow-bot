@@ -11,6 +11,7 @@ import re
 import struct
 import sys
 from pathlib import Path
+from dbc import read_wdbc
 
 
 def insert_rows(path, table):
@@ -73,16 +74,15 @@ def read_taxipath_sql(path):
 
 
 def read_taxipath_dbc(path):
-    body = Path(path).read_bytes()
-    if len(body) < 20 or body[:4] != b"WDBC":
-        raise ValueError(f"{path} is not a WDBC file")
-    count, fields, record_size, string_size = struct.unpack_from("<4I", body, 4)
-    if record_size < 44 or len(body) < 20 + count * record_size + string_size:
-        raise ValueError(f"{path} has an unsupported TaxiPathNode.dbc layout")
+    dbc = read_wdbc(
+        Path(path),
+        minimum_record_bytes=44,
+        validate_field_extent=False,
+        string_block_policy="within",
+    )
     nodes = []
-    for index in range(count):
-        offset = 20 + index * record_size
-        row = struct.unpack_from("<11I", body, offset)
+    for record in dbc.records:
+        row = struct.unpack_from("<11I", record)
         nodes.append((row[1], row[2], row[3], row[7]))
     return nodes
 

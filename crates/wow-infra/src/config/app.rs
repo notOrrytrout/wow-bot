@@ -2,6 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 use wow_domain::{AccountId, LaneId};
 
+pub const DEFAULT_LOOPBACK_HOST: &str = "127.0.0.1";
+pub const DEFAULT_PROXY_BIND_HOST: &str = "0.0.0.0";
+pub const DEFAULT_UPSTREAM_AUTH_PORT: u16 = 3724;
+pub const DEFAULT_UPSTREAM_WORLD_PORT: u16 = 8085;
+pub const DEFAULT_PROXY_AUTH_PORT: u16 = 3725;
+pub const DEFAULT_PROXY_WORLD_PORT: u16 = 8086;
+pub const DEFAULT_TRANSPARENT_WORLD_PORT: u16 = 8088;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountConfig {
@@ -31,22 +39,25 @@ const fn default_true() -> bool {
     true
 }
 const fn default_auth_port() -> u16 {
-    3724
+    DEFAULT_UPSTREAM_AUTH_PORT
 }
 const fn default_world_port() -> u16 {
-    8085
+    DEFAULT_UPSTREAM_WORLD_PORT
 }
 fn default_proxy_auth_bind() -> String {
-    "0.0.0.0:3725".to_owned()
+    listener_bind(DEFAULT_PROXY_AUTH_PORT)
 }
 fn default_proxy_world_bind() -> String {
-    "0.0.0.0:8086".to_owned()
+    listener_bind(DEFAULT_PROXY_WORLD_PORT)
 }
 fn default_transparent_world_bind() -> String {
-    "0.0.0.0:8088".to_owned()
+    listener_bind(DEFAULT_TRANSPARENT_WORLD_PORT)
 }
 fn default_advertise_host() -> String {
-    "127.0.0.1".to_owned()
+    DEFAULT_LOOPBACK_HOST.to_owned()
+}
+fn listener_bind(port: u16) -> String {
+    format!("{DEFAULT_PROXY_BIND_HOST}:{port}")
 }
 const fn default_max_total() -> usize {
     128
@@ -70,9 +81,9 @@ pub struct UpstreamConfig {
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
-            auth_host: "127.0.0.1".into(),
+            auth_host: DEFAULT_LOOPBACK_HOST.into(),
             auth_port: default_auth_port(),
-            world_host: "127.0.0.1".into(),
+            world_host: DEFAULT_LOOPBACK_HOST.into(),
             world_port: default_world_port(),
             realm_name: "AzerothCore".into(),
         }
@@ -126,6 +137,14 @@ impl Default for ProxyConfig {
     }
 }
 
+impl ProxyConfig {
+    pub fn set_listener_bind_host(&mut self, host: &str) {
+        self.auth_bind = format!("{host}:{DEFAULT_PROXY_AUTH_PORT}");
+        self.world_bind = format!("{host}:{DEFAULT_PROXY_WORLD_PORT}");
+        self.transparent_world_bind = format!("{host}:{DEFAULT_TRANSPARENT_WORLD_PORT}");
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -135,6 +154,59 @@ impl Default for AppConfig {
             proxy: ProxyConfig::default(),
             accounts: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_defaults_match_example_config() {
+        let example: AppConfig =
+            serde_json::from_str(include_str!("../../../../config.example.json"))
+                .expect("example config should deserialize");
+        let defaults = AppConfig::default();
+
+        assert_eq!(example.upstream.auth_host, defaults.upstream.auth_host);
+        assert_eq!(example.upstream.auth_port, defaults.upstream.auth_port);
+        assert_eq!(example.upstream.world_host, defaults.upstream.world_host);
+        assert_eq!(example.upstream.world_port, defaults.upstream.world_port);
+        assert_eq!(example.proxy.auth_bind, defaults.proxy.auth_bind);
+        assert_eq!(example.proxy.world_bind, defaults.proxy.world_bind);
+        assert_eq!(
+            example.proxy.transparent_world_bind,
+            defaults.proxy.transparent_world_bind
+        );
+        assert_eq!(example.proxy.advertise_host, defaults.proxy.advertise_host);
+    }
+
+    #[test]
+    fn proxy_listener_bind_host_keeps_shared_ports() {
+        let mut proxy = ProxyConfig::default();
+
+        proxy.set_listener_bind_host(DEFAULT_LOOPBACK_HOST);
+
+        assert_eq!(
+            proxy.auth_bind,
+            format!("{DEFAULT_LOOPBACK_HOST}:{DEFAULT_PROXY_AUTH_PORT}")
+        );
+        assert_eq!(
+            proxy.world_bind,
+            format!("{DEFAULT_LOOPBACK_HOST}:{DEFAULT_PROXY_WORLD_PORT}")
+        );
+        assert_eq!(
+            proxy.transparent_world_bind,
+            format!("{DEFAULT_LOOPBACK_HOST}:{DEFAULT_TRANSPARENT_WORLD_PORT}")
+        );
+
+        proxy.set_listener_bind_host(DEFAULT_PROXY_BIND_HOST);
+        assert_eq!(proxy.auth_bind, default_proxy_auth_bind());
+        assert_eq!(proxy.world_bind, default_proxy_world_bind());
+        assert_eq!(
+            proxy.transparent_world_bind,
+            default_transparent_world_bind()
+        );
     }
 }
 

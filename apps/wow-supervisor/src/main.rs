@@ -25,7 +25,10 @@ use wow_control_proto::{
 };
 use wow_domain::{AccountId, LaneId, WorkerGeneration, time::Millis};
 use wow_infra::config::{
-    app::{AccountConfig, AppConfig},
+    app::{
+        AccountConfig, AppConfig, DEFAULT_LOOPBACK_HOST, DEFAULT_PROXY_AUTH_PORT,
+        DEFAULT_PROXY_BIND_HOST, DEFAULT_PROXY_WORLD_PORT, DEFAULT_TRANSPARENT_WORLD_PORT,
+    },
     data_dir::AppPaths,
 };
 use wow_infra::logging::structured::{DiagnosticStream, diagnostic_path};
@@ -615,8 +618,8 @@ fn ensure_interactive_setup(
 fn configure_network_topology(config: &mut AppConfig) -> Result<()> {
     let local_server = prompt_yes_no("Is AzerothCore running on this same computer?", true)?;
     if local_server {
-        config.upstream.auth_host = "127.0.0.1".into();
-        config.upstream.world_host = "127.0.0.1".into();
+        config.upstream.auth_host = DEFAULT_LOOPBACK_HOST.into();
+        config.upstream.world_host = DEFAULT_LOOPBACK_HOST.into();
     } else {
         let host = prompt_required("AzerothCore hostname or IP address")?;
         config.upstream.auth_host = host.clone();
@@ -637,18 +640,14 @@ fn configure_network_topology(config: &mut AppConfig) -> Result<()> {
             );
         }
         println!(
-            "For clients outside your LAN, enter your public IP address or DNS name. Set router port forwarding to this computer for TCP ports 3725, 8086, and 8088."
+            "For clients outside your LAN, enter your public IP address or DNS name. Set router port forwarding to this computer for TCP ports {DEFAULT_PROXY_AUTH_PORT}, {DEFAULT_PROXY_WORLD_PORT}, and {DEFAULT_TRANSPARENT_WORLD_PORT}."
         );
         let advertised = prompt_client_reachable_host(detected.as_deref())?;
-        config.proxy.auth_bind = "0.0.0.0:3725".into();
-        config.proxy.world_bind = "0.0.0.0:8086".into();
-        config.proxy.transparent_world_bind = "0.0.0.0:8088".into();
+        config.proxy.set_listener_bind_host(DEFAULT_PROXY_BIND_HOST);
         config.proxy.advertise_host = advertised;
     } else {
-        config.proxy.auth_bind = "127.0.0.1:3725".into();
-        config.proxy.world_bind = "127.0.0.1:8086".into();
-        config.proxy.transparent_world_bind = "127.0.0.1:8088".into();
-        config.proxy.advertise_host = "127.0.0.1".into();
+        config.proxy.set_listener_bind_host(DEFAULT_LOOPBACK_HOST);
+        config.proxy.advertise_host = DEFAULT_LOOPBACK_HOST.into();
     }
     Ok(())
 }
@@ -724,8 +723,8 @@ async fn check_upstream_services(config: &AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let same_machine =
-        config.upstream.auth_host == "127.0.0.1" && config.upstream.world_host == "127.0.0.1";
+    let same_machine = config.upstream.auth_host == DEFAULT_LOOPBACK_HOST
+        && config.upstream.world_host == DEFAULT_LOOPBACK_HOST;
     let hint = if same_machine {
         "AzerothCore is configured on this same computer. Start both authserver and worldserver, and verify they are listening on the configured ports."
     } else {

@@ -556,10 +556,7 @@ fn owned_dot_is_active(
             auras.values().any(|aura| {
                 let same_dot_family = crate::combat::spells::metadata(aura.spell)
                     .is_some_and(|metadata| metadata.family_id == family);
-                let refresh_window = aura
-                    .max_duration_ms
-                    .map(|duration| (duration / 5).clamp(1_000, 3_000))
-                    .unwrap_or(1_500);
+                let refresh_window = aura_refresh_window_ms(aura.max_duration_ms);
                 aura.caster == Some(player)
                     && same_dot_family
                     && aura
@@ -567,6 +564,12 @@ fn owned_dot_is_active(
                         .is_none_or(|remaining| remaining > refresh_window)
             })
         })
+}
+
+fn aura_refresh_window_ms(max_duration_ms: Option<u32>) -> u32 {
+    max_duration_ms
+        .map(|duration| (duration / 5).clamp(1_000, 3_000))
+        .unwrap_or(1_500)
 }
 
 /// Select one bounded dispel or refresh an owned crowd-control effect before
@@ -601,10 +604,7 @@ fn select_combat_utility(snapshot: &Snapshot, target: EntityId) -> Option<(u32, 
             let Some(remaining) = aura.remaining_ms else {
                 continue;
             };
-            let window = aura
-                .max_duration_ms
-                .map(|duration| (duration / 5).clamp(1_000, 3_000))
-                .unwrap_or(1_500);
+            let window = aura_refresh_window_ms(aura.max_duration_ms);
             if remaining <= 300 || remaining > window {
                 continue;
             }

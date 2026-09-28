@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct NonEmptyText(String);
 
+/// Return a trimmed, lowercase form for case-insensitive name matching.
+pub fn normalize_name(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
 impl NonEmptyText {
     pub fn new(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
@@ -48,5 +53,10 @@ mod tests {
         assert!(valid_identifier("bot_1-a"));
         assert!(!valid_identifier("1bot"));
         assert!(!valid_identifier("bot space"));
+    }
+
+    #[test]
+    fn name_normalization_trims_and_lowercases() {
+        assert_eq!(normalize_name("  Iron Ore "), "iron ore");
     }
 }

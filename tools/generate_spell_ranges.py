@@ -7,6 +7,7 @@ import hashlib
 import json
 import struct
 from pathlib import Path
+from dbc import read_wdbc
 
 
 SPELL_RANGE_INDEX_FIELD = 46
@@ -16,25 +17,6 @@ ONLY_STEALTHED_ATTRIBUTE = 0x00020000
 STEALTH_AURA_TYPE = 16
 
 
-def read_dbc(path: Path) -> tuple[int, int, list[bytes]]:
-    data = path.read_bytes()
-    if len(data) < 20:
-        raise RuntimeError(f"{path} is too small to be a WDBC file")
-    magic, record_count, field_count, record_size, string_size = struct.unpack_from(
-        "<4s4I", data
-    )
-    records_end = 20 + record_count * record_size
-    if magic != b"WDBC" or field_count * 4 > record_size:
-        raise RuntimeError(f"{path} has an unsupported WDBC layout")
-    if records_end + string_size != len(data):
-        raise RuntimeError(f"{path} is truncated or has trailing data")
-    records = [
-        data[20 + row * record_size : 20 + (row + 1) * record_size]
-        for row in range(record_count)
-    ]
-    return field_count, record_size, records
-
-
 def generate(dbc_dir: Path) -> dict:
     spell_path = dbc_dir / "Spell.dbc"
     range_path = dbc_dir / "SpellRange.dbc"
@@ -42,8 +24,10 @@ def generate(dbc_dir: Path) -> dict:
         if not path.is_file():
             raise FileNotFoundError(f"missing spell range source: {path}")
 
-    spell_fields, _, spell_records = read_dbc(spell_path)
-    range_fields, _, range_records = read_dbc(range_path)
+    spell_file = read_wdbc(spell_path, error_type=RuntimeError)
+    range_file = read_wdbc(range_path, error_type=RuntimeError)
+    spell_fields, spell_records = spell_file.field_count, spell_file.records
+    range_fields, range_records = range_file.field_count, range_file.records
     if spell_fields <= SPELL_RANGE_INDEX_FIELD or range_fields < 6:
         raise RuntimeError("DBC files do not match the expected 3.3.5a layouts")
 

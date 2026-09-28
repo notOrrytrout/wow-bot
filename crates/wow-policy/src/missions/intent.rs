@@ -14,5 +14,5 @@ pub fn exact_name_scope<'a>(mission: &'a Mission) -> Option<&'a str> {
 }
 
 pub fn normalize_scope(value: &str) -> String {
-    value.trim().to_lowercase()
+    wow_domain::text::normalize_name(value)
 }

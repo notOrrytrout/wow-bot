@@ -1,7 +1,7 @@
 use wow_state::entities::EntityState;
 
 pub fn normalized_name(value: &str) -> String {
-    value.trim().to_lowercase()
+    wow_domain::text::normalize_name(value)
 }
 
 pub fn matches_resource(entity: &EntityState, resource: &str) -> bool {

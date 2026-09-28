@@ -4,27 +4,12 @@
 import argparse
 import hashlib
 import json
-import struct
 from pathlib import Path
-
-def read_dbc(path: Path) -> tuple[list[tuple[int, ...]], bytes]:
-    data = path.read_bytes()
-    if len(data) < 20 or data[:4] != b"WDBC":
-        raise ValueError(f"{path} has an invalid WDBC header")
-    count, fields, size, string_size = struct.unpack_from("<4I", data, 4)
-    records_end = 20 + count * size
-    if size < fields * 4 or records_end + string_size != len(data):
-        raise ValueError(f"{path} has an unsupported or truncated DBC layout")
-    records = [
-        struct.unpack_from("<" + "I" * fields, data, 20 + index * size)
-        for index in range(count)
-    ]
-    return records, data[records_end:]
-
+from dbc import read_wdbc
 
 def generate(dbc_dir: Path, seed_path: Path, catalog_path: Path) -> dict:
     spell_path = dbc_dir / "Spell.dbc"
-    records, _ = read_dbc(spell_path)
+    records = read_wdbc(spell_path).integer_rows()
     by_id = {record[0] for record in records if record[0]}
     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     family_by_spell = {spell["id"]: spell["family_id"] for spell in catalog["spells"]}

@@ -10,10 +10,10 @@ import argparse
 import hashlib
 import json
 import re
-import struct
 import subprocess
 from collections import defaultdict
 from pathlib import Path
+from dbc import read_wdbc
 
 CREATE_COLUMN_RE = re.compile(r"^\s*`([^`]+)`\s+")
 
@@ -133,22 +133,15 @@ def sha256(path: Path) -> str:
 
 def lock_rows_from_dbc(path: Path):
     """Yield Lock.dbc rows as ID + Type[8] + Index[8] + Skill[8]."""
-    data = path.read_bytes()
-    if len(data) < 20:
-        raise RuntimeError(f"{path} is too small to be a WDBC file")
-    magic, record_count, field_count, record_size, string_size = struct.unpack_from("<4s4I", data, 0)
-    if magic != b"WDBC":
-        raise RuntimeError(f"{path} has invalid DBC magic {magic!r}")
-    if field_count < 33 or record_size < 33 * 4:
-        raise RuntimeError(
-            f"{path} has an unsupported Lock.dbc layout: fields={field_count}, record_size={record_size}"
-        )
-    records_end = 20 + record_count * record_size
-    if records_end + string_size > len(data):
-        raise RuntimeError(f"{path} is truncated")
-    for index in range(record_count):
-        offset = 20 + index * record_size
-        values = struct.unpack_from("<33I", data, offset)
+    dbc = read_wdbc(
+        path,
+        minimum_fields=33,
+        minimum_record_bytes=33 * 4,
+        validate_field_extent=False,
+        string_block_policy="within",
+        error_type=RuntimeError,
+    )
+    for values in dbc.integer_rows(33):
         yield values[:25]
 
 
@@ -169,20 +162,13 @@ PROFESSION_SKILLS = {129, 164, 165, 171, 182, 185, 186, 197, 202, 333, 356, 393,
 
 def dbc_records(path: Path):
     """Yield little-endian u32 fields from a WotLK WDBC file."""
-    data = path.read_bytes()
-    if len(data) < 20:
-        raise RuntimeError(f"{path} is too small to be a WDBC file")
-    magic, record_count, field_count, record_size, string_size = struct.unpack_from("<4s4I", data, 0)
-    if magic != b"WDBC" or field_count == 0 or record_size != field_count * 4:
-        raise RuntimeError(
-            f"{path} has an unsupported WDBC layout: magic={magic!r}, fields={field_count}, record_size={record_size}"
-        )
-    records_end = 20 + record_count * record_size
-    if records_end + string_size > len(data):
-        raise RuntimeError(f"{path} is truncated")
-    fmt = f"<{field_count}I"
-    for index in range(record_count):
-        yield struct.unpack_from(fmt, data, 20 + index * record_size)
+    yield from read_wdbc(
+        path,
+        minimum_fields=1,
+        string_block_policy="within",
+        require_exact_record_size=True,
+        error_type=RuntimeError,
+    ).integer_rows()
 
 
 def find_dbc(args, name: str) -> Path | None:

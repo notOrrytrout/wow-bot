@@ -6,8 +6,8 @@ import argparse
 import hashlib
 import json
 import re
-import struct
 from pathlib import Path
+from dbc import read_wdbc
 
 BUILD = 12340
 CLASS_IDS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 11)
@@ -79,21 +79,6 @@ FIELDS = {
 SPELL_FIELDS = 234
 
 
-def read_dbc(path: Path) -> tuple[list[tuple[int, ...]], bytes, bytes]:
-    data = path.read_bytes()
-    if len(data) < 20:
-        raise ValueError(f"{path} is too small to be a WDBC file")
-    magic, count, fields, row_size, string_size = struct.unpack_from("<4s4I", data)
-    end = 20 + count * row_size
-    if magic != b"WDBC" or fields * 4 > row_size or end + string_size != len(data):
-        raise ValueError(f"{path} has an invalid or truncated WDBC layout")
-    records = [
-        struct.unpack_from("<" + "I" * fields, data, 20 + i * row_size)
-        for i in range(count)
-    ]
-    return records, data[end:], data
-
-
 def dbc_string(strings: bytes, offset: int) -> str:
     if offset >= len(strings):
         return ""
@@ -101,7 +86,7 @@ def dbc_string(strings: bytes, offset: int) -> str:
 
 
 def indexed_rows(path: Path) -> dict[int, tuple[int, ...]]:
-    rows, _, _ = read_dbc(path)
+    rows = read_wdbc(path).integer_rows()
     return {row[0]: row for row in rows if row and row[0]}
 
 
@@ -143,7 +128,9 @@ def generate(dbc_dir: Path) -> dict:
         if not path.is_file():
             raise FileNotFoundError(f"missing spell catalogue source: {path}")
 
-    spell_rows, spell_strings, spell_bytes = read_dbc(paths["Spell.dbc"])
+    spell_file = read_wdbc(paths["Spell.dbc"])
+    spell_rows, spell_strings = spell_file.integer_rows(), spell_file.strings
+    spell_bytes = spell_file.source
     if len(spell_rows[0]) != SPELL_FIELDS:
         raise ValueError(f"Spell.dbc must have {SPELL_FIELDS} fields")
     ranges = indexed_rows(paths["SpellRange.dbc"])

@@ -4,8 +4,8 @@
 import argparse
 import hashlib
 import json
-import struct
 from pathlib import Path
+from dbc import read_wdbc
 
 
 # TalentTab.dbc IDs and tree pages from the 3.3.5a client data. Keep this
@@ -24,22 +24,6 @@ TAB_TREES = {
 }
 
 
-def dbc_records(path: Path, minimum_fields: int) -> list[tuple[int, ...]]:
-    data = path.read_bytes()
-    if len(data) < 20 or data[:4] != b"WDBC":
-        raise ValueError(f"{path} has an invalid WDBC header")
-    count, fields, record_size, _ = struct.unpack_from("<4I", data, 4)
-    if fields < minimum_fields or record_size < fields * 4:
-        raise ValueError(f"{path} has an unsupported record layout")
-    records_end = 20 + count * record_size
-    if records_end > len(data):
-        raise ValueError(f"{path} has truncated records")
-    return [
-        struct.unpack_from("<" + "I" * fields, data, 20 + i * record_size)
-        for i in range(count)
-    ]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dbc_dir", type=Path)
@@ -52,12 +36,19 @@ def main() -> None:
 
     talent_path = args.dbc_dir / "Talent.dbc"
     tab_path = args.dbc_dir / "TalentTab.dbc"
-    tab_pages = {record[0]: record[22] for record in dbc_records(tab_path, 23)}
+    tab_pages = {
+        record[0]: record[22]
+        for record in read_wdbc(
+            tab_path, minimum_fields=23, string_block_policy="ignore"
+        ).integer_rows()
+    }
     if any(tab_pages.get(tab_id) != tree for tab_id, (_, tree) in TAB_TREES.items()):
         raise ValueError("TalentTab.dbc tree pages do not match the reviewed 3.3.5a map")
     talents: dict[str, dict[str, int]] = {}
     counts = {(class_id, tree): 0 for class_id, tree in TAB_TREES.values()}
-    for record in dbc_records(talent_path, 23):
+    for record in read_wdbc(
+        talent_path, minimum_fields=23, string_block_policy="ignore"
+    ).integer_rows():
         talent_id, tab_id = record[:2]
         if tab_id not in tab_pages or tab_id not in TAB_TREES:
             continue

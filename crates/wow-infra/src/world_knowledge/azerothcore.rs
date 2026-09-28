@@ -434,7 +434,7 @@ impl AzerothCoreCatalog {
         )
     }
     pub fn nearest_vendor(&self, service: VendorKind, map: u32, from: Vec3) -> Option<(u32, Vec3)> {
-        closest_by_distance(
+        nearest_spawn_candidate(
             self.world
                 .vendor_services
                 .iter()
@@ -444,12 +444,13 @@ impl AzerothCoreCatalog {
                     VendorKind::Auction => vendor.can_auction,
                 })
                 .flat_map(|vendor| {
-                    vendor.spawns.iter().filter_map(move |spawn| {
-                        nearest_location(spawn, map)
-                            .map(|point| (from.distance(point), vendor.entry_id, point))
-                    })
-                })
-                .map(|(distance, entry, point)| (distance, (entry, point))),
+                    vendor
+                        .spawns
+                        .iter()
+                        .map(move |spawn| (vendor.entry_id, spawn))
+                }),
+            map,
+            from,
         )
     }
     pub fn nearest_profession_trainer(
@@ -458,18 +459,19 @@ impl AzerothCoreCatalog {
         map: u32,
         from: Vec3,
     ) -> Option<(u32, Vec3)> {
-        closest_by_distance(
+        nearest_spawn_candidate(
             self.world
                 .trainer_services
                 .iter()
                 .filter(|trainer| trainer.skills.contains(&skill))
                 .flat_map(|trainer| {
-                    trainer.spawns.iter().filter_map(move |spawn| {
-                        nearest_location(spawn, map)
-                            .map(|point| (from.distance(point), trainer.entry_id, point))
-                    })
-                })
-                .map(|(distance, entry, point)| (distance, (entry, point))),
+                    trainer
+                        .spawns
+                        .iter()
+                        .map(move |spawn| (trainer.entry_id, spawn))
+                }),
+            map,
+            from,
         )
     }
     pub fn nearest_gather_node(
@@ -478,18 +480,14 @@ impl AzerothCoreCatalog {
         map: u32,
         from: Vec3,
     ) -> Option<(&GatherNode, Vec3)> {
-        closest_by_distance(
+        nearest_spawn_candidate(
             self.world
                 .gather_nodes
                 .iter()
                 .filter(|node| node.kind == kind)
-                .flat_map(|node| {
-                    node.spawns.iter().filter_map(move |spawn| {
-                        nearest_location(spawn, map)
-                            .map(|point| (from.distance(point), node, point))
-                    })
-                })
-                .map(|(distance, node, point)| (distance, (node, point))),
+                .flat_map(|node| node.spawns.iter().map(move |spawn| (node, spawn))),
+            map,
+            from,
         )
     }
     fn nearest_spawn_for_entries(
@@ -558,6 +556,16 @@ fn closest_by_distance<T>(candidates: impl IntoIterator<Item = (f32, T)>) -> Opt
         .into_iter()
         .min_by(|left, right| left.0.total_cmp(&right.0))
         .map(|(_, candidate)| candidate)
+}
+
+fn nearest_spawn_candidate<'a, T>(
+    spawns: impl IntoIterator<Item = (T, &'a KnowledgeSpawn)>,
+    map: u32,
+    from: Vec3,
+) -> Option<(T, Vec3)> {
+    closest_by_distance(spawns.into_iter().filter_map(|(candidate, spawn)| {
+        nearest_location(spawn, map).map(|point| (from.distance(point), (candidate, point)))
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -645,6 +653,18 @@ mod tests {
         }
     }
 
+    fn spawn(map_id: u32, x: f32) -> KnowledgeSpawn {
+        KnowledgeSpawn {
+            map_id,
+            zone_id: 0,
+            area_id: 0,
+            x,
+            y: 0.0,
+            z: 0.0,
+            orientation: 0.0,
+        }
+    }
+
     #[test]
     fn spawn_candidates_are_nearest_first_and_unique() {
         let origin = Vec3::new(0.0, 0.0, 0.0);
@@ -689,6 +709,17 @@ mod tests {
         );
         assert!(
             nearby_quest_start_locations(&starts, 1, Vec3::default(), Some(1), f32::NAN).is_empty()
+        );
+    }
+
+    #[test]
+    fn nearest_spawn_candidate_uses_the_closest_spawn_on_the_requested_map() {
+        let spawns = [spawn(2, 1.0), spawn(1, 8.0), spawn(1, 3.0)];
+        let candidates = [(20, &spawns[0]), (10, &spawns[1]), (30, &spawns[2])];
+
+        assert_eq!(
+            nearest_spawn_candidate(candidates, 1, Vec3::default()),
+            Some((30, Vec3::new(3.0, 0.0, 0.0)))
         );
     }
 }

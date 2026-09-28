@@ -1,5 +1,9 @@
 use super::{
-    app::{AccountConfig, AppConfig, ProxyConfig, UpstreamConfig},
+    app::{
+        AccountConfig, AppConfig, DEFAULT_LOOPBACK_HOST, DEFAULT_PROXY_AUTH_PORT,
+        DEFAULT_PROXY_BIND_HOST, DEFAULT_PROXY_WORLD_PORT, DEFAULT_TRANSPARENT_WORLD_PORT,
+        DEFAULT_UPSTREAM_AUTH_PORT, DEFAULT_UPSTREAM_WORLD_PORT, ProxyConfig, UpstreamConfig,
+    },
     runtime_data::RuntimeTuning,
 };
 use anyhow::{Context, Result, bail};
@@ -77,7 +81,7 @@ fn endpoint(
         return bind;
     }
     let port = number(root, port_path).unwrap_or(default_port);
-    format!("0.0.0.0:{port}")
+    format!("{DEFAULT_PROXY_BIND_HOST}:{port}")
 }
 
 fn resolve_from(parent: &Path, path: PathBuf) -> PathBuf {
@@ -144,9 +148,9 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
     }
 
     let proxy_client_host =
-        string(&values, &["proxy_client_host"]).unwrap_or_else(|| "127.0.0.1".to_owned());
+        string(&values, &["proxy_client_host"]).unwrap_or_else(|| DEFAULT_LOOPBACK_HOST.to_owned());
     let wow_server_host =
-        string(&values, &["wow_server_host"]).unwrap_or_else(|| "127.0.0.1".to_owned());
+        string(&values, &["wow_server_host"]).unwrap_or_else(|| DEFAULT_LOOPBACK_HOST.to_owned());
     let auth_host = string(&values, &["proxy", "upstream", "auth_host"])
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| wow_server_host.clone());
@@ -195,17 +199,19 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
         auth_host,
         auth_port: number(&values, &["proxy", "upstream", "auth_port"])
             .and_then(|n| u16::try_from(n).ok())
-            .unwrap_or(3724),
+            .unwrap_or(DEFAULT_UPSTREAM_AUTH_PORT),
         world_host,
         world_port: number(&values, &["proxy", "upstream", "world_port"])
             .and_then(|n| u16::try_from(n).ok())
-            .unwrap_or(8085),
+            .unwrap_or(DEFAULT_UPSTREAM_WORLD_PORT),
         realm_name,
     };
-    let player_auth_port = number(&values, &["proxy", "player", "auth_port"]).unwrap_or(3725);
-    let player_world_port = number(&values, &["proxy", "player", "world_port"]).unwrap_or(8086);
-    let passthrough_port =
-        number(&values, &["proxy", "account", "passthrough_world_port"]).unwrap_or(8088);
+    let player_auth_port = number(&values, &["proxy", "player", "auth_port"])
+        .unwrap_or(u64::from(DEFAULT_PROXY_AUTH_PORT));
+    let player_world_port = number(&values, &["proxy", "player", "world_port"])
+        .unwrap_or(u64::from(DEFAULT_PROXY_WORLD_PORT));
+    let passthrough_port = number(&values, &["proxy", "account", "passthrough_world_port"])
+        .unwrap_or(u64::from(DEFAULT_TRANSPARENT_WORLD_PORT));
     config.proxy = ProxyConfig {
         auth_bind: endpoint(
             &values,
@@ -219,7 +225,7 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
             &["proxy", "player", "world_port"],
             player_world_port,
         ),
-        transparent_world_bind: format!("0.0.0.0:{passthrough_port}"),
+        transparent_world_bind: format!("{DEFAULT_PROXY_BIND_HOST}:{passthrough_port}"),
         advertise_host: string(&values, &["proxy", "player", "advertise_host"])
             .filter(|value| !value.is_empty())
             .unwrap_or(proxy_client_host),
@@ -324,7 +330,7 @@ mod tests {
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn runtime_tuning_toml_values_flow_to_runtime_config() {
+    fn legacy_toml_uses_shared_ports_and_runtime_tuning_defaults() {
         let unique = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
         let directory = Path::new("/private/tmp").join(format!(
             "wow-infra-runtime-tuning-{}-{unique}",
@@ -366,6 +372,15 @@ character = "Test Character"
         .unwrap();
 
         let config = load_toml(&config_path).unwrap();
+        let defaults = AppConfig::default();
+        assert_eq!(config.upstream.auth_port, defaults.upstream.auth_port);
+        assert_eq!(config.upstream.world_port, defaults.upstream.world_port);
+        assert_eq!(config.proxy.auth_bind, defaults.proxy.auth_bind);
+        assert_eq!(config.proxy.world_bind, defaults.proxy.world_bind);
+        assert_eq!(
+            config.proxy.transparent_world_bind,
+            defaults.proxy.transparent_world_bind
+        );
         assert_eq!(
             config
                 .runtime
