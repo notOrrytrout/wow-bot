@@ -1,5 +1,6 @@
 use tentacli::plugins::wow::wotlk::realm::object::{
     Object, ObjectNameRegistry, ObjectTypeId,
+    types::movement::{MovementFlags, Point3D},
     types::update_fields::{FieldValue, UnitField},
 };
 use wow_domain::{EntityId, Vec3, WorldPosition};
@@ -15,11 +16,7 @@ pub fn object_to_entity(
 ) -> EntityState {
     let id = EntityId(object.guid().0);
     let entry = object.entry_id().unwrap_or_default();
-    let position = object.position().map(|point| WorldPosition {
-        map: map_id,
-        point: Vec3::new(point.x, point.y, point.z),
-        orientation: object.facing().unwrap_or_default(),
-    });
+    let position = current_world_position(object, map_id);
     let health = object
         .as_unit()
         .and_then(|unit| unit.health().zip(unit.max_health()));
@@ -123,6 +120,86 @@ pub fn object_to_entity(
     }
 }
 
+fn current_world_position(object: &Object, map_id: u32) -> Option<WorldPosition> {
+    let point = active_spline_position(object).or_else(|| object.position())?;
+    Some(WorldPosition {
+        map: map_id,
+        point: Vec3::new(point.x, point.y, point.z),
+        orientation: object.facing().unwrap_or_default(),
+    })
+}
+
+/// Tentacli stores creature spline paths separately from the last position in
+/// MovementInfo. Use the interpolated spline point while the server marks the
+/// creature as moving, so combat facing and LOS recovery use current geometry.
+fn active_spline_position(object: &Object) -> Option<Point3D> {
+    let movement = object.movement.as_ref()?;
+    let movement_info = movement.movement_info.as_ref()?;
+    if !movement_info
+        .movement_flags
+        .contains(MovementFlags::SPLINE_ENABLED)
+    {
+        return None;
+    }
+    let spline = movement.spline_info.as_ref()?;
+    let mut path = spline.path.clone();
+    if path.is_empty() {
+        path.push(movement_info.location.point);
+    }
+    let destination = spline.final_destination;
+    if spline.nodes_count > 0
+        && destination.x.is_finite()
+        && destination.y.is_finite()
+        && destination.z.is_finite()
+        && path.last().is_none_or(|last| {
+            (last.x - destination.x).abs() > f32::EPSILON
+                || (last.y - destination.y).abs() > f32::EPSILON
+                || (last.z - destination.z).abs() > f32::EPSILON
+        })
+    {
+        path.push(destination);
+    }
+    path.retain(|point| point.x.is_finite() && point.y.is_finite() && point.z.is_finite());
+    if path.is_empty() {
+        return None;
+    }
+    if spline.duration == 0 {
+        return path.last().copied();
+    }
+
+    let mut segment_lengths = Vec::with_capacity(path.len().saturating_sub(1));
+    let mut total_length = 0.0;
+    for pair in path.windows(2) {
+        let from = Vec3::new(pair[0].x, pair[0].y, pair[0].z);
+        let to = Vec3::new(pair[1].x, pair[1].y, pair[1].z);
+        let length = from.distance(to);
+        segment_lengths.push(length);
+        total_length += length;
+    }
+    if total_length <= f32::EPSILON {
+        return path.last().copied();
+    }
+
+    let mut remaining =
+        total_length * (spline.time_passed as f32 / spline.duration as f32).clamp(0.0, 1.0);
+    for (index, length) in segment_lengths.into_iter().enumerate() {
+        if remaining <= length || index + 1 == path.len() - 1 {
+            let fraction = if length <= f32::EPSILON {
+                0.0
+            } else {
+                (remaining / length).clamp(0.0, 1.0)
+            };
+            return Some(Point3D {
+                x: path[index].x + (path[index + 1].x - path[index].x) * fraction,
+                y: path[index].y + (path[index + 1].y - path[index].y) * fraction,
+                z: path[index].z + (path[index + 1].z - path[index].z) * fraction,
+            });
+        }
+        remaining -= length;
+    }
+    path.last().copied()
+}
+
 fn unit_integer(object: &Object, field: UnitField) -> Option<i32> {
     match object.unit_fields.get(&field) {
         Some(FieldValue::Integer(value)) => Some(*value),
@@ -195,10 +272,15 @@ mod tests {
     use tentacli::plugins::wow::wotlk::realm::object::{
         Object, ObjectTypeId, PackedGuid,
         types::{
+            movement::{
+                Movement, MovementExtraFlags, MovementFlags, MovementInfo, OrientedPoint3D,
+                Point3D, SplineInfo,
+            },
             update_data::ObjectTypeMask,
             update_fields::{FieldValue, UnitField},
         },
     };
+    use wow_domain::Vec3;
 
     use super::{complete_array, object_to_entity};
 
@@ -260,5 +342,53 @@ mod tests {
         let entity = object_to_entity(&object(ObjectTypeId::Unit, None), None, 0);
 
         assert_eq!(entity.shapeshift_form, None);
+    }
+
+    #[test]
+    fn moving_unit_position_uses_current_spline_point() {
+        let mut unit = object(ObjectTypeId::Unit, None);
+        unit.movement = Some(Movement {
+            movement_info: Some(MovementInfo {
+                movement_flags: MovementFlags::SPLINE_ENABLED,
+                movement_extra_flags: MovementExtraFlags::default(),
+                time: 10,
+                location: OrientedPoint3D {
+                    point: Point3D {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    direction: 0.0,
+                },
+                taxi_info: None,
+                fall_time: 0,
+                jump_info: None,
+            }),
+            spline_info: Some(SplineInfo {
+                time_passed: 500,
+                duration: 1_000,
+                path: vec![
+                    Point3D {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    Point3D {
+                        x: 10.0,
+                        y: 10.0,
+                        z: 0.0,
+                    },
+                ],
+                final_destination: Point3D::default(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let entity = object_to_entity(&unit, None, 1);
+        let position = entity.position.expect("the moving unit has a position");
+
+        assert_eq!(position.map, 1);
+        assert_eq!(position.point, Vec3::new(5.0, 5.0, 0.0));
     }
 }

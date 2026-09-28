@@ -5,6 +5,8 @@ const INTERACTION_FACING_TOLERANCE: f32 = PI / 4.0;
 const CAST_FACING_TOLERANCE: f32 = PI / 9.0;
 const INTERACTION_MAX_RANGE: f32 = 5.0;
 const INTERACTION_APPROACH_RANGE: f32 = 4.0;
+// Keep the corpse approach inside the server interaction limit.
+const CORPSE_LOOT_SAFE_RANGE: f32 = 2.5;
 const NPC_FRONT_STANDOFF: f32 = 3.0;
 const NPC_FRONT_TOLERANCE: f32 = 0.8;
 const MOB_REAR_STANDOFF: f32 = 3.0;
@@ -54,7 +56,7 @@ pub fn check_corpse_loot(snapshot: &Snapshot, target: EntityId) -> CorpseLootChe
     if mover.map != position.map {
         return CorpseLootCheck::DifferentMap;
     }
-    if mover.point.distance(position.point) > INTERACTION_MAX_RANGE {
+    if mover.point.distance(position.point) > CORPSE_LOOT_SAFE_RANGE {
         return CorpseLootCheck::OutOfRange;
     }
     CorpseLootCheck::Ready
@@ -102,10 +104,17 @@ pub fn profile(command: &GameplayCommand) -> Option<SpatialProfile> {
             Some(MELEE_FACING_TOLERANCE),
             true,
         ),
+        GameplayCommand::Loot(target) => (
+            *target,
+            0.0,
+            INTERACTION_MAX_RANGE,
+            CORPSE_LOOT_SAFE_RANGE,
+            None,
+            false,
+        ),
         GameplayCommand::Interact(target)
         | GameplayCommand::UseGameObject(target)
         | GameplayCommand::CastGameObject { target, .. }
-        | GameplayCommand::Loot(target)
         | GameplayCommand::Gather(target)
         | GameplayCommand::EnterVehicle(target)
         | GameplayCommand::UseItem {
@@ -469,7 +478,12 @@ pub fn is_in_range(snapshot: &Snapshot, command: &GameplayCommand) -> Option<boo
     } else {
         movement_distance(snapshot, mover.point, target.point)
     };
-    Some(distance >= profile.minimum_range && distance <= profile.maximum_range)
+    let maximum_range = if matches!(command, GameplayCommand::Loot(_)) {
+        profile.approach_range
+    } else {
+        profile.maximum_range
+    };
+    Some(distance >= profile.minimum_range && distance <= maximum_range)
 }
 
 fn loot_approach_requirement(
@@ -487,7 +501,7 @@ fn loot_approach_requirement(
     }
 
     let distance = mover.point.distance(target.point);
-    if distance <= profile.maximum_range {
+    if distance <= profile.approach_range {
         return None;
     }
 
@@ -495,9 +509,10 @@ fn loot_approach_requirement(
     if vertical_distance >= profile.maximum_range {
         return None;
     }
-    let horizontal_limit =
-        (profile.maximum_range * profile.maximum_range - vertical_distance * vertical_distance)
-            .sqrt();
+    let horizontal_limit = (profile.approach_range * profile.approach_range
+        - vertical_distance * vertical_distance)
+        .max(0.0)
+        .sqrt();
     let acceptable_range = profile
         .approach_range
         .min((horizontal_limit - 0.25).max(0.25));
@@ -691,13 +706,22 @@ mod tests {
     fn corpse_loot_checks_require_a_present_dead_unit_and_conservative_range() {
         let nearby = WorldPosition {
             map: 1,
-            point: Vec3::new(3.0, 0.0, 0.0),
+            point: Vec3::new(2.0, 0.0, 0.0),
             orientation: 0.0,
         };
         let mut snapshot = corpse_snapshot(nearby);
         assert_eq!(
             check_corpse_loot(&snapshot, EntityId(7)),
             CorpseLootCheck::Ready
+        );
+
+        let outside_safe_range = corpse_snapshot(WorldPosition {
+            point: Vec3::new(4.0, 0.0, 0.0),
+            ..nearby
+        });
+        assert_eq!(
+            check_corpse_loot(&outside_safe_range, EntityId(7)),
+            CorpseLootCheck::OutOfRange
         );
 
         snapshot.state.entities.0.remove(&EntityId(7));
@@ -785,6 +809,13 @@ mod tests {
         let command = GameplayCommand::Attack(EntityId(7));
         assert!(movement_requirement(&s, &command).is_some());
         assert!(facing_requirement(&s, &command).is_some());
+
+        let loot = GameplayCommand::Loot(EntityId(7));
+        assert_eq!(facing_requirement(&s, &loot), None);
+        assert_eq!(
+            line_of_sight_requirement(&loot, |_| LineOfSightStatus::Blocked),
+            None
+        );
     }
 
     #[test]
@@ -802,7 +833,24 @@ mod tests {
             },
         );
         let requirement = movement_requirement(&s, &GameplayCommand::Loot(EntityId(7))).unwrap();
-        assert_eq!(requirement.acceptable_range, 4.0);
+        assert!(requirement.acceptable_range < CORPSE_LOOT_SAFE_RANGE);
+        assert!(requirement.acceptable_range > 2.0);
+
+        let near_server_limit = snapshot(
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(0.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(4.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+        );
+        let command = GameplayCommand::Loot(EntityId(7));
+        assert_eq!(is_in_range(&near_server_limit, &command), Some(false));
+        assert!(movement_requirement(&near_server_limit, &command).is_some());
     }
 
     #[test]
@@ -817,7 +865,7 @@ mod tests {
             mover,
             WorldPosition {
                 map: 1,
-                point: Vec3::new(3.0, 0.0, 0.0),
+                point: Vec3::new(2.0, 0.0, 0.0),
                 orientation: 0.0,
             },
         );

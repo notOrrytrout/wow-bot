@@ -704,15 +704,32 @@ impl LaneEngine {
                         if self.state.authoritative.session.character_guid == Some(killer.0)
                             || self.state.authoritative.pet.guid == Some(*killer) =>
                     {
-                        Some(*victim)
+                        Some((*killer, *victim))
                     }
                     _ => None,
                 };
+                let updated_entity = match &o {
+                    ProtocolObservation::EntityUpsert { entity } => Some(entity.id),
+                    _ => None,
+                };
                 let delta = reduce(&mut self.state.authoritative, o);
-                if let Some(target) = owned_kill {
-                    let corpse = self.state.authoritative.entities.0.get(&target).cloned();
+                if let Some((killer, target)) = owned_kill {
+                    let mut corpse = self.state.authoritative.entities.0.get(&target).cloned();
+                    if let Some(corpse) = &mut corpse
+                        && relocate_moved_mob_corpse(&self.state.authoritative, corpse)
+                    {
+                        if let Some(entity) = self.state.authoritative.entities.0.get_mut(&target) {
+                            entity.position = corpse.position;
+                        }
+                        tracing::info!(lane=?self.state.lane, ?target, ?killer, position=?corpse.position, "using the nearby killer position for a moved mob corpse");
+                    }
                     self.post_combat_loot = Some((target, Instant::now(), corpse));
                     tracing::info!(lane=?self.state.lane, ?target, "server kill log credited the player or pet; corpse loot queued before the next target");
+                }
+                if let Some(target) = updated_entity
+                    && let Some(entity) = self.state.authoritative.entities.0.get(&target)
+                {
+                    refresh_cached_post_combat_corpse(&mut self.post_combat_loot, target, entity);
                 }
                 if let Some((source, position, client_time, mover)) = movement_position {
                     let source_is_active = match source {
@@ -1911,6 +1928,37 @@ impl LaneEngine {
             movement.runtime.destination.map = player.map;
             movement.destination_map_known = true;
         }
+        if let Some(GameplayCommand::Loot(target)) = movement.resume.as_ref() {
+            let mut snapshot = Snapshot::from_state(&self.state.authoritative);
+            if !snapshot.state.entities.0.contains_key(target)
+                && let Some((queued_target, _, Some(cached_target))) = &self.post_combat_loot
+                && queued_target == target
+            {
+                snapshot
+                    .state
+                    .entities
+                    .0
+                    .insert(*target, cached_target.clone());
+            }
+            if let Some((refreshed_destination, acceptable_range)) =
+                current_loot_approach(&snapshot, *target)
+            {
+                if movement.destination.map != refreshed_destination.map
+                    || movement
+                        .destination
+                        .point
+                        .distance(refreshed_destination.point)
+                        > 0.5
+                {
+                    movement.destination = refreshed_destination;
+                    movement.runtime.destination = refreshed_destination;
+                    movement.acceptable_range = acceptable_range;
+                    movement.last_step = None;
+                    self.cancel_route_job();
+                    tracing::info!(lane=?self.state.lane, ?target, destination=?refreshed_destination, "refreshed corpse approach from current target position");
+                }
+            }
+        }
         if player.map != movement.destination.map || movement.transport.is_some() {
             let Some(routes) = self.transport_routes.as_ref() else {
                 self.waiting(format!(
@@ -2091,7 +2139,8 @@ impl LaneEngine {
         };
         let locomotion =
             wow_navigation::LocomotionMode::from_server_flags(controlled_mover, movement_flags);
-        let use_3d_arrival = matches!(&movement.work.key, QuestWorkKey::TurnIn { .. });
+        let use_3d_arrival = matches!(&movement.work.key, QuestWorkKey::TurnIn { .. })
+            || matches!(movement.resume.as_ref(), Some(GameplayCommand::Loot(_)));
         let distance = match locomotion {
             wow_navigation::LocomotionMode::Ground if use_3d_arrival => {
                 player.point.distance(movement.destination.point)
@@ -3501,6 +3550,14 @@ impl LaneEngine {
                         .or(target_state);
                     if let Some(corpse) = &mut corpse {
                         corpse.mark_dead();
+                        if relocate_moved_mob_corpse(&self.state.authoritative, corpse) {
+                            if let Some(entity) =
+                                self.state.authoritative.entities.0.get_mut(&target)
+                            {
+                                entity.position = corpse.position;
+                            }
+                            tracing::info!(lane=?self.state.lane, ?target, position=?corpse.position, "using the nearby killer position for a moved mob corpse");
+                        }
                     }
                     self.post_combat_loot = Some((target, Instant::now(), corpse));
                     self.pending_quest_action = None;
@@ -4451,6 +4508,92 @@ impl LaneEngine {
     }
 }
 
+const CORPSE_STALE_TARGET_DISTANCE: f32 = 6.0;
+
+fn refresh_cached_post_combat_corpse(
+    queued: &mut Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
+    target: EntityId,
+    observed: &wow_state::entities::EntityState,
+) {
+    if observed.health.is_some_and(|(current, _)| current > 0) {
+        return;
+    }
+    let Some((queued_target, _, cached)) = queued else {
+        return;
+    };
+    if *queued_target != target {
+        return;
+    }
+    let mut current = observed.clone();
+    current.mark_dead();
+    *cached = Some(current);
+}
+
+fn current_loot_approach(snapshot: &Snapshot, target: EntityId) -> Option<(WorldPosition, f32)> {
+    let target_position = crate::action::spatial::target_position(snapshot, target)?;
+    let requirement =
+        crate::action::spatial::movement_requirement(snapshot, &GameplayCommand::Loot(target))?;
+    Some((
+        WorldPosition {
+            map: target_position.map,
+            point: requirement.destination,
+            orientation: target_position.orientation,
+        },
+        requirement.acceptable_range,
+    ))
+}
+
+/// Replace an old creature location with the nearby unit it was attacking.
+/// WotLK creature movement packets can leave the object's stored position at
+/// its spawn point while the creature runs toward the player or pet.
+fn relocate_moved_mob_corpse(
+    state: &wow_state::AuthoritativeState,
+    corpse: &mut wow_state::entities::EntityState,
+) -> bool {
+    let Some(attacker) = corpse.target else {
+        return false;
+    };
+    let player = state.session.character_guid.map(EntityId);
+    let player_is_attacker = player == Some(attacker);
+    let pet_is_attacker = state.pet.guid == Some(attacker);
+    if !player_is_attacker && !pet_is_attacker {
+        return false;
+    }
+
+    let attacker_position = if player_is_attacker {
+        state
+            .control
+            .active_position(state.position.player)
+            .or_else(|| {
+                state
+                    .entities
+                    .0
+                    .get(&attacker)
+                    .and_then(|entity| entity.position)
+            })
+    } else {
+        state
+            .entities
+            .0
+            .get(&attacker)
+            .and_then(|entity| entity.position)
+    };
+    let (Some(corpse_position), Some(attacker_position)) = (corpse.position, attacker_position)
+    else {
+        return false;
+    };
+    if corpse_position.map != attacker_position.map
+        || !corpse_position.point.is_finite()
+        || !attacker_position.point.is_finite()
+        || corpse_position.point.distance(attacker_position.point) <= CORPSE_STALE_TARGET_DISTANCE
+    {
+        return false;
+    }
+
+    corpse.position = Some(attacker_position);
+    true
+}
+
 fn movement_step_distance(run_speed: f32, last_step: Option<Instant>, now: Instant) -> f32 {
     let elapsed = last_step
         .map(|at| now.saturating_duration_since(at))
@@ -4533,10 +4676,226 @@ fn should_supersede_search_movement(purpose: MovementPurpose, live_target_availa
     purpose == MovementPurpose::SearchArea && live_target_available
 }
 
+fn is_quest_search_work(movement: &PendingMovement) -> bool {
+    movement.purpose == MovementPurpose::SearchArea
+        && matches!(
+            &movement.work.key,
+            QuestWorkKey::TravelToObjective { .. } | QuestWorkKey::CollectItem { .. }
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::activity::ActivityArbiter;
+
+    #[tokio::test]
+    async fn moved_mob_loot_uses_its_nearby_player_target_position() {
+        let player = EntityId(1);
+        let target = EntityId(2);
+        let player_position = WorldPosition {
+            map: 0,
+            point: Vec3::new(-6455.0, 544.0, 387.0),
+            orientation: 0.0,
+        };
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(player_position);
+        authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::Unit,
+                position: Some(WorldPosition {
+                    map: 0,
+                    point: Vec3::new(-6477.6, 534.1, 387.5),
+                    orientation: 0.0,
+                }),
+                health: Some((1, 100)),
+                target: Some(player),
+                ..Default::default()
+            },
+        );
+        let (mut engine, _) = test_engine(Mission::quest(MissionId(1)), authoritative);
+
+        assert!(
+            engine
+                .handle(LaneMessage::Observation(
+                    ProtocolObservation::CreatureKilled {
+                        killer: player,
+                        victim: target,
+                    }
+                ))
+                .await
+        );
+
+        let Some((queued_target, _, Some(corpse))) = &engine.post_combat_loot else {
+            panic!("the owned kill must queue its corpse");
+        };
+        assert_eq!(*queued_target, target);
+        assert_eq!(corpse.position, Some(player_position));
+        assert_eq!(
+            engine.state.authoritative.entities.0[&target].position,
+            Some(player_position)
+        );
+    }
+
+    #[test]
+    fn later_corpse_position_updates_replace_the_cached_reference() {
+        let target = EntityId(2);
+        let old_position = WorldPosition {
+            map: 0,
+            point: Vec3::new(10.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let current_position = WorldPosition {
+            point: Vec3::new(20.0, 5.0, 1.0),
+            ..old_position
+        };
+        let old = wow_state::entities::EntityState {
+            id: target,
+            position: Some(old_position),
+            health: Some((0, 100)),
+            ..Default::default()
+        };
+        let observed = wow_state::entities::EntityState {
+            position: Some(current_position),
+            ..old.clone()
+        };
+        let mut queued = Some((target, Instant::now(), Some(old)));
+
+        refresh_cached_post_combat_corpse(&mut queued, target, &observed);
+
+        assert_eq!(queued.unwrap().2.unwrap().position, Some(current_position));
+    }
+
+    #[test]
+    fn corpse_approach_uses_its_latest_observed_position() {
+        let player = EntityId(1);
+        let target = EntityId(2);
+        let mut state = wow_state::AuthoritativeState::default();
+        state.session.character_guid = Some(player.0);
+        state.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::Unit,
+                position: Some(WorldPosition {
+                    map: 0,
+                    point: Vec3::new(10.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                health: Some((0, 100)),
+                ..Default::default()
+            },
+        );
+        let first = current_loot_approach(&Snapshot::from_state(&state), target)
+            .expect("the first corpse position must have an approach");
+
+        state.entities.0.get_mut(&target).unwrap().position = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(20.0, 5.0, 1.0),
+            orientation: 0.0,
+        });
+        let current = current_loot_approach(&Snapshot::from_state(&state), target)
+            .expect("the updated corpse position must have an approach");
+
+        assert_ne!(first.0.point, current.0.point);
+        assert_eq!(current.0.map, 0);
+    }
+
+    #[tokio::test]
+    async fn blocked_selected_target_queues_movement_before_retry() {
+        let target = EntityId(2);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::Unit,
+                hostile: true,
+                health: Some((100, 100)),
+                position: Some(WorldPosition {
+                    map: 0,
+                    point: Vec3::new(10.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let (mut engine, _) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        assert!(
+            engine
+                .handle(LaneMessage::Observation(ProtocolObservation::CastFailed {
+                    spell: 686,
+                    reason: 47,
+                    target: Some(target),
+                }))
+                .await
+        );
+
+        assert!(
+            engine
+                .propose_command(
+                    GameplayCommand::Cast {
+                        spell: 686,
+                        target: Some(target),
+                    },
+                    true,
+                )
+                .await
+        );
+
+        let movement = engine
+            .pending_movement
+            .as_ref()
+            .expect("a line-of-sight failure must start recovery movement");
+        assert_eq!(movement.destination.point, Vec3::new(0.0, 3.0, 0.0));
+        assert_eq!(
+            movement.resume,
+            Some(GameplayCommand::Cast {
+                spell: 686,
+                target: Some(target),
+            })
+        );
+    }
+
+    #[test]
+    fn corpse_not_targeting_player_keeps_its_world_position() {
+        let player = EntityId(1);
+        let mut state = wow_state::AuthoritativeState::default();
+        state.session.character_guid = Some(player.0);
+        state.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(20.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        let corpse_position = WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut corpse = wow_state::entities::EntityState {
+            target: None,
+            position: Some(corpse_position),
+            ..Default::default()
+        };
+
+        assert!(!relocate_moved_mob_corpse(&state, &mut corpse));
+        assert_eq!(corpse.position, Some(corpse_position));
+    }
 
     fn test_engine(
         mission: Mission,
@@ -4983,7 +5342,7 @@ mod tests {
             .unwrap()
             .position = Some(WorldPosition {
             map: 0,
-            point: Vec3::new(3.0, 0.0, 0.0),
+            point: Vec3::new(2.0, 0.0, 0.0),
             orientation: 0.0,
         });
         engine
