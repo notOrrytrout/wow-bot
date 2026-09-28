@@ -45,19 +45,19 @@ const fn default_world_port() -> u16 {
     DEFAULT_UPSTREAM_WORLD_PORT
 }
 fn default_proxy_auth_bind() -> String {
-    listener_bind(DEFAULT_PROXY_AUTH_PORT)
+    listener_bind(DEFAULT_PROXY_BIND_HOST, DEFAULT_PROXY_AUTH_PORT)
 }
 fn default_proxy_world_bind() -> String {
-    listener_bind(DEFAULT_PROXY_WORLD_PORT)
+    listener_bind(DEFAULT_PROXY_BIND_HOST, DEFAULT_PROXY_WORLD_PORT)
 }
 fn default_transparent_world_bind() -> String {
-    listener_bind(DEFAULT_TRANSPARENT_WORLD_PORT)
+    listener_bind(DEFAULT_PROXY_BIND_HOST, DEFAULT_TRANSPARENT_WORLD_PORT)
 }
 fn default_advertise_host() -> String {
     DEFAULT_LOOPBACK_HOST.to_owned()
 }
-fn listener_bind(port: u16) -> String {
-    format!("{DEFAULT_PROXY_BIND_HOST}:{port}")
+fn listener_bind(host: &str, port: u16) -> String {
+    format!("{host}:{port}")
 }
 const fn default_max_total() -> usize {
     128
@@ -139,9 +139,9 @@ impl Default for ProxyConfig {
 
 impl ProxyConfig {
     pub fn set_listener_bind_host(&mut self, host: &str) {
-        self.auth_bind = format!("{host}:{DEFAULT_PROXY_AUTH_PORT}");
-        self.world_bind = format!("{host}:{DEFAULT_PROXY_WORLD_PORT}");
-        self.transparent_world_bind = format!("{host}:{DEFAULT_TRANSPARENT_WORLD_PORT}");
+        self.auth_bind = listener_bind(host, DEFAULT_PROXY_AUTH_PORT);
+        self.world_bind = listener_bind(host, DEFAULT_PROXY_WORLD_PORT);
+        self.transparent_world_bind = listener_bind(host, DEFAULT_TRANSPARENT_WORLD_PORT);
     }
 }
 

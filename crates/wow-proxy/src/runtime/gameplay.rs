@@ -4,6 +4,10 @@ use wow_domain::orientation::Radians;
 use wow_domain::{EntityId, GameplayCommand, Vec3, WorldPosition};
 use wow_srp::wrath_header::ServerEncrypterHalf;
 
+use super::packet::{
+    read_f32_cursor as read_f32, read_packed_guid, read_u16_cursor as read_u16,
+    read_u32_cursor as read_u32,
+};
 use crate::framing::{ClientFrame, ServerFrame, upstream_edge::write_server_frame};
 
 pub(super) const SMSG_FORCE_RUN_SPEED_CHANGE_OPCODE: u16 = 0x00E2;
@@ -651,37 +655,6 @@ pub(super) fn encode_simple_movement(
     body
 }
 
-fn packed_guid(body: &[u8], cursor: &mut usize) -> Option<u64> {
-    let mask = *body.get(*cursor)?;
-    *cursor += 1;
-    let mut guid = [0_u8; 8];
-    for (index, byte) in guid.iter_mut().enumerate() {
-        if mask & (1 << index) != 0 {
-            *byte = *body.get(*cursor)?;
-            *cursor += 1;
-        }
-    }
-    Some(u64::from_le_bytes(guid))
-}
-
-fn read_u16(body: &[u8], cursor: &mut usize) -> Option<u16> {
-    let value = u16::from_le_bytes(body.get(*cursor..*cursor + 2)?.try_into().ok()?);
-    *cursor += 2;
-    Some(value)
-}
-
-fn read_u32(body: &[u8], cursor: &mut usize) -> Option<u32> {
-    let value = u32::from_le_bytes(body.get(*cursor..*cursor + 4)?.try_into().ok()?);
-    *cursor += 4;
-    Some(value)
-}
-
-fn read_f32(body: &[u8], cursor: &mut usize) -> Option<f32> {
-    let value = f32::from_le_bytes(body.get(*cursor..*cursor + 4)?.try_into().ok()?);
-    *cursor += 4;
-    value.is_finite().then_some(value)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct MovementCorrectionExpectation {
     pub ack_opcode: u32,
@@ -702,7 +675,7 @@ fn decode_movement_info_payload(body: &[u8], cursor: &mut usize) -> Option<(u32,
     let orientation = read_f32(body, cursor)?;
 
     if flags & 0x0000_0200 != 0 {
-        packed_guid(body, cursor)?;
+        read_packed_guid(body, cursor)?;
         for _ in 0..4 {
             read_f32(body, cursor)?;
         }
@@ -735,7 +708,7 @@ pub(super) fn decode_simple_movement(
     body: &[u8],
 ) -> Option<(EntityId, u32, u32, Vec3, f32)> {
     let mut cursor = 0usize;
-    let guid = packed_guid(body, &mut cursor)?;
+    let guid = read_packed_guid(body, &mut cursor)?;
     let (flags, client_time, point, orientation) = decode_movement_info_payload(body, &mut cursor)?;
     if cursor != body.len() || guid == 0 || !point.is_finite() || !orientation.is_finite() {
         return None;
@@ -746,64 +719,176 @@ pub(super) fn decode_simple_movement(
 
 pub(super) fn decode_near_teleport_ack(body: &[u8]) -> Option<(EntityId, u32, u32)> {
     let mut cursor = 0usize;
-    let guid = packed_guid(body, &mut cursor)?;
+    let guid = read_packed_guid(body, &mut cursor)?;
     let flags = read_u32(body, &mut cursor)?;
     let client_time = read_u32(body, &mut cursor)?;
     (guid != 0 && cursor == body.len()).then_some((EntityId(guid), flags, client_time))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CorrectionAckFormat {
+    NearTeleport,
+    NoTail,
+    FiniteFloatTail,
+    OpaqueFourByteTail,
+}
+
+#[derive(Clone, Copy)]
+struct CorrectionAckOpcode {
+    request: u32,
+    ack: u32,
+    format: CorrectionAckFormat,
+}
+
+const CORRECTION_ACK_OPCODES: &[CorrectionAckOpcode] = &[
+    CorrectionAckOpcode {
+        request: 0x00C7,
+        ack: 0x00C7,
+        format: CorrectionAckFormat::NearTeleport,
+    },
+    CorrectionAckOpcode {
+        request: 0x00EF,
+        ack: 0x00F0,
+        format: CorrectionAckFormat::NoTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00E8,
+        ack: 0x00E9,
+        format: CorrectionAckFormat::NoTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00EA,
+        ack: 0x00EB,
+        format: CorrectionAckFormat::NoTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00E2,
+        ack: 0x00E3,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00E4,
+        ack: 0x00E5,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00E6,
+        ack: 0x00E7,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00F2,
+        ack: 0x02CF,
+        format: CorrectionAckFormat::OpaqueFourByteTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00F3,
+        ack: 0x02CF,
+        format: CorrectionAckFormat::OpaqueFourByteTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00F4,
+        ack: 0x00F6,
+        format: CorrectionAckFormat::OpaqueFourByteTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00F5,
+        ack: 0x00F6,
+        format: CorrectionAckFormat::OpaqueFourByteTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00DE,
+        ack: 0x02D0,
+        format: CorrectionAckFormat::OpaqueFourByteTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x00DF,
+        ack: 0x02D0,
+        format: CorrectionAckFormat::OpaqueFourByteTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x02DA,
+        ack: 0x02DB,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x02DC,
+        ack: 0x02DD,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x02DE,
+        ack: 0x02DF,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x0343,
+        ack: 0x0345,
+        format: CorrectionAckFormat::OpaqueFourByteTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x0344,
+        ack: 0x0345,
+        format: CorrectionAckFormat::OpaqueFourByteTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x033E,
+        ack: 0x0340,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x033F,
+        ack: 0x0340,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x0381,
+        ack: 0x0382,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x0383,
+        ack: 0x0384,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x045C,
+        ack: 0x045D,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x04CE,
+        ack: 0x04CF,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x04D0,
+        ack: 0x04D1,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+    CorrectionAckOpcode {
+        request: 0x0516,
+        ack: 0x0517,
+        format: CorrectionAckFormat::FiniteFloatTail,
+    },
+];
+
 fn correction_ack_opcode(request_opcode: u32) -> Option<u32> {
-    Some(match request_opcode {
-        0x00C7 => 0x00C7,
-        0x00EF => 0x00F0,
-        0x00E8 => 0x00E9,
-        0x00EA => 0x00EB,
-        0x00E2 => 0x00E3,
-        0x00E4 => 0x00E5,
-        0x00E6 => 0x00E7,
-        0x00F2 | 0x00F3 => 0x02CF,
-        0x00F4 | 0x00F5 => 0x00F6,
-        0x00DE | 0x00DF => 0x02D0,
-        0x02DA => 0x02DB,
-        0x02DC => 0x02DD,
-        0x02DE => 0x02DF,
-        0x0343 | 0x0344 => 0x0345,
-        0x033E | 0x033F => 0x0340,
-        0x0381 => 0x0382,
-        0x0383 => 0x0384,
-        0x045C => 0x045D,
-        0x04CE => 0x04CF,
-        0x04D0 => 0x04D1,
-        0x0516 => 0x0517,
-        _ => return None,
-    })
+    CORRECTION_ACK_OPCODES
+        .iter()
+        .find(|entry| entry.request == request_opcode)
+        .map(|entry| entry.ack)
+}
+
+fn correction_ack_format(ack_opcode: u32) -> Option<CorrectionAckFormat> {
+    CORRECTION_ACK_OPCODES
+        .iter()
+        .find(|entry| entry.ack == ack_opcode)
+        .map(|entry| entry.format)
 }
 
 pub(super) fn is_movement_correction_ack_opcode(opcode: u32) -> bool {
-    matches!(
-        opcode,
-        0x00C7
-            | 0x00E3
-            | 0x00E5
-            | 0x00E7
-            | 0x00E9
-            | 0x00EB
-            | 0x00F0
-            | 0x00F6
-            | 0x02CF
-            | 0x02D0
-            | 0x02DB
-            | 0x02DD
-            | 0x02DF
-            | 0x0340
-            | 0x0345
-            | 0x0382
-            | 0x0384
-            | 0x045D
-            | 0x04CF
-            | 0x04D1
-            | 0x0517
-    )
+    correction_ack_format(opcode).is_some()
 }
 
 pub(super) fn movement_correction_expectation(
@@ -812,7 +897,7 @@ pub(super) fn movement_correction_expectation(
 ) -> Option<MovementCorrectionExpectation> {
     let ack_opcode = correction_ack_opcode(request_opcode)?;
     let mut cursor = 0usize;
-    let mover = EntityId(packed_guid(body, &mut cursor)?);
+    let mover = EntityId(read_packed_guid(body, &mut cursor)?);
     if mover == EntityId(0) {
         return None;
     }
@@ -842,7 +927,9 @@ pub(super) fn validate_movement_correction_ack(
     if opcode != expectation.ack_opcode {
         return Err("correction acknowledgement opcode does not match pending request");
     }
-    if opcode == 0x00C7 {
+    let format = correction_ack_format(opcode)
+        .ok_or("unsupported movement correction acknowledgement opcode")?;
+    if format == CorrectionAckFormat::NearTeleport {
         let (mover, flags, _) = decode_near_teleport_ack(body)
             .ok_or("near-teleport acknowledgement has malformed layout")?;
         if mover != expectation.mover || expectation.near_teleport_flags != Some(flags) {
@@ -853,7 +940,7 @@ pub(super) fn validate_movement_correction_ack(
 
     let mut cursor = 0usize;
     let mover = EntityId(
-        packed_guid(body, &mut cursor)
+        read_packed_guid(body, &mut cursor)
             .ok_or("correction acknowledgement has malformed mover GUID")?,
     );
     let counter = read_u32(body, &mut cursor)
@@ -864,16 +951,15 @@ pub(super) fn validate_movement_correction_ack(
     decode_movement_info_payload(body, &mut cursor)
         .ok_or("correction acknowledgement has malformed MovementInfo")?;
     let tail_len = body.len().saturating_sub(cursor);
-    let expected_tail = match opcode {
-        0x00E3 | 0x00E5 | 0x00E7 | 0x02DB | 0x02DD | 0x02DF | 0x0382 | 0x0384 | 0x045D | 0x0517
-        | 0x00F6 | 0x02CF | 0x02D0 | 0x0345 => 4,
-        0x00E9 | 0x00EB | 0x00F0 => 0,
-        _ => return Err("unsupported movement correction acknowledgement opcode"),
+    let expected_tail = match format {
+        CorrectionAckFormat::NoTail => 0,
+        CorrectionAckFormat::FiniteFloatTail | CorrectionAckFormat::OpaqueFourByteTail => 4,
+        CorrectionAckFormat::NearTeleport => unreachable!("handled above"),
     };
     if tail_len != expected_tail {
         return Err("correction acknowledgement has invalid trailing fields");
     }
-    if expected_tail == 4 && !matches!(opcode, 0x00F6 | 0x02CF | 0x02D0 | 0x0345) {
+    if format == CorrectionAckFormat::FiniteFloatTail {
         let value = f32::from_le_bytes(
             body[cursor..]
                 .try_into()

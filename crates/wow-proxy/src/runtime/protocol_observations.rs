@@ -1,3 +1,4 @@
+use super::packet::{read_packed_guid, read_u32_cursor as read_u32};
 use wow_domain::{
     EntityId, Vec3, WorldPosition,
     binary::{cstring_at, u32_le_at, u64_le_at},
@@ -295,7 +296,7 @@ fn parse_creature_killed(body: &[u8]) -> Option<ProtocolObservation> {
 fn parse_spell_start(body: &[u8]) -> Option<ProtocolObservation> {
     let mut offset = 0usize;
     read_packed_guid(body, &mut offset)?; // cast item or caster
-    let caster = read_packed_guid(body, &mut offset)?;
+    let caster = EntityId(read_packed_guid(body, &mut offset)?);
     offset = offset.checked_add(1)?; // cast count
     let spell = read_u32(body, &mut offset)?;
     offset = offset.checked_add(4)?; // cast flags
@@ -306,7 +307,7 @@ fn parse_spell_start(body: &[u8]) -> Option<ProtocolObservation> {
 fn parse_spell_go(body: &[u8]) -> Option<ProtocolObservation> {
     let mut offset = 0usize;
     read_packed_guid(body, &mut offset)?; // cast item or caster
-    let caster = read_packed_guid(body, &mut offset)?;
+    let caster = EntityId(read_packed_guid(body, &mut offset)?);
     offset = offset.checked_add(1)?; // cast count
     let spell = read_u32(body, &mut offset)?;
     (caster.0 != 0 && spell != 0).then_some(ProtocolObservation::CastFinished { caster, spell })
@@ -314,7 +315,7 @@ fn parse_spell_go(body: &[u8]) -> Option<ProtocolObservation> {
 
 fn parse_channel_start(body: &[u8]) -> Option<ProtocolObservation> {
     let mut offset = 0usize;
-    let caster = read_packed_guid(body, &mut offset)?;
+    let caster = EntityId(read_packed_guid(body, &mut offset)?);
     let spell = read_u32(body, &mut offset)?;
     let duration_ms = read_u32(body, &mut offset)?;
     cast_started(caster, spell, duration_ms)
@@ -337,7 +338,7 @@ fn cast_started(caster: EntityId, spell: u32, duration_ms: u32) -> Option<Protoc
 
 fn parse_channel_update(body: &[u8]) -> Option<ProtocolObservation> {
     let mut offset = 0usize;
-    let caster = read_packed_guid(body, &mut offset)?;
+    let caster = EntityId(read_packed_guid(body, &mut offset)?);
     let remaining_ms = read_u32(body, &mut offset)?;
     if caster.0 == 0 {
         return None;
@@ -350,13 +351,6 @@ fn parse_channel_update(body: &[u8]) -> Option<ProtocolObservation> {
             .0
     };
     Some(ProtocolObservation::CastUpdated { caster, ends_at_ms })
-}
-
-fn read_u32(body: &[u8], offset: &mut usize) -> Option<u32> {
-    let end = (*offset).checked_add(4)?;
-    let value = u32_le_at(body, *offset)?;
-    *offset = end;
-    Some(value)
 }
 
 pub(super) fn parse_corpse_query(body: &[u8]) -> Option<ProtocolObservation> {
@@ -438,7 +432,7 @@ pub(super) fn parse_player_runes(body: &[u8]) -> Option<Vec<wow_state::capabilit
 
 pub(super) fn parse_combo_points(body: &[u8]) -> ProtocolObservation {
     let mut offset = 0;
-    let target = read_packed_guid(body, &mut offset);
+    let target = read_packed_guid(body, &mut offset).map(EntityId);
     let points = body
         .get(offset)
         .copied()
@@ -468,22 +462,9 @@ pub(super) fn parse_initial_spells(body: &[u8]) -> Vec<ProtocolObservation> {
     out
 }
 
-fn read_packed_guid(body: &[u8], offset: &mut usize) -> Option<EntityId> {
-    let mask = *body.get(*offset)?;
-    *offset += 1;
-    let mut bytes = [0_u8; 8];
-    for (index, slot) in bytes.iter_mut().enumerate() {
-        if mask & (1 << index) != 0 {
-            *slot = *body.get(*offset)?;
-            *offset += 1;
-        }
-    }
-    Some(EntityId(u64::from_le_bytes(bytes)))
-}
-
 pub(super) fn parse_aura_update(body: &[u8]) -> Option<ProtocolObservation> {
     let mut offset = 0usize;
-    let entity = read_packed_guid(body, &mut offset)?;
+    let entity = EntityId(read_packed_guid(body, &mut offset)?);
     let slot = *body.get(offset)?;
     offset += 1;
     let spell = u32_le_at(body, offset)?;
@@ -500,7 +481,7 @@ pub(super) fn parse_aura_update(body: &[u8]) -> Option<ProtocolObservation> {
 
 pub(super) fn parse_aura_update_all(body: &[u8]) -> Option<ProtocolObservation> {
     let mut offset = 0usize;
-    let entity = read_packed_guid(body, &mut offset)?;
+    let entity = EntityId(read_packed_guid(body, &mut offset)?);
     let mut auras = Vec::new();
     while offset < body.len() {
         let slot = *body.get(offset)?;
@@ -512,7 +493,7 @@ pub(super) fn parse_aura_update_all(body: &[u8]) -> Option<ProtocolObservation> 
         let _level = *body.get(offset)?;
         offset += 1;
         let caster = if flags & 0x08 == 0 {
-            Some(read_packed_guid(body, &mut offset)?)
+            Some(EntityId(read_packed_guid(body, &mut offset)?))
         } else {
             None
         };

@@ -1,4 +1,5 @@
 mod gameplay;
+mod packet;
 mod protocol_observations;
 
 use crate::{

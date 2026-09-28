@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use md5::{Digest as _, Md5};
 use sha1::Sha1;
 use std::{fs, path::Path};
+use wow_domain::binary::{u16_le_at, u32_le_at};
 
 const MODULE_ID: [u8; 16] = [
     0x79, 0xC0, 0x76, 0x8D, 0x65, 0x79, 0x77, 0xD6, 0x97, 0xE1, 0x0B, 0xAD, 0x95, 0x6C, 0xCE, 0xD1,
@@ -332,21 +333,11 @@ impl PeImage {
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    Ok(u16::from_le_bytes(
-        bytes
-            .get(offset..offset + 2)
-            .context("short PE header")?
-            .try_into()?,
-    ))
+    u16_le_at(bytes, offset).context("short PE header")
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        bytes
-            .get(offset..offset + 4)
-            .context("short PE header")?
-            .try_into()?,
-    ))
+    u32_le_at(bytes, offset).context("short PE header")
 }
 
 #[cfg(test)]
