@@ -1214,7 +1214,7 @@ impl LaneEngine {
                     if self
                         .pending_accept
                         .is_some_and(|(_, pending_giver, _)| pending_giver == *giver)
-                        && !quest_status_available(*status)
+                        && !wow_state::quests::quest_giver_has_available_quest(*status)
                     {
                         tracing::info!(lane=?self.state.lane, ?giver, status, "server quest-giver status changed after accept attempt");
                         self.pending_accept = None;
@@ -5255,7 +5255,7 @@ impl LaneEngine {
             .giver_status
             .iter()
             .find(|(giver, status)| {
-                quest_status_available(**status)
+                wow_state::quests::quest_giver_has_available_quest(**status)
                     && self
                         .giver_retry_after
                         .get(giver)
@@ -5851,7 +5851,7 @@ impl LaneEngine {
             .quests
             .giver_status
             .iter()
-            .find(|(_, status)| quest_status_reward(**status))
+            .find(|(_, status)| wow_state::quests::quest_giver_has_reward(**status))
             .map(|(&giver, &status)| (giver, status));
         if let Some((giver, status)) = reward_giver {
             tracing::info!(lane=?self.state.lane, quest, ?giver, status, "quest scheduler opening authoritative turn-in giver");
@@ -7621,12 +7621,6 @@ fn corpse_route_map_matches(player: WorldPosition, corpse: WorldPosition) -> boo
     player.map == corpse.map
 }
 
-fn quest_status_available(status: u8) -> bool {
-    matches!(status, 2 | 4 | 7 | 8)
-}
-fn quest_status_reward(status: u8) -> bool {
-    matches!(status, 3 | 6 | 9 | 10)
-}
 fn quest_confirmation_waiting(started: Instant, now: Instant) -> bool {
     now.saturating_duration_since(started) < QUEST_CONFIRMATION_TIMEOUT
 }
@@ -11596,16 +11590,6 @@ mod tests {
         );
         assert!(engine.pending_movement.is_none());
         assert!(engine.current_work.is_none());
-    }
-
-    #[test]
-    fn dialog_states_match_azerothcore_335a() {
-        for status in [2, 4, 7, 8] {
-            assert!(quest_status_available(status));
-        }
-        for status in [3, 6, 9, 10] {
-            assert!(quest_status_reward(status));
-        }
     }
 
     #[test]

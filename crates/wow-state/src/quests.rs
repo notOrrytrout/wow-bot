@@ -2,6 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use wow_domain::EntityId;
 
+/// Return whether an AzerothCore 3.3.5a quest-giver status has an available quest icon.
+pub const fn quest_giver_has_available_quest(status: u8) -> bool {
+    matches!(status, 2 | 4 | 7 | 8)
+}
+
+/// Return whether an AzerothCore 3.3.5a quest-giver status has a reward icon.
+pub const fn quest_giver_has_reward(status: u8) -> bool {
+    matches!(status, 3 | 6 | 9 | 10)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct QuestProgress {
     pub complete: bool,
@@ -67,4 +77,23 @@ pub struct QuestState {
     pub offers: BTreeMap<u32, QuestOffer>,
     pub definitions: BTreeMap<u32, QuestDefinition>,
     pub turn_in: BTreeMap<u32, QuestTurnInDialog>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quest_giver_dialog_statuses_match_azerothcore_335a() {
+        for status in [2, 4, 7, 8] {
+            assert!(quest_giver_has_available_quest(status));
+        }
+        for status in [3, 6, 9, 10] {
+            assert!(quest_giver_has_reward(status));
+        }
+        for status in [0, 1, 5, 11, u8::MAX] {
+            assert!(!quest_giver_has_available_quest(status));
+            assert!(!quest_giver_has_reward(status));
+        }
+    }
 }

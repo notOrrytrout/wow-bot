@@ -427,7 +427,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
         }
         ProtocolObservation::QuestGiverStatus { giver, status } => {
             state.quests.giver_status.insert(giver, status);
-            if !matches!(status, 2 | 4 | 7 | 8) {
+            if !crate::quests::quest_giver_has_available_quest(status) {
                 state.quests.offers.retain(|_, offer| offer.giver != giver);
             }
             ensure_quest_giver(state, giver);
@@ -954,6 +954,28 @@ mod tests {
             state.quests.offers.get(&43).map(|offer| offer.giver),
             Some(EntityId(7))
         );
+    }
+
+    #[test]
+    fn available_quest_giver_status_keeps_offers_and_other_statuses_clear_them() {
+        let mut state = AuthoritativeState::default();
+        let giver = EntityId(7);
+        state
+            .quests
+            .offers
+            .insert(43, crate::quests::QuestOffer { giver, icon: 0 });
+
+        reduce(
+            &mut state,
+            ProtocolObservation::QuestGiverStatus { giver, status: 8 },
+        );
+        assert!(state.quests.offers.contains_key(&43));
+
+        reduce(
+            &mut state,
+            ProtocolObservation::QuestGiverStatus { giver, status: 5 },
+        );
+        assert!(state.quests.offers.is_empty());
     }
 
     #[test]
