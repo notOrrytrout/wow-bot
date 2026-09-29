@@ -38,43 +38,39 @@ pub fn select_named_grind_target(snapshot: &Snapshot, creature: &str) -> Option<
         return None;
     }
 
-    snapshot
-        .state
-        .entities
-        .0
-        .values()
-        .filter(|entity| {
-            entity.id != player_id
-                && entity.kind == EntityKind::Unit
-                && entity.hostile
-                && !entity.is_dead()
-                && entity.name.as_deref().is_some_and(|name| {
-                    !name.trim().is_empty() && name.trim().eq_ignore_ascii_case(creature)
-                })
-        })
-        .filter_map(|target| {
-            let position = target.position?;
-            if position.map != player_position.map || !position.point.is_finite() {
-                return None;
-            }
-            let distance = player_position.point.distance(position.point);
-            if !distance.is_finite() || distance > GRIND_TARGET_MAX_DISTANCE_YARDS {
-                return None;
-            }
-            if level_exceeds_safe_limit(player.level, target.level) {
-                return None;
-            }
-            if !pull_is_safe(snapshot, player, target) {
-                return None;
-            }
-            Some((target.id, distance))
-        })
-        .min_by(|(left_id, left_distance), (right_id, right_distance)| {
-            left_distance
-                .total_cmp(right_distance)
-                .then_with(|| left_id.cmp(right_id))
-        })
-        .map(|(id, _)| id)
+    crate::selection::nearest_entity_id(
+        snapshot
+            .state
+            .entities
+            .0
+            .values()
+            .filter(|entity| {
+                entity.id != player_id
+                    && entity.kind == EntityKind::Unit
+                    && entity.hostile
+                    && !entity.is_dead()
+                    && entity.name.as_deref().is_some_and(|name| {
+                        !name.trim().is_empty() && name.trim().eq_ignore_ascii_case(creature)
+                    })
+            })
+            .filter_map(|target| {
+                let position = target.position?;
+                if position.map != player_position.map || !position.point.is_finite() {
+                    return None;
+                }
+                let distance = player_position.point.distance(position.point);
+                if !distance.is_finite() || distance > GRIND_TARGET_MAX_DISTANCE_YARDS {
+                    return None;
+                }
+                if level_exceeds_safe_limit(player.level, target.level) {
+                    return None;
+                }
+                if !pull_is_safe(snapshot, player, target) {
+                    return None;
+                }
+                Some((target.id, distance))
+            }),
+    )
 }
 
 fn player_is_engaged(snapshot: &Snapshot) -> bool {

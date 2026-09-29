@@ -10,21 +10,16 @@ pub fn select_hostile_player_target(snapshot: &Snapshot) -> Option<EntityId> {
         return None;
     }
 
-    snapshot
-        .state
-        .entities
-        .0
-        .iter()
-        .filter_map(|(id, entity)| {
+    crate::selection::nearest_entity_id(snapshot.state.entities.0.iter().filter_map(
+        |(id, entity)| {
             if entity.kind != EntityKind::Player || !entity.hostile || entity.is_dead() {
                 return None;
             }
             let position = entity.position?;
             (position.map == player_position.map)
-                .then_some((player_position.point.distance(position.point), *id))
-        })
-        .min_by(|left, right| left.0.total_cmp(&right.0))
-        .map(|(_, id)| id)
+                .then_some((*id, player_position.point.distance(position.point)))
+        },
+    ))
 }
 
 #[cfg(test)]

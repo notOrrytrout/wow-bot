@@ -387,18 +387,20 @@ fn nearest_live_entity(
     matches: impl Fn(&EntityState) -> bool,
 ) -> Option<&EntityState> {
     let player = player?;
-    snapshot
-        .state
-        .entities
-        .0
-        .values()
-        .filter(|entity| matches(entity))
-        .filter_map(|entity| {
-            let position = entity.position?;
-            (position.map == player.map).then_some((player.point.distance(position.point), entity))
-        })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, entity)| entity)
+    let target = crate::selection::nearest_entity_id(
+        snapshot
+            .state
+            .entities
+            .0
+            .values()
+            .filter(|entity| matches(entity))
+            .filter_map(|entity| {
+                let position = entity.position?;
+                (position.map == player.map)
+                    .then_some((entity.id, player.point.distance(position.point)))
+            }),
+    )?;
+    snapshot.state.entities.0.get(&target)
 }
 
 fn poi_destination(
