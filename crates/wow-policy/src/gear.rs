@@ -33,16 +33,8 @@ pub fn destination_slots(metadata: &ItemTemplateMetadata) -> &'static [u8] {
 }
 
 pub fn player_can_use(metadata: &ItemTemplateMetadata, class: u8, level: u8) -> bool {
-    if metadata.required_level > u32::from(level) {
+    if !player_meets_item_requirements(metadata, class, level) {
         return false;
-    }
-    if metadata.allowable_class != 0 && metadata.allowable_class != u32::MAX {
-        if class == 0 || class > 32 {
-            return false;
-        }
-        if metadata.allowable_class & (1u32 << (class - 1)) == 0 {
-            return false;
-        }
     }
     match metadata.item_class {
         2 => weapon_subclass_allowed(class, metadata.subclass),
@@ -54,7 +46,11 @@ pub fn player_can_use(metadata: &ItemTemplateMetadata, class: u8, level: u8) -> 
 pub fn container_can_equip(metadata: &ItemTemplateMetadata, class: u8, level: u8) -> bool {
     metadata.inventory_type == 18
         && metadata.container_slots > 0
-        && metadata.required_level <= u32::from(level)
+        && player_meets_item_requirements(metadata, class, level)
+}
+
+fn player_meets_item_requirements(metadata: &ItemTemplateMetadata, class: u8, level: u8) -> bool {
+    metadata.required_level <= u32::from(level)
         && (metadata.allowable_class == 0
             || metadata.allowable_class == u32::MAX
             || (class > 0 && class <= 32 && metadata.allowable_class & (1u32 << (class - 1)) != 0))
@@ -518,6 +514,31 @@ mod tests {
         assert!(!player_can_use(&plate, 1, 39));
         assert!(player_can_use(&plate, 1, 40));
         assert!(!player_can_use(&plate, 8, 80));
+    }
+
+    #[test]
+    fn gear_and_bag_eligibility_share_level_and_class_requirements() {
+        for (class, level, allowable_class, required_level, expected) in [
+            (1, 9, u32::MAX, 10, false),
+            (1, 10, u32::MAX, 10, true),
+            (1, 10, 1, 1, true),
+            (2, 10, 1, 1, false),
+            (0, 10, 1, 1, false),
+            (33, 10, 1, 1, false),
+            (33, 10, 0, 1, true),
+        ] {
+            let mut gear = item(1, 10, (4, 1));
+            gear.item_class = 0;
+            gear.allowable_class = allowable_class;
+            gear.required_level = required_level;
+
+            let mut bag = gear.clone();
+            bag.inventory_type = 18;
+            bag.container_slots = 1;
+
+            assert_eq!(player_can_use(&gear, class, level), expected);
+            assert_eq!(container_can_equip(&bag, class, level), expected);
+        }
     }
 
     #[test]
