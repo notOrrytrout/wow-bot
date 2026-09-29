@@ -36,8 +36,7 @@ It uses consecutive stop frames as legs and includes the final-to-first loop
 leg when the route has at least two stops. It also lists map transitions from
 path teleports or map changes. It does not guess a stop from a map boundary.
 
-The manifest marks legs with `requires_ground_points: true`. It does not
-contain boarding or exit positions and is not accepted by the runtime. Add
-those positions to the authored `transports.json` and validate them against
-the installed navigation data. Do not copy the moving transport node
+The manifest marks legs with `requires_ground_points: true` and is not accepted
+by the runtime. See [Authored transport routes](TRANSPORT_ROUTES.md) to add
+validated boarding and exit positions. Do not use moving transport node
 coordinates as passenger ground positions.
