@@ -6,6 +6,7 @@ pub mod economy;
 pub mod gathering;
 pub mod gear;
 pub mod group;
+pub mod interaction;
 pub mod maintenance;
 pub mod missions;
 pub mod questing;

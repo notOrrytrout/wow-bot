@@ -1112,19 +1112,13 @@ fn is_nearby_class_trainer(snapshot: &Snapshot, trainer: EntityId) -> bool {
     let Some(entity) = snapshot.state.entities.0.get(&trainer) else {
         return false;
     };
-    let Some(position) = entity.position else {
-        return false;
-    };
     let Some(player_position) = snapshot.state.position.player else {
         return false;
     };
-    entity.kind == wow_state::entities::EntityKind::Unit
-        && entity.interactable
+    wow_policy::interaction::is_nearby_interactable_unit(entity, player_position, 5.0)
         && entity
             .npc_flags
             .is_some_and(|flags| flags & 0x20 != 0 || (flags & 0x10 != 0 && flags & 0x40 == 0))
-        && position.map == player_position.map
-        && position.point.distance(player_position.point) <= 5.0
 }
 
 fn attack_authorized(

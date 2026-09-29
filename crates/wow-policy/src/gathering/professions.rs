@@ -158,27 +158,26 @@ pub fn is_nearby_profession_trainer(state: &Snapshot, trainer: wow_domain::Entit
     else {
         return false;
     };
+    let Some(entity) = state.state.entities.0.get(&trainer) else {
+        return false;
+    };
+    let Some(wanted) = actionable_missing_skills(state) else {
+        return false;
+    };
+    if !crate::interaction::is_nearby_interactable_unit(entity, position, 5.0)
+        || !entity
+            .npc_flags
+            .is_some_and(crate::maintenance::is_profession_trainer_flags)
+    {
+        return false;
+    }
     let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
-    state.state.entities.0.get(&trainer).is_some_and(|entity| {
-        let Some(wanted) = actionable_missing_skills(state) else {
-            return false;
-        };
-        entity.kind == wow_state::entities::EntityKind::Unit
-            && entity.interactable
-            && entity
-                .npc_flags
-                .is_some_and(crate::maintenance::is_profession_trainer_flags)
-            && entity.position.is_some_and(|trainer_position| {
-                trainer_position.map == position.map
-                    && trainer_position.point.distance(position.point) <= 5.0
-            })
-            && catalog
-                .world()
-                .trainer_services
-                .iter()
-                .find(|service| service.entry_id == entity.entry)
-                .is_some_and(|service| service.skills.iter().any(|skill| wanted.contains(skill)))
-    })
+    catalog
+        .world()
+        .trainer_services
+        .iter()
+        .find(|service| service.entry_id == entity.entry)
+        .is_some_and(|service| service.skills.iter().any(|skill| wanted.contains(skill)))
 }
 
 /// Check a live offer against the trusted trainer spell-to-skill mapping and
