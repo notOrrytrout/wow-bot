@@ -347,30 +347,17 @@ fn class_training(
     {
         return None;
     }
-    let player_level = snapshot
-        .state
-        .session
-        .character_guid
-        .map(EntityId)
-        .and_then(|player| snapshot.state.entities.0.get(&player))
-        .and_then(|player| player.level)?;
+    let player_level = class_training_player_level(snapshot)?;
     let mut offers = snapshot
         .state
         .trainer
         .offers
         .iter()
         .filter(|offer| {
-            offer.usable == 0
-                && offer.spell != 0
-                && u32::from(offer.required_level) <= player_level
-                && !snapshot.state.capabilities.spells.contains(&offer.spell)
+            class_training_offer_is_eligible(snapshot, offer, player_level)
                 && u64::from(offer.cost_copper)
                     .saturating_add(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
                     <= snapshot.state.inventory.money
-                && (offer.required_skill_line == 0
-                    || (snapshot.state.professions.known
-                        && u32::from(snapshot.state.professions.skill(offer.required_skill_line))
-                            >= offer.required_skill_rank))
                 && !retry_after
                     .get(&(offer.spell, trainer))
                     .is_some_and(|deadline| *deadline > now)
@@ -389,7 +376,60 @@ fn class_training(
     })
 }
 
-fn is_class_trainer_flags(flags: u32) -> bool {
+pub fn class_training_has_eligible_offer(snapshot: &Snapshot) -> bool {
+    if snapshot.state.trainer.trainer_type != Some(0) {
+        return false;
+    }
+    let Some(player_level) = class_training_player_level(snapshot) else {
+        return false;
+    };
+    snapshot
+        .state
+        .trainer
+        .offers
+        .iter()
+        .any(|offer| class_training_offer_is_eligible(snapshot, offer, player_level))
+}
+
+pub fn class_training_has_affordable_offer(snapshot: &Snapshot) -> bool {
+    let Some(player_level) = class_training_player_level(snapshot) else {
+        return false;
+    };
+    snapshot.state.trainer.trainer_type == Some(0)
+        && snapshot.state.trainer.offers.iter().any(|offer| {
+            class_training_offer_is_eligible(snapshot, offer, player_level)
+                && u64::from(offer.cost_copper)
+                    .saturating_add(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
+                    <= snapshot.state.inventory.money
+        })
+}
+
+fn class_training_player_level(snapshot: &Snapshot) -> Option<u32> {
+    snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|player| snapshot.state.entities.0.get(&player))
+        .and_then(|player| player.level)
+}
+
+fn class_training_offer_is_eligible(
+    snapshot: &Snapshot,
+    offer: &wow_state::trainer::TrainerSpellOffer,
+    player_level: u32,
+) -> bool {
+    offer.usable == 0
+        && offer.spell != 0
+        && u32::from(offer.required_level) <= player_level
+        && !snapshot.state.capabilities.spells.contains(&offer.spell)
+        && (offer.required_skill_line == 0
+            || (snapshot.state.professions.known
+                && u32::from(snapshot.state.professions.skill(offer.required_skill_line))
+                    >= offer.required_skill_rank))
+}
+
+pub fn is_class_trainer_flags(flags: u32) -> bool {
     flags & 0x20 != 0 || (flags & 0x10 != 0 && flags & 0x40 == 0)
 }
 

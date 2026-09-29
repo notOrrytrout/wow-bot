@@ -135,9 +135,9 @@ fn nearby_class_trainer(snapshot: &Snapshot) -> Option<EntityId> {
         .filter(|entity| {
             entity.kind == wow_state::entities::EntityKind::Unit
                 && entity.interactable
-                && entity.npc_flags.is_some_and(|flags| {
-                    flags & 0x20 != 0 || (flags & 0x10 != 0 && flags & 0x40 == 0)
-                })
+                && entity
+                    .npc_flags
+                    .is_some_and(wow_policy::maintenance::is_class_trainer_flags)
         })
         .filter_map(|entity| entity.position.map(|point| (entity, point)))
         .filter(|(_, trainer_position)| {
@@ -150,6 +150,41 @@ fn nearby_class_trainer(snapshot: &Snapshot) -> Option<EntityId> {
                 .total_cmp(&right.point.distance(position.point))
         })
         .map(|(entity, _)| entity.id)
+}
+
+fn remembered_class_trainer_destination(
+    snapshot: &Snapshot,
+    remembered: &BTreeMap<u32, (WorldPosition, Instant)>,
+    now: Instant,
+) -> Option<WorldPosition> {
+    let position = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player)?;
+    remembered
+        .get(&position.map)
+        .filter(|(_, observed_at)| {
+            now.saturating_duration_since(*observed_at) <= CLASS_TRAINER_MEMORY_MAX_AGE
+        })
+        .map(|(trainer, _)| *trainer)
+        .filter(|trainer| {
+            trainer.point.distance(position.point) <= CLASS_TRAINER_DETOUR_RADIUS_YARDS
+        })
+}
+
+fn nearby_quest_offer(snapshot: &Snapshot, position: WorldPosition) -> bool {
+    snapshot.state.quests.offers.values().any(|offer| {
+        snapshot
+            .state
+            .entities
+            .0
+            .get(&offer.giver)
+            .and_then(|entity| entity.position)
+            .is_some_and(|giver| {
+                giver.map == position.map
+                    && giver.point.distance(position.point) <= QUEST_OFFER_PRIORITY_RADIUS_YARDS
+            })
+    })
 }
 
 struct RoutePlanJob {
@@ -184,6 +219,7 @@ enum MovementPurpose {
     ApproachGroundedTarget,
     SurvivalApproach,
     RepairVendor,
+    ClassTrainer,
 }
 
 const TURN_IN_SEARCH_RANGE: f32 = 5.0;
@@ -207,6 +243,11 @@ const QUEST_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MOVEMENT_STEP_EARLY_TOLERANCE: Duration = Duration::from_millis(10);
 const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
+const CLASS_TRAINER_DETOUR_RADIUS_YARDS: f32 = 30.0;
+const CLASS_TRAINER_MEMORY_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+const CLASS_TRAINER_TRAVEL_RETRY: Duration = Duration::from_secs(5 * 60);
+const CLASS_TRAINER_MONEY_RESERVE_COPPER: u64 = 1_000;
+const QUEST_OFFER_PRIORITY_RADIUS_YARDS: f32 = 40.0;
 
 #[derive(Clone, Debug)]
 enum PendingQuestAction {
@@ -322,6 +363,11 @@ pub struct LaneEngine {
     maintenance_retry_after: BTreeMap<(u32, EntityId), Instant>,
     repair_pending: Option<(wow_state::inventory::EquipmentCondition, Instant)>,
     repair_retry_after: Option<Instant>,
+    remembered_class_trainers: BTreeMap<u32, (WorldPosition, Instant)>,
+    class_training_character: Option<u64>,
+    last_player_level: Option<u32>,
+    class_training_due: bool,
+    class_trainer_travel_retry_after: Option<Instant>,
     last_maintenance_tick: Option<Instant>,
     last_maintenance_status: Option<String>,
     post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
@@ -395,6 +441,11 @@ impl LaneEngine {
             maintenance_retry_after: BTreeMap::new(),
             repair_pending: None,
             repair_retry_after: None,
+            remembered_class_trainers: BTreeMap::new(),
+            class_training_character: None,
+            last_player_level: None,
+            class_training_due: false,
+            class_trainer_travel_retry_after: None,
             last_maintenance_tick: None,
             last_maintenance_status: None,
             post_combat_loot: None,
@@ -876,7 +927,95 @@ impl LaneEngine {
                     ProtocolObservation::EntityUpsert { entity } => Some(entity.id),
                     _ => None,
                 };
+                let listed_trainer = match &o {
+                    ProtocolObservation::TrainerList { trainer, .. } => Some(*trainer),
+                    _ => None,
+                };
+                let learned_spell = match &o {
+                    ProtocolObservation::SpellKnown { spell } => Some(*spell),
+                    _ => None,
+                };
+                let previous_level = self
+                    .state
+                    .authoritative
+                    .session
+                    .character_guid
+                    .and_then(|guid| self.state.authoritative.entities.0.get(&EntityId(guid)))
+                    .and_then(|player| player.level);
                 let delta = reduce(&mut self.state.authoritative, o);
+                if let Some(id) = updated_entity
+                    && let Some(entity) = self.state.authoritative.entities.0.get(&id)
+                    && entity.kind == wow_state::entities::EntityKind::Unit
+                    && entity.interactable
+                    && entity
+                        .npc_flags
+                        .is_some_and(wow_policy::maintenance::is_class_trainer_flags)
+                    && let Some(position) = entity.position
+                {
+                    self.remembered_class_trainers
+                        .insert(position.map, (position, Instant::now()));
+                }
+                let character = self.state.authoritative.session.character_guid;
+                if character != self.class_training_character {
+                    let character_changed = self.class_training_character.is_some();
+                    self.class_training_character = character;
+                    self.last_player_level = None;
+                    self.class_training_due = false;
+                    self.class_trainer_travel_retry_after = None;
+                    if character_changed {
+                        self.remembered_class_trainers.clear();
+                    }
+                }
+                if let Some(level) = character
+                    .map(EntityId)
+                    .and_then(|player| self.state.authoritative.entities.0.get(&player))
+                    .and_then(|player| player.level)
+                {
+                    let baseline = if updated_entity == character.map(EntityId) {
+                        previous_level.or(self.last_player_level)
+                    } else {
+                        self.last_player_level
+                    };
+                    if baseline.is_none_or(|previous| level > previous) {
+                        self.class_training_due = true;
+                        self.class_trainer_travel_retry_after = None;
+                    }
+                    self.last_player_level = Some(level);
+                }
+                if let Some(trainer) = listed_trainer {
+                    let snapshot = Snapshot::from_state(&self.state.authoritative);
+                    if snapshot.state.trainer.trainer == Some(trainer)
+                        && snapshot.state.trainer.trainer_type == Some(0)
+                    {
+                        if !wow_policy::maintenance::class_training_has_eligible_offer(&snapshot) {
+                            self.class_training_due = false;
+                            self.class_trainer_travel_retry_after = None;
+                        } else if wow_policy::maintenance::class_training_has_affordable_offer(
+                            &snapshot,
+                        ) {
+                            self.class_trainer_travel_retry_after = None;
+                        } else {
+                            self.class_trainer_travel_retry_after =
+                                Some(Instant::now() + CLASS_TRAINER_TRAVEL_RETRY);
+                        }
+                    }
+                }
+                if learned_spell.is_some_and(|spell| {
+                    self.state.authoritative.trainer.trainer_type == Some(0)
+                        && self
+                            .state
+                            .authoritative
+                            .trainer
+                            .offers
+                            .iter()
+                            .any(|offer| offer.spell == spell)
+                }) {
+                    let snapshot = Snapshot::from_state(&self.state.authoritative);
+                    if !wow_policy::maintenance::class_training_has_eligible_offer(&snapshot) {
+                        self.class_training_due = false;
+                        self.class_trainer_travel_retry_after = None;
+                    }
+                }
                 if let Some((killer, target)) = owned_kill {
                     let mut corpse = self.state.authoritative.entities.0.get(&target).cloned();
                     if let Some(corpse) = &mut corpse
@@ -1157,6 +1296,18 @@ impl LaneEngine {
             self.stop_active_movement_for_handoff("repair detour is no longer safe or needed")
                 .await;
         }
+        if self
+            .pending_movement
+            .as_ref()
+            .is_some_and(|movement| movement.purpose == MovementPurpose::ClassTrainer)
+            && (!self.class_trainer_travel_allowed(&snapshot)
+                || nearby_class_trainer(&snapshot).is_some())
+        {
+            self.stop_active_movement_for_handoff(
+                "class trainer detour is no longer safe or needed",
+            )
+            .await;
+        }
         if self.pending_movement.is_some() {
             return true;
         }
@@ -1170,6 +1321,9 @@ impl LaneEngine {
                 return result;
             }
             if let Some(result) = self.tick_maintenance().await {
+                return result;
+            }
+            if let Some(result) = self.tick_class_trainer_travel(&snapshot) {
                 return result;
             }
         }
@@ -1846,6 +2000,91 @@ impl LaneEngine {
         }
         self.last_maintenance_tick
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
+    }
+
+    fn class_trainer_travel_allowed(&self, snapshot: &Snapshot) -> bool {
+        if !self.class_training_due
+            || self.state.authoritative.group.lifecycle != wow_state::group::GroupLifecycle::Solo
+            || matches!(
+                self.state.mission.intent,
+                MissionIntent::Party { .. } | MissionIntent::Raid { .. }
+            )
+            || !self
+                .state
+                .mission
+                .permissions
+                .contains(PermissionSet::MAINTENANCE | PermissionSet::MOVE)
+            || snapshot.state.inventory.money <= CLASS_TRAINER_MONEY_RESERVE_COPPER
+            || wow_policy::combat::engagement::survival_attacker(snapshot).is_some()
+        {
+            return false;
+        }
+        let Some(position) = snapshot
+            .state
+            .control
+            .active_position(snapshot.state.position.player)
+        else {
+            return false;
+        };
+        let player_in_combat = snapshot
+            .state
+            .session
+            .character_guid
+            .map(EntityId)
+            .and_then(|player| snapshot.state.entities.0.get(&player))
+            .and_then(wow_state::entities::EntityState::in_combat)
+            .unwrap_or(false);
+        !player_in_combat && !nearby_quest_offer(snapshot, position)
+    }
+
+    fn tick_class_trainer_travel(&mut self, snapshot: &Snapshot) -> Option<bool> {
+        if !self.class_trainer_travel_allowed(snapshot)
+            || nearby_class_trainer(snapshot).is_some()
+            || self
+                .class_trainer_travel_retry_after
+                .is_some_and(|deadline| deadline > Instant::now())
+        {
+            return None;
+        }
+        let now = Instant::now();
+        let Some(destination) =
+            remembered_class_trainer_destination(snapshot, &self.remembered_class_trainers, now)
+        else {
+            return None;
+        };
+        let Some(position) = snapshot
+            .state
+            .control
+            .active_position(snapshot.state.position.player)
+        else {
+            return None;
+        };
+        if destination.point.distance(position.point) <= 5.0 {
+            self.class_trainer_travel_retry_after = Some(now + CLASS_TRAINER_TRAVEL_RETRY);
+            return None;
+        }
+        self.class_trainer_travel_retry_after = Some(now + CLASS_TRAINER_TRAVEL_RETRY);
+        let work = self.set_work(QuestWorkKey::TravelToObjective {
+            quest: 0,
+            objective: 0,
+            destination,
+        });
+        self.queue_world_movement(
+            destination,
+            5.0,
+            None,
+            None,
+            PlanOrigin::SystemPolicy,
+            work,
+            MovementPurpose::ClassTrainer,
+        );
+        tracing::info!(
+            lane=?self.state.lane,
+            map=destination.map,
+            distance_yards=position.point.distance(destination.point),
+            "class training selected a recent observed trainer for a short same-map detour"
+        );
+        Some(true)
     }
 
     async fn tick_maintenance(&mut self) -> Option<bool> {
@@ -5391,6 +5630,11 @@ impl LaneEngine {
         self.maintenance_retry_after.clear();
         self.repair_pending = None;
         self.repair_retry_after = None;
+        self.remembered_class_trainers.clear();
+        self.class_training_character = None;
+        self.last_player_level = None;
+        self.class_training_due = false;
+        self.class_trainer_travel_retry_after = None;
         self.last_maintenance_tick = None;
         self.last_maintenance_status = None;
         self.post_combat_loot = None;
@@ -5755,6 +5999,255 @@ mod tests {
             ..position
         });
         assert_eq!(nearby_class_trainer(&Snapshot::from_state(&state)), None);
+    }
+
+    #[test]
+    fn remembered_class_trainer_requires_recent_same_map_location_within_detour_radius() {
+        let now = Instant::now();
+        let player_position = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let destination = WorldPosition {
+            point: Vec3::new(29.0, 0.0, 0.0),
+            ..player_position
+        };
+        let mut state = wow_state::AuthoritativeState::default();
+        state.position.player = Some(player_position);
+        let snapshot = Snapshot::from_state(&state);
+        let memory = BTreeMap::from([(1, (destination, now))]);
+        assert_eq!(
+            remembered_class_trainer_destination(&snapshot, &memory, now),
+            Some(destination)
+        );
+
+        let far = WorldPosition {
+            point: Vec3::new(31.0, 0.0, 0.0),
+            ..player_position
+        };
+        assert_eq!(
+            remembered_class_trainer_destination(
+                &snapshot,
+                &BTreeMap::from([(1, (far, now))]),
+                now
+            ),
+            None
+        );
+        assert_eq!(
+            remembered_class_trainer_destination(
+                &snapshot,
+                &BTreeMap::from([(2, (destination, now))]),
+                now
+            ),
+            None
+        );
+        assert_eq!(
+            remembered_class_trainer_destination(
+                &snapshot,
+                &memory,
+                now + CLASS_TRAINER_MEMORY_MAX_AGE + Duration::from_secs(1)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn trainer_travel_obeys_permission_group_money_combat_and_quest_gates() {
+        let position = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let player = EntityId(1);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(position);
+        authoritative.inventory.money = CLASS_TRAINER_MONEY_RESERVE_COPPER + 1;
+        authoritative.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                id: player,
+                kind: wow_state::entities::EntityKind::Player,
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+        let (mut engine, _) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        engine.class_training_due = true;
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert!(engine.class_trainer_travel_allowed(&snapshot));
+
+        engine.state.mission.permissions = PermissionSet::MAINTENANCE;
+        assert!(!engine.class_trainer_travel_allowed(&snapshot));
+        engine.state.mission.permissions = PermissionSet::MAINTENANCE | PermissionSet::MOVE;
+        engine.state.authoritative.group.lifecycle = wow_state::group::GroupLifecycle::Active;
+        assert!(!engine.class_trainer_travel_allowed(&snapshot));
+        engine.state.authoritative.group.lifecycle = wow_state::group::GroupLifecycle::Solo;
+        engine.state.authoritative.inventory.money = CLASS_TRAINER_MONEY_RESERVE_COPPER;
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert!(!engine.class_trainer_travel_allowed(&snapshot));
+        engine.state.authoritative.inventory.money = CLASS_TRAINER_MONEY_RESERVE_COPPER + 1;
+        engine
+            .state
+            .authoritative
+            .entities
+            .0
+            .get_mut(&player)
+            .unwrap()
+            .unit_flags = Some(0x0008_0000);
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert!(!engine.class_trainer_travel_allowed(&snapshot));
+        engine
+            .state
+            .authoritative
+            .entities
+            .0
+            .get_mut(&player)
+            .unwrap()
+            .unit_flags = Some(0);
+        let giver = EntityId(22);
+        engine.state.authoritative.entities.0.insert(
+            giver,
+            wow_state::entities::EntityState {
+                id: giver,
+                position: Some(WorldPosition {
+                    point: Vec3::new(39.0, 0.0, 0.0),
+                    ..position
+                }),
+                ..Default::default()
+            },
+        );
+        engine
+            .state
+            .authoritative
+            .quests
+            .offers
+            .insert(99, wow_state::quests::QuestOffer { giver, icon: 0 });
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert!(!engine.class_trainer_travel_allowed(&snapshot));
+    }
+
+    #[test]
+    fn trainer_travel_queues_short_detour_without_replacing_mission() {
+        let position = WorldPosition {
+            map: 4,
+            point: Vec3::new(10.0, 10.0, 5.0),
+            orientation: 0.0,
+        };
+        let player = EntityId(1);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(position);
+        authoritative.inventory.money = CLASS_TRAINER_MONEY_RESERVE_COPPER + 1;
+        authoritative.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                id: player,
+                kind: wow_state::entities::EntityKind::Player,
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+        let mission = Mission::quest(MissionId(88));
+        let intent = mission.intent.clone();
+        let (mut engine, _) = test_engine(mission, authoritative);
+        engine.class_training_due = true;
+        let destination = WorldPosition {
+            point: Vec3::new(20.0, 10.0, 5.0),
+            ..position
+        };
+        engine
+            .remembered_class_trainers
+            .insert(4, (destination, Instant::now()));
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+
+        assert_eq!(engine.tick_class_trainer_travel(&snapshot), Some(true));
+        assert_eq!(engine.state.mission.intent, intent);
+        assert!(engine.pending_movement.as_ref().is_some_and(|movement| {
+            movement.purpose == MovementPurpose::ClassTrainer && movement.destination == destination
+        }));
+    }
+
+    #[tokio::test]
+    async fn authoritative_player_level_initialization_and_increase_mark_training_due() {
+        let player = EntityId(1);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        let (mut engine, _) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        let player_state = |level| wow_state::entities::EntityState {
+            id: player,
+            kind: wow_state::entities::EntityKind::Player,
+            level: Some(level),
+            health: Some((100, 100)),
+            ..Default::default()
+        };
+
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::EntityUpsert {
+                    entity: player_state(5),
+                },
+            ))
+            .await;
+        assert!(engine.class_training_due);
+        engine.class_training_due = false;
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::EntityUpsert {
+                    entity: player_state(6),
+                },
+            ))
+            .await;
+        assert!(engine.class_training_due);
+    }
+
+    #[tokio::test]
+    async fn trainer_memory_and_due_state_reset_when_character_or_session_changes() {
+        let player = EntityId(1);
+        let position = WorldPosition {
+            map: 1,
+            point: Vec3::new(1.0, 2.0, 3.0),
+            orientation: 0.0,
+        };
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        let (mut engine, _) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        engine.class_training_character = Some(player.0);
+        engine.last_player_level = Some(10);
+        engine.class_training_due = true;
+        engine
+            .remembered_class_trainers
+            .insert(1, (position, Instant::now()));
+
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::EnteredWorld {
+                    character_guid: 2,
+                    position: Some(position),
+                },
+            ))
+            .await;
+        assert_eq!(engine.class_training_character, Some(2));
+        assert_eq!(engine.last_player_level, None);
+        assert!(!engine.class_training_due);
+        assert!(engine.remembered_class_trainers.is_empty());
+
+        engine.class_training_due = true;
+        engine
+            .remembered_class_trainers
+            .insert(1, (position, Instant::now()));
+        engine
+            .handle(LaneMessage::Observation(ProtocolObservation::LeftWorld))
+            .await;
+        assert_eq!(engine.class_training_character, None);
+        assert_eq!(engine.last_player_level, None);
+        assert!(!engine.class_training_due);
+        assert!(engine.remembered_class_trainers.is_empty());
     }
 
     #[tokio::test]

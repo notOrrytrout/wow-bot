@@ -10,4 +10,5 @@ The legacy bot learned eligible class spells from nearby trainers and then used 
 - Parse the current WotLK trainer list into authoritative state.
 - Add typed list and buy actions to the shared validation and dispatch path.
 - Let maintenance request a nearby class trainer list and buy one eligible, affordable spell at a time.
+- Remember observed class-trainer positions for up to six hours and allow a short same-map trip after an authoritative level increase.
 - Keep profession training and long-distance trainer travel as separate policy work.
