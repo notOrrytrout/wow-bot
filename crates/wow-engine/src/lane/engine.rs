@@ -2132,6 +2132,17 @@ impl LaneEngine {
             return true;
         }
 
+        let role = match &self.state.mission.intent {
+            MissionIntent::Party { role } | MissionIntent::Raid { role } => *role,
+            _ => GroupRole::Auto,
+        };
+        if wow_policy::group::encounter::pull_decision(&snapshot, role, player, target)
+            == wow_policy::group::encounter::PullDecision::WaitForGroupEngagement
+        {
+            self.waiting("group role is waiting for an observed authorized pull".into());
+            return true;
+        }
+
         self.dispatch_combat_target(target, false).await
     }
 

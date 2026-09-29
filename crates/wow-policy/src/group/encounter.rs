@@ -1,5 +1,11 @@
-use wow_domain::EntityId;
+use wow_domain::{EntityId, GroupRole};
 use wow_state::Snapshot;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PullDecision {
+    Engage,
+    WaitForGroupEngagement,
+}
 #[derive(Clone, Debug, Default)]
 pub struct EncounterIntent {
     pub preferred_target: Option<EntityId>,
@@ -14,5 +20,136 @@ pub fn from_observed(state: &Snapshot) -> EncounterIntent {
         allowed_targets: target.into_iter().collect(),
         interrupt_allowed: target.is_some(),
         hold_threat: false,
+    }
+}
+
+/// Authorize combat only for the current observed group encounter target.
+/// Tanks may initiate that assigned encounter. Other roles wait until the
+/// target is visibly in combat and targeting an observed online member.
+pub fn pull_decision(
+    state: &Snapshot,
+    role: GroupRole,
+    player: Option<EntityId>,
+    target: EntityId,
+) -> PullDecision {
+    if !state
+        .state
+        .group
+        .encounter_target
+        .is_some_and(|authorized| authorized == target)
+    {
+        return PullDecision::WaitForGroupEngagement;
+    }
+
+    if role == GroupRole::Tank {
+        return PullDecision::Engage;
+    }
+
+    let Some(target_state) = state.state.entities.0.get(&target) else {
+        return PullDecision::WaitForGroupEngagement;
+    };
+    let targets_group_member = target_state.target.is_some_and(|victim| {
+        Some(victim) == player || crate::group::state::observed_member(state, victim)
+    });
+    if target_state.in_combat() == Some(true) && targets_group_member {
+        PullDecision::Engage
+    } else {
+        PullDecision::WaitForGroupEngagement
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wow_state::{AuthoritativeState, entities::EntityState, group::GroupMember};
+
+    fn encounter(
+        role: GroupRole,
+        target_victim: Option<EntityId>,
+        in_combat: Option<bool>,
+    ) -> PullDecision {
+        let target = EntityId(9);
+        let member = EntityId(2);
+        let mut state = AuthoritativeState::default();
+        state.group.encounter_target = Some(target);
+        state.group.members.push(GroupMember {
+            entity: member,
+            online: true,
+            ..Default::default()
+        });
+        state.entities.0.insert(
+            target,
+            EntityState {
+                id: target,
+                hostile: true,
+                target: target_victim,
+                unit_flags: in_combat.map(|active| if active { 0x0008_0000 } else { 0 }),
+                ..Default::default()
+            },
+        );
+        pull_decision(
+            &Snapshot::from_state(&state),
+            role,
+            Some(EntityId(1)),
+            target,
+        )
+    }
+
+    #[test]
+    fn tank_can_initiate_only_the_observed_group_encounter_target() {
+        assert_eq!(
+            encounter(GroupRole::Tank, None, Some(false)),
+            PullDecision::Engage
+        );
+    }
+
+    #[test]
+    fn non_tank_waits_until_target_is_in_combat_against_observed_member() {
+        assert_eq!(
+            encounter(GroupRole::Ranged, None, Some(false)),
+            PullDecision::WaitForGroupEngagement
+        );
+        assert_eq!(
+            encounter(GroupRole::Ranged, Some(EntityId(2)), Some(true)),
+            PullDecision::Engage
+        );
+    }
+
+    #[test]
+    fn non_tank_does_not_infer_authority_from_combat_flag_alone() {
+        assert_eq!(
+            encounter(GroupRole::Healer, Some(EntityId(88)), Some(true)),
+            PullDecision::WaitForGroupEngagement
+        );
+        assert_eq!(
+            encounter(GroupRole::Healer, Some(EntityId(2)), None),
+            PullDecision::WaitForGroupEngagement
+        );
+    }
+
+    #[test]
+    fn non_tank_cannot_assist_a_target_outside_the_observed_encounter() {
+        let target = EntityId(8);
+        let mut state = AuthoritativeState::default();
+        state.group.encounter_target = Some(EntityId(9));
+        state.entities.0.insert(
+            target,
+            EntityState {
+                id: target,
+                hostile: true,
+                target: Some(EntityId(2)),
+                unit_flags: Some(0x0008_0000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            pull_decision(
+                &Snapshot::from_state(&state),
+                GroupRole::Melee,
+                Some(EntityId(1)),
+                target,
+            ),
+            PullDecision::WaitForGroupEngagement
+        );
     }
 }

@@ -48,3 +48,22 @@ The system SHALL apply the same combat authorization and self-defense boundaries
 #### Scenario: Group member is attacked
 - **WHEN** an applicable active group member is attacked by a hostile entity
 - **THEN** defensive combat may respond according to self-defense policy
+
+### Requirement: Role-aware pull authorization
+The system SHALL initiate voluntary group combat only against the currently observed group encounter target. A configured tank may initiate that target. Other roles SHALL wait until the target is observed in combat against the player or an online group member. Unknown combat or victim state SHALL NOT authorize a voluntary pull.
+
+#### Scenario: Tank initiates the assigned encounter target
+- **WHEN** the tank role observes a live hostile as the current group encounter target
+- **THEN** the tank may engage that target
+
+#### Scenario: Damage role waits for the tank's pull
+- **WHEN** a non-tank role observes the assigned hostile but the hostile is not visibly in combat against the group
+- **THEN** the bot waits and does not start combat
+
+#### Scenario: Non-tank assists a group-engaged target
+- **WHEN** a non-tank role observes the assigned hostile in combat against an online group member
+- **THEN** the bot may assist that target
+
+#### Scenario: Nearby hostile is not assigned to the group encounter
+- **WHEN** an observed hostile is not the current group encounter target
+- **THEN** role policy does not authorize a voluntary attack against it
