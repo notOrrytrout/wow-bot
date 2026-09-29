@@ -22,6 +22,66 @@ use crate::objects::object_to_entity;
 
 const SMSG_TALENTS_INFO: u16 = 0x04c0;
 const SMSG_PET_SPELLS: u16 = 0x0179;
+// The pinned Tentacli exposes this WotLK opcode, but no typed status accessor.
+const SMSG_BATTLEFIELD_STATUS: u16 = 724;
+
+fn parse_battleground_status(
+    body: &[u8],
+) -> Option<wow_state::battleground::BattlegroundQueueState> {
+    if body.len() < 12 {
+        return None;
+    }
+    let queue_slot = u32::from_le_bytes(body[0..4].try_into().ok()?);
+    if body.len() == 12 && body[4..12].iter().all(|byte| *byte == 0) {
+        return Some(wow_state::battleground::BattlegroundQueueState {
+            queue_slot,
+            battleground_type_id: None,
+            status: wow_state::battleground::BattlegroundQueueStatus::None,
+            map_id: None,
+            invite_timeout_ms: None,
+            elapsed_time_ms: None,
+            auto_leave_time_ms: None,
+            team_alliance: None,
+        });
+    }
+    if body.len() < 23 {
+        return None;
+    }
+
+    let battleground_type_id = u32::from_le_bytes(body[6..10].try_into().ok()?);
+    let status_raw = u32::from_le_bytes(body[19..23].try_into().ok()?);
+    let map_id = if matches!(status_raw, 2 | 3) && body.len() >= 27 {
+        Some(u32::from_le_bytes(body[23..27].try_into().ok()?))
+    } else {
+        None
+    };
+    let invite_timeout_ms = if status_raw == 2 && body.len() >= 39 {
+        Some(u32::from_le_bytes(body[35..39].try_into().ok()?))
+    } else {
+        None
+    };
+    let (auto_leave_time_ms, elapsed_time_ms, team_alliance) =
+        if status_raw == 3 && body.len() >= 44 {
+            (
+                Some(u32::from_le_bytes(body[35..39].try_into().ok()?)),
+                Some(u32::from_le_bytes(body[39..43].try_into().ok()?)),
+                Some(body[43] != 0),
+            )
+        } else {
+            (None, None, None)
+        };
+
+    Some(wow_state::battleground::BattlegroundQueueState {
+        queue_slot,
+        battleground_type_id: Some(battleground_type_id),
+        status: wow_state::battleground::BattlegroundQueueStatus::from_raw(status_raw),
+        map_id,
+        invite_timeout_ms,
+        elapsed_time_ms,
+        auto_leave_time_ms,
+        team_alliance,
+    })
+}
 
 fn new_processor_context() -> Result<(ObjectProcessor, Arc<RwLock<CtxMap>>)> {
     let mut processor = ObjectProcessor::default();
@@ -173,6 +233,11 @@ impl ObjectObservationRuntime {
 
     pub async fn observe(&mut self, opcode: u16, body: &[u8]) -> Result<Vec<ProtocolObservation>> {
         let mut observations = Vec::new();
+        if opcode == SMSG_BATTLEFIELD_STATUS
+            && let Some(queue) = parse_battleground_status(body)
+        {
+            observations.push(ProtocolObservation::BattlegroundQueue(queue));
+        }
         if opcode == SMSG_PET_SPELLS && body.len() >= 8 {
             let raw_pet = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
             if raw_pet == 0 {
@@ -945,6 +1010,93 @@ impl<'a> TalentPacketReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn battlefield_status_packets_project_known_and_unknown_states() {
+        let mut runtime = ObjectObservationRuntime::new().expect("object observer");
+        let mut in_progress = vec![0; 44];
+        in_progress[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        in_progress[6..10].copy_from_slice(&32_u32.to_le_bytes());
+        in_progress[19..23].copy_from_slice(&3_u32.to_le_bytes());
+        in_progress[23..27].copy_from_slice(&489_u32.to_le_bytes());
+        in_progress[35..39].copy_from_slice(&90_000_u32.to_le_bytes());
+        in_progress[39..43].copy_from_slice(&12_000_u32.to_le_bytes());
+        in_progress[43] = 1;
+        let observations = runtime
+            .observe(SMSG_BATTLEFIELD_STATUS, &in_progress)
+            .await
+            .expect("status packet");
+        assert!(matches!(
+            observations.first(),
+            Some(ProtocolObservation::BattlegroundQueue(queue))
+                if queue.queue_slot == 1
+                    && queue.battleground_type_id == Some(32)
+                    && queue.status == wow_state::battleground::BattlegroundQueueStatus::InProgress
+                    && queue.map_id == Some(489)
+                    && queue.auto_leave_time_ms == Some(90_000)
+                    && queue.elapsed_time_ms == Some(12_000)
+                    && queue.team_alliance == Some(true)
+        ));
+
+        let mut invited = vec![0; 39];
+        invited[0..4].copy_from_slice(&2_u32.to_le_bytes());
+        invited[6..10].copy_from_slice(&32_u32.to_le_bytes());
+        invited[19..23].copy_from_slice(&2_u32.to_le_bytes());
+        invited[23..27].copy_from_slice(&489_u32.to_le_bytes());
+        invited[35..39].copy_from_slice(&60_000_u32.to_le_bytes());
+        let observations = runtime
+            .observe(SMSG_BATTLEFIELD_STATUS, &invited)
+            .await
+            .expect("invitation status packet");
+        assert!(matches!(
+            observations.first(),
+            Some(ProtocolObservation::BattlegroundQueue(queue))
+                if queue.queue_slot == 2
+                    && queue.status == wow_state::battleground::BattlegroundQueueStatus::WaitJoin
+                    && queue.map_id == Some(489)
+                    && queue.invite_timeout_ms == Some(60_000)
+        ));
+
+        let mut unknown = vec![0; 23];
+        unknown[0..4].copy_from_slice(&2_u32.to_le_bytes());
+        unknown[19..23].copy_from_slice(&99_u32.to_le_bytes());
+        let observations = runtime
+            .observe(SMSG_BATTLEFIELD_STATUS, &unknown)
+            .await
+            .expect("unknown status packet");
+        assert!(matches!(
+            observations.first(),
+            Some(ProtocolObservation::BattlegroundQueue(queue))
+                if queue.status == wow_state::battleground::BattlegroundQueueStatus::Unknown(99)
+        ));
+
+        let mut empty_slot = vec![0; 12];
+        empty_slot[0..4].copy_from_slice(&2_u32.to_le_bytes());
+        let observations = runtime
+            .observe(SMSG_BATTLEFIELD_STATUS, &empty_slot)
+            .await
+            .expect("empty slot packet");
+        assert!(matches!(
+            observations.first(),
+            Some(ProtocolObservation::BattlegroundQueue(queue))
+                if queue.status == wow_state::battleground::BattlegroundQueueStatus::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_battlefield_status_packets_do_not_emit_queue_state() {
+        let mut runtime = ObjectObservationRuntime::new().expect("object observer");
+        for body in [&[0; 11][..], &[0; 22][..]] {
+            let observations = runtime
+                .observe(SMSG_BATTLEFIELD_STATUS, body)
+                .await
+                .expect("short malformed packets are ignored");
+            assert!(!observations.iter().any(|observation| matches!(
+                observation,
+                ProtocolObservation::BattlegroundQueue(_)
+            )));
+        }
+    }
 
     #[tokio::test]
     async fn pet_control_uses_pet_bar_and_initial_talents_as_authority() {

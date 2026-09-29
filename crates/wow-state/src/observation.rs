@@ -236,6 +236,7 @@ pub enum ProtocolObservation {
         fishing: bool,
     },
     Group(crate::group::GroupState),
+    BattlegroundQueue(crate::battleground::BattlegroundQueueState),
     Desync {
         reason: String,
     },

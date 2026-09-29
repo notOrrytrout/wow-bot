@@ -36,6 +36,7 @@ fn mark_entity_changed(delta: &mut StateDelta, entity: EntityId, sections: &[&st
 fn clear_world_transients(state: &mut AuthoritativeState) {
     state.entities = Default::default();
     state.auras = Default::default();
+    state.battleground = Default::default();
     state.transport = Default::default();
     state.control = Default::default();
     state.pet = Default::default();
@@ -75,6 +76,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                     [
                         "entities",
                         "auras",
+                        "battleground",
                         "transport",
                         "control",
                         "pet",
@@ -109,6 +111,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                     "position",
                     "entities",
                     "auras",
+                    "battleground",
                     "transport",
                     "control",
                     "pet",
@@ -138,6 +141,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                     "capabilities",
                     "control",
                     "auras",
+                    "battleground",
                     "desync",
                 ]
                 .map(str::to_owned),
@@ -627,6 +631,14 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.group = group;
             delta.changed.push("group".into());
         }
+        ProtocolObservation::BattlegroundQueue(queue) => {
+            if queue.status == crate::battleground::BattlegroundQueueStatus::None {
+                state.battleground.queues.remove(&queue.queue_slot);
+            } else {
+                state.battleground.queues.insert(queue.queue_slot, queue);
+            }
+            delta.changed.push("battleground".into());
+        }
         ProtocolObservation::Desync { reason } => {
             state.desync.suspect = true;
             state.desync.reasons.push(reason);
@@ -653,6 +665,76 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use wow_domain::{EntityId, Vec3, WorldPosition};
+
+    fn battleground_queue(
+        queue_slot: u32,
+        status: crate::BattlegroundQueueStatus,
+    ) -> ProtocolObservation {
+        ProtocolObservation::BattlegroundQueue(crate::BattlegroundQueueState {
+            queue_slot,
+            battleground_type_id: Some(32),
+            status,
+            map_id: None,
+            invite_timeout_ms: None,
+            elapsed_time_ms: None,
+            auto_leave_time_ms: None,
+            team_alliance: None,
+        })
+    }
+
+    #[test]
+    fn battleground_queue_observations_keep_each_slot_and_unknown_status() {
+        let mut state = AuthoritativeState::default();
+        reduce(
+            &mut state,
+            battleground_queue(0, crate::BattlegroundQueueStatus::WaitQueue),
+        );
+        reduce(
+            &mut state,
+            battleground_queue(1, crate::BattlegroundQueueStatus::Unknown(9)),
+        );
+
+        assert_eq!(state.battleground.queues.len(), 2);
+        assert_eq!(
+            state.battleground.queues[&1].status,
+            crate::BattlegroundQueueStatus::Unknown(9)
+        );
+
+        reduce(
+            &mut state,
+            battleground_queue(0, crate::BattlegroundQueueStatus::None),
+        );
+        assert!(!state.battleground.queues.contains_key(&0));
+        assert!(state.battleground.queues.contains_key(&1));
+    }
+
+    #[test]
+    fn world_transitions_clear_battleground_queue_observations() {
+        let mut state = AuthoritativeState::default();
+        reduce(
+            &mut state,
+            battleground_queue(0, crate::BattlegroundQueueStatus::InProgress),
+        );
+        reduce(
+            &mut state,
+            ProtocolObservation::WorldChanged {
+                character_guid: 7,
+                position: WorldPosition {
+                    map: 489,
+                    point: Vec3::new(1.0, 2.0, 3.0),
+                    orientation: 0.0,
+                },
+            },
+        );
+        assert!(state.battleground.queues.is_empty());
+
+        reduce(
+            &mut state,
+            battleground_queue(2, crate::BattlegroundQueueStatus::WaitJoin),
+        );
+        reduce(&mut state, ProtocolObservation::LeftWorld);
+        assert!(state.battleground.queues.is_empty());
+    }
 
     #[test]
     fn partial_aura_update_keeps_known_caster_and_server_duration() {

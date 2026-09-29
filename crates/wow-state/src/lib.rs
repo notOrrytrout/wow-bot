@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 pub mod auras;
 pub mod authoritative;
+pub mod battleground;
 pub mod capabilities;
 pub mod control;
 pub mod delta;
@@ -21,6 +22,7 @@ pub mod talents;
 pub mod trainer;
 pub mod transport;
 pub use authoritative::*;
+pub use battleground::*;
 pub use delta::*;
 pub use observation::*;
 pub use reducer::*;

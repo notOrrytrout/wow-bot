@@ -1,8 +1,9 @@
 use crate::{
-    auras::AuraState, capabilities::CapabilityState, control::ControlState, desync::DesyncState,
-    entities::Entities, group::GroupState, inventory::InventoryState, life::LifeState,
-    pets::PetState, position::PositionState, professions::ProfessionState, quests::QuestState,
-    session::SessionState, trainer::TrainerState, transport::TransportState,
+    auras::AuraState, battleground::BattlegroundState, capabilities::CapabilityState,
+    control::ControlState, desync::DesyncState, entities::Entities, group::GroupState,
+    inventory::InventoryState, life::LifeState, pets::PetState, position::PositionState,
+    professions::ProfessionState, quests::QuestState, session::SessionState, trainer::TrainerState,
+    transport::TransportState,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -18,6 +19,8 @@ pub struct ActiveCastState {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AuthoritativeState {
     pub auras: AuraState,
+    #[serde(default)]
+    pub battleground: BattlegroundState,
     pub revision: StateRevision,
     pub session: SessionState,
     pub position: PositionState,
