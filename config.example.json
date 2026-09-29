@@ -42,5 +42,12 @@
     "max_pre_auth_connections_per_ip": 8,
     "warden_client_image": null
   },
-  "accounts": []
+  "accounts": [],
+  "memory": {
+    "database_url_env": "TENTACLI_BOT_DATABASE_URL",
+    "required": false
+  },
+  "debug": {
+    "enabled": false
+  }
 }

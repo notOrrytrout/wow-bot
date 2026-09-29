@@ -1,0 +1,6 @@
+- [x] Retain the configured memory URL environment name, debug gate, and stable roster bot ID.
+- [x] Add one-transaction, parameter-bound deletion for the legacy memory tables.
+- [x] Add `.bot forget` parsing and configured-account/debug/worker gates.
+- [x] Add tests that do not connect to a live database.
+- [x] Add OpenSpec behavior deltas for local authorization, transaction scope, and database transport security.
+- [x] Run focused infra, proxy, supervisor, formatting, diff, and OpenSpec checks without connecting to a database.

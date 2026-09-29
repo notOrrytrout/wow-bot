@@ -235,8 +235,11 @@ pub struct ProxyAccountConfig {
     pub lane: LaneId,
     pub worker: Option<WorkerGeneration>,
     pub account_name: String,
+    pub bot_id: String,
     pub password: String,
     pub character: Option<String>,
+    pub memory_database_url_env: String,
+    pub debug_enabled: bool,
 }
 
 pub struct ManagedLane {
@@ -3622,6 +3625,19 @@ async fn execute_bot_command(
             tracing::info!(account=%account.config.account_name, command=".bot clear", "bot mission cleared and automation disabled");
             Ok(vec!["mission cleared; automation disabled".into()])
         }
+        BotCommand::Forget => {
+            validate_forget_authorization(
+                account.config.worker.is_some(),
+                account.config.debug_enabled,
+            )?;
+            wow_infra::memory::mysql::clear_bot_memory(
+                &account.config.memory_database_url_env,
+                &account.config.bot_id,
+            )
+            .await?;
+            tracing::info!(account=%account.config.account_name, command=".bot forget", "persistent bot memory cleared");
+            Ok(vec!["persistent memory cleared for this bot".into()])
+        }
         BotCommand::Status => {
             let owner = *account.ownership_state.borrow();
             let character = account
@@ -3646,6 +3662,16 @@ async fn execute_bot_command(
             .map(|line| (*line).to_owned())
             .collect()),
     }
+}
+
+fn validate_forget_authorization(worker_enabled: bool, debug_enabled: bool) -> Result<(), String> {
+    if !worker_enabled {
+        return Err("this account has no enabled bot worker".into());
+    }
+    if !debug_enabled {
+        return Err(".bot forget requires debug mode in the protected runtime config".into());
+    }
+    Ok(())
 }
 
 async fn handle_log_command(
@@ -4824,5 +4850,20 @@ mod quest_protocol_tests {
             ]
             .concat(),
         }));
+    }
+
+    #[test]
+    fn persistent_memory_clear_requires_enabled_worker_and_debug_gate() {
+        assert!(validate_forget_authorization(true, true).is_ok());
+        assert!(
+            validate_forget_authorization(false, true)
+                .unwrap_err()
+                .contains("no enabled bot worker")
+        );
+        assert!(
+            validate_forget_authorization(true, false)
+                .unwrap_err()
+                .contains("requires debug mode")
+        );
     }
 }

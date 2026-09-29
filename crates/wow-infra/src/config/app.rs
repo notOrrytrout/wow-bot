@@ -16,6 +16,8 @@ pub struct AccountConfig {
     pub lane: LaneId,
     pub account: AccountId,
     pub account_name: String,
+    #[serde(default)]
+    pub bot_id: String,
     pub password: String,
     pub character: String,
     #[serde(default = "default_true")]
@@ -28,6 +30,7 @@ impl std::fmt::Debug for AccountConfig {
             .field("lane", &self.lane)
             .field("account", &self.account)
             .field("account_name", &self.account_name)
+            .field("bot_id", &self.bot_id)
             .field("password", &"[redacted]")
             .field("character", &self.character)
             .field("enabled", &self.enabled)
@@ -121,6 +124,39 @@ pub struct AppConfig {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default)]
+    pub debug: DebugConfig,
+}
+
+fn default_memory_database_url_env() -> String {
+    "TENTACLI_BOT_DATABASE_URL".into()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    #[serde(default = "default_memory_database_url_env")]
+    pub database_url_env: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            database_url_env: default_memory_database_url_env(),
+            required: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl Default for ProxyConfig {
@@ -153,6 +189,8 @@ impl Default for AppConfig {
             upstream: UpstreamConfig::default(),
             proxy: ProxyConfig::default(),
             accounts: Vec::new(),
+            memory: MemoryConfig::default(),
+            debug: DebugConfig::default(),
         }
     }
 }
@@ -241,6 +279,15 @@ impl AppConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         super::validation::validate(&self.runtime)?;
+        if self.memory.database_url_env.trim().is_empty() {
+            return Err("memory.database_url_env must not be empty".into());
+        }
+        if self.memory.required && std::env::var_os(&self.memory.database_url_env).is_none() {
+            return Err(format!(
+                "required persistent memory backend is unavailable: environment variable {} is not set",
+                self.memory.database_url_env
+            ));
+        }
         self.proxy
             .auth_bind
             .parse::<std::net::SocketAddr>()

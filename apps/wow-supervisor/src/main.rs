@@ -268,9 +268,16 @@ async fn main() -> Result<()> {
                 lane: account.lane,
                 worker: account.enabled.then_some(generation),
                 account_name: account.account_name.clone(),
+                bot_id: if account.bot_id.trim().is_empty() {
+                    account.account_name.clone()
+                } else {
+                    account.bot_id.clone()
+                },
                 password: account.password.clone(),
                 character: (!account.character.trim().is_empty())
                     .then(|| account.character.clone()),
+                memory_database_url_env: config.memory.database_url_env.clone(),
+                debug_enabled: config.debug.enabled,
             },
             worker_rx,
             worker_tx,
@@ -915,6 +922,7 @@ fn configure_first_account(config: &mut AppConfig) -> Result<()> {
         lane: LaneId::new(next_lane),
         account: AccountId::new(next_account),
         account_name,
+        bot_id: String::new(),
         password,
         character,
         enabled: true,

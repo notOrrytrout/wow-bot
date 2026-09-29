@@ -63,5 +63,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            parse_local(".bot forget", chat::ChatFamily::Say, false, MissionId(10))
+                .unwrap()
+                .is_none()
+        );
     }
 }

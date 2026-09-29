@@ -14,5 +14,6 @@ serde_json.workspace = true
 toml = "0.8"
 tokio.workspace = true
 tracing.workspace = true
+sqlx.workspace = true
 [lints]
 workspace = true

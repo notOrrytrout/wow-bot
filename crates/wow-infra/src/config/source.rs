@@ -167,6 +167,19 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
 
     let mut config = AppConfig::default();
     config.setup_complete = true;
+    if let Some(database_url_env) = string(&values, &["memory", "database_url_env"]) {
+        config.memory.database_url_env = database_url_env;
+    }
+    config.memory.required = values
+        .get("memory")
+        .and_then(|section| section.get("required"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(config.memory.required);
+    config.debug.enabled = values
+        .get("debug")
+        .and_then(|section| section.get("enabled"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(config.debug.enabled);
     config.runtime.control_bind =
         string(&values, &["server", "bind"]).unwrap_or_else(|| config.runtime.control_bind.clone());
     config.runtime.worker_queue = number(&values, &["proxy", "limits", "worker_command_capacity"])
@@ -328,6 +341,9 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
             lane: LaneId::new(index),
             account: AccountId::new(index),
             account_name: account.username.clone(),
+            bot_id: bot
+                .map(|entry| entry.id.clone())
+                .unwrap_or_else(|| account.username.clone()),
             password,
             character: bot.map(|entry| entry.character.clone()).unwrap_or_default(),
             enabled: active_accounts.contains(&account.id),
@@ -361,6 +377,13 @@ mod tests {
 [bots]
 roster_file = "bots.toml"
 
+[memory]
+database_url_env = "TEST_BOT_DB_URL"
+required = false
+
+[debug]
+enabled = true
+
 [runtime_tuning.movement]
 travel_speed_form_min_yards = 30
 path_straightness = 0.75
@@ -389,6 +412,10 @@ character = "Test Character"
 
         let config = load_toml(&config_path).unwrap();
         let defaults = AppConfig::default();
+        assert_eq!(config.memory.database_url_env, "TEST_BOT_DB_URL");
+        assert!(!config.memory.required);
+        assert!(config.debug.enabled);
+        assert_eq!(config.accounts[0].bot_id, "test-bot");
         assert_eq!(config.upstream.auth_port, defaults.upstream.auth_port);
         assert_eq!(config.upstream.world_port, defaults.upstream.world_port);
         assert_eq!(config.proxy.auth_bind, defaults.proxy.auth_bind);

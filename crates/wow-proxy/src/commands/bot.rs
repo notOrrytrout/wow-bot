@@ -5,6 +5,7 @@ pub enum BotCommand {
     On,
     Off,
     Clear(Mission),
+    Forget,
     Status,
     Help,
     Mission(Mission),
@@ -72,7 +73,7 @@ fn take_word(text: &str) -> Option<(&str, &str)> {
 pub const BOT_HELP_LINES: &[&str] = &[
     ".bot quest | .bot gather \"resource\" | .bot grind \"creature\" | .bot pvp bg | .bot goal \"text\"",
     ".bot party [auto|tank|healer|melee|ranged|support] | .bot raid [auto|tank|healer|melee|ranged|support]",
-    ".bot on | .bot off | .bot clear | .bot status | .bot help",
+    ".bot on | .bot off | .bot clear | .bot forget | .bot status | .bot help",
 ];
 
 pub const HELP_LINES: &[&str] = &[
@@ -100,6 +101,9 @@ pub fn parse(text: &str, mission_id: MissionId) -> Result<Option<BotCommand>, St
             id: mission_id,
             ..Mission::idle()
         })));
+    }
+    if rest.eq_ignore_ascii_case("forget") {
+        return Ok(Some(BotCommand::Forget));
     }
     if rest.eq_ignore_ascii_case("status") {
         return Ok(Some(BotCommand::Status));
@@ -211,5 +215,14 @@ mod tests {
         };
         assert_eq!(mission.id, MissionId(11));
         assert_eq!(mission.intent, MissionIntent::Idle);
+    }
+
+    #[test]
+    fn forget_requires_exact_local_command() {
+        assert_eq!(
+            parse(".bot forget", MissionId(12)).unwrap(),
+            Some(BotCommand::Forget)
+        );
+        assert!(parse(".bot forget all", MissionId(12)).unwrap().is_none());
     }
 }
