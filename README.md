@@ -6,11 +6,7 @@ The project targets the Wrath of the Lich King protocol through Tentacli. It use
 
 ## Project status
 
-This project is under development. The source includes quest discovery, acceptance, objective handling, and turn-in paths, plus ground navigation, controlled movement, buff maintenance, and player-to-bot control handoff. Coverage and live verification remain incomplete.
-
-Full class combat rotations, general quest-item use, group and raid automation, and battleground behavior are not complete. Learned gameplay memory does not currently persist across worker restarts.
-
-See [Project details](docs/PROJECT_DETAILS.md) for the runtime design, implemented paths, and known gaps.
+This project is under development. See [Project details](docs/PROJECT_DETAILS.md) for the runtime design, implemented paths, and known gaps.
 See [Capability traceability](docs/TRACEABILITY.md) for implementation and verification status by baseline specification.
 
 ## Requirements
