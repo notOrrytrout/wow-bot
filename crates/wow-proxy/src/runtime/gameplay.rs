@@ -478,8 +478,65 @@ pub(super) fn encode_gameplay_command(
     const CMSG_SET_AMMO: u32 = 0x0268;
     const CMSG_BANKER_ACTIVATE: u32 = 0x01B7;
     const CMSG_AUTOBANK_ITEM: u32 = 0x0283;
+    const CMSG_BATTLEFIELD_STATUS: u32 = 0x02D3;
+    const CMSG_BATTLEFIELD_PORT: u32 = 0x02D5;
+    const CMSG_BATTLEMASTER_JOIN: u32 = 0x02EE;
+    const CMSG_LEAVE_BATTLEFIELD: u32 = 0x02E1;
     match command {
         GameplayCommand::Raw { opcode, body } => Ok(Some((ClientFrame { opcode, body }, None))),
+        GameplayCommand::BattlegroundJoinRandom => {
+            let mut body = Vec::with_capacity(17);
+            body.extend_from_slice(&0_u64.to_le_bytes()); // battlemaster GUID
+            body.extend_from_slice(&32_u32.to_le_bytes()); // Random Battleground
+            body.extend_from_slice(&0_u32.to_le_bytes()); // first available instance
+            body.push(0); // solo queue
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_BATTLEMASTER_JOIN,
+                    body,
+                },
+                None,
+            )))
+        }
+        GameplayCommand::BattlegroundStatus => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_BATTLEFIELD_STATUS,
+                body: Vec::new(),
+            },
+            None,
+        ))),
+        GameplayCommand::BattlegroundPort {
+            battleground_type_id,
+            enter,
+        } => {
+            let mut body = Vec::with_capacity(9);
+            body.extend_from_slice(&[0, 0]); // arena type and client unknown byte
+            body.extend_from_slice(&battleground_type_id.to_le_bytes());
+            body.extend_from_slice(&0x1f90_u16.to_le_bytes());
+            body.push(u8::from(enter));
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_BATTLEFIELD_PORT,
+                    body,
+                },
+                None,
+            )))
+        }
+        GameplayCommand::BattlegroundLeave {
+            battleground_type_id,
+        } => {
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&[0, 0]); // client unknown bytes
+            body.extend_from_slice(&battleground_type_id.to_le_bytes());
+            body.extend_from_slice(&0_u16.to_le_bytes()); // client unknown field
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_LEAVE_BATTLEFIELD,
+                    body,
+                },
+                None,
+            )))
+        }
         GameplayCommand::QueryQuestGivers => Ok(Some((
             ClientFrame {
                 opcode: CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY,
@@ -1502,6 +1559,82 @@ pub(super) fn validate_player_takeover(
 #[cfg(test)]
 mod movement_clock_tests {
     use super::*;
+
+    #[test]
+    fn battleground_commands_use_the_legacy_wotlk_packet_layouts() {
+        let mut clock = MovementClock::default();
+        let (join, _) = encode_gameplay_command(
+            GameplayCommand::BattlegroundJoinRandom,
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(join.opcode, 0x02EE);
+        assert_eq!(join.body.len(), 17);
+        assert_eq!(&join.body[..8], &0_u64.to_le_bytes());
+        assert_eq!(&join.body[8..12], &32_u32.to_le_bytes());
+        assert_eq!(&join.body[12..16], &0_u32.to_le_bytes());
+        assert_eq!(join.body[16], 0);
+
+        let (status, _) = encode_gameplay_command(
+            GameplayCommand::BattlegroundStatus,
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.opcode, 0x02D3);
+        assert!(status.body.is_empty());
+
+        let (port, _) = encode_gameplay_command(
+            GameplayCommand::BattlegroundPort {
+                battleground_type_id: 32,
+                enter: true,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(port.opcode, 0x02D5);
+        assert_eq!(port.body, [0, 0, 32, 0, 0, 0, 0x90, 0x1f, 1]);
+
+        let (leave_queue, _) = encode_gameplay_command(
+            GameplayCommand::BattlegroundPort {
+                battleground_type_id: 32,
+                enter: false,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(leave_queue.opcode, 0x02D5);
+        assert_eq!(leave_queue.body[8], 0);
+
+        let (leave, _) = encode_gameplay_command(
+            GameplayCommand::BattlegroundLeave {
+                battleground_type_id: 32,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(leave.opcode, 0x02E1);
+        assert_eq!(leave.body, [0, 0, 32, 0, 0, 0, 0, 0]);
+    }
 
     #[test]
     fn typed_travel_cleanup_uses_wotlk_mount_and_aura_cancel_commands() {

@@ -135,8 +135,51 @@ fn validate_command(
     command: &GameplayCommand,
 ) -> Result<(), ValidationOutcome> {
     validate_spatial_command(snapshot, command)?;
+    validate_battleground_command(snapshot, command)?;
     validate_quest_command(snapshot, command)?;
     validate_economy_command(snapshot, command)
+}
+
+fn validate_battleground_command(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+) -> Result<(), ValidationOutcome> {
+    use wow_state::battleground::BattlegroundQueueStatus as Status;
+
+    let queues = &snapshot.state.battleground.queues;
+    let current_type = |status: Status, type_id: u32| {
+        queues
+            .values()
+            .any(|queue| queue.status == status && queue.battleground_type_id == Some(type_id))
+    };
+    let invalid = match command {
+        GameplayCommand::BattlegroundJoinRandom => !queues.is_empty(),
+        GameplayCommand::BattlegroundPort {
+            battleground_type_id,
+            enter: true,
+        } => !current_type(Status::WaitJoin, *battleground_type_id),
+        GameplayCommand::BattlegroundPort {
+            battleground_type_id,
+            enter: false,
+        } => ![Status::WaitQueue, Status::WaitJoin]
+            .into_iter()
+            .any(|status| current_type(status, *battleground_type_id)),
+        GameplayCommand::BattlegroundLeave {
+            battleground_type_id,
+        } => ![Status::InProgress, Status::WaitLeave]
+            .into_iter()
+            .any(|status| current_type(status, *battleground_type_id)),
+        GameplayCommand::BattlegroundStatus => false,
+        _ => return Ok(()),
+    };
+    if invalid {
+        return Err(reject(
+            "battleground_state",
+            "action does not match current authoritative battleground queue state",
+            true,
+        ));
+    }
+    Ok(())
 }
 
 fn has_unique_nearby_trusted_mailbox(snapshot: &Snapshot, mailbox: EntityId) -> bool {
@@ -1114,6 +1157,10 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
         GameplayCommand::MailboxList { .. } => PermissionSet::ECONOMY,
         GameplayCommand::BankActivate { .. } => PermissionSet::MAINTENANCE,
         GameplayCommand::BankDeposit { .. } => PermissionSet::MAINTENANCE,
+        GameplayCommand::BattlegroundJoinRandom
+        | GameplayCommand::BattlegroundStatus
+        | GameplayCommand::BattlegroundPort { .. }
+        | GameplayCommand::BattlegroundLeave { .. } => PermissionSet::GROUP,
         GameplayCommand::Chat { .. } => PermissionSet::CHAT,
         GameplayCommand::Raw { .. } => PermissionSet::SERVER_COMMAND,
         GameplayCommand::Interact(_)
@@ -1144,6 +1191,10 @@ fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
             | GameplayCommand::MailTake { .. }
             | GameplayCommand::BankActivate { .. }
             | GameplayCommand::BankDeposit { .. }
+            | GameplayCommand::BattlegroundJoinRandom
+            | GameplayCommand::BattlegroundStatus
+            | GameplayCommand::BattlegroundPort { .. }
+            | GameplayCommand::BattlegroundLeave { .. }
             | GameplayCommand::PetAttack { .. }
     ) && !matches!(origin, PlanOrigin::SystemPolicy | PlanOrigin::Operator)
     {
@@ -1294,6 +1345,118 @@ mod tests {
         state.revision = StateRevision(7);
         state.session.in_world = true;
         Snapshot::from_state(&state)
+    }
+
+    fn battleground_snapshot(
+        status: wow_state::battleground::BattlegroundQueueStatus,
+        battleground_type_id: Option<u32>,
+    ) -> Snapshot {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.battleground.queues.insert(
+            0,
+            wow_state::battleground::BattlegroundQueueState {
+                queue_slot: 0,
+                battleground_type_id,
+                status,
+                map_id: None,
+                invite_timeout_ms: None,
+                elapsed_time_ms: None,
+                auto_leave_time_ms: None,
+                team_alliance: None,
+            },
+        );
+        Snapshot::from_state(&state)
+    }
+
+    #[test]
+    fn battleground_commands_require_matching_observed_queue_state() {
+        use wow_state::battleground::BattlegroundQueueStatus as Status;
+
+        assert!(
+            validate_battleground_command(&snapshot(), &GameplayCommand::BattlegroundStatus)
+                .is_ok()
+        );
+        assert!(
+            validate_battleground_command(&snapshot(), &GameplayCommand::BattlegroundJoinRandom)
+                .is_ok()
+        );
+        assert!(
+            validate_battleground_command(
+                &battleground_snapshot(Status::WaitQueue, Some(32)),
+                &GameplayCommand::BattlegroundJoinRandom
+            )
+            .is_err()
+        );
+        assert!(
+            validate_battleground_command(
+                &battleground_snapshot(Status::WaitJoin, Some(32)),
+                &GameplayCommand::BattlegroundPort {
+                    battleground_type_id: 31,
+                    enter: true,
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_battleground_command(
+                &battleground_snapshot(Status::WaitJoin, Some(32)),
+                &GameplayCommand::BattlegroundPort {
+                    battleground_type_id: 32,
+                    enter: true,
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_battleground_command(
+                &battleground_snapshot(Status::InProgress, Some(32)),
+                &GameplayCommand::BattlegroundPort {
+                    battleground_type_id: 32,
+                    enter: false,
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_battleground_command(
+                &battleground_snapshot(Status::WaitQueue, Some(32)),
+                &GameplayCommand::BattlegroundPort {
+                    battleground_type_id: 32,
+                    enter: false,
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_battleground_command(
+                &battleground_snapshot(Status::InProgress, Some(32)),
+                &GameplayCommand::BattlegroundLeave {
+                    battleground_type_id: 32,
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn battleground_commands_require_group_permission_and_system_policy_origin() {
+        assert_eq!(
+            required_permission(&GameplayCommand::BattlegroundJoinRandom),
+            PermissionSet::GROUP
+        );
+        assert!(!origin_authorized(
+            PlanOrigin::Llm,
+            &GameplayCommand::BattlegroundJoinRandom
+        ));
+        assert!(!origin_authorized(
+            PlanOrigin::GroupPolicy,
+            &GameplayCommand::BattlegroundStatus
+        ));
+        assert!(origin_authorized(
+            PlanOrigin::SystemPolicy,
+            &GameplayCommand::BattlegroundStatus
+        ));
     }
 
     fn mailbox_snapshot(cod: Option<u64>, free_slots: u16) -> Snapshot {

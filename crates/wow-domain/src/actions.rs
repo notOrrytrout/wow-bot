@@ -184,6 +184,19 @@ pub enum GameplayCommand {
         spell: u32,
         target: Option<EntityId>,
     },
+    /// Request the WotLK random battleground queue.
+    BattlegroundJoinRandom,
+    /// Refresh server-owned battleground queue state.
+    BattlegroundStatus,
+    /// Accept or decline a server-reported queue invitation.
+    BattlegroundPort {
+        battleground_type_id: u32,
+        enter: bool,
+    },
+    /// Leave an active battleground match.
+    BattlegroundLeave {
+        battleground_type_id: u32,
+    },
     Chat {
         channel: u32,
         text: String,
@@ -215,6 +228,10 @@ impl PlanOrigin {
                     | GameplayCommand::AuctionBuy { .. }
                     | GameplayCommand::MailTake { .. }
                     | GameplayCommand::BankDeposit { .. }
+                    | GameplayCommand::BattlegroundJoinRandom
+                    | GameplayCommand::BattlegroundStatus
+                    | GameplayCommand::BattlegroundPort { .. }
+                    | GameplayCommand::BattlegroundLeave { .. }
             ),
             Self::Recovery => !matches!(
                 command,

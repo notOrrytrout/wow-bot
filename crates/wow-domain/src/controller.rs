@@ -238,6 +238,10 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::QueryQuestGivers
         | GameplayCommand::QueryQuest { .. }
         | GameplayCommand::QueryItem { .. }
+        | GameplayCommand::BattlegroundJoinRandom
+        | GameplayCommand::BattlegroundStatus
+        | GameplayCommand::BattlegroundPort { .. }
+        | GameplayCommand::BattlegroundLeave { .. }
         | GameplayCommand::Chat { .. }
         | GameplayCommand::Raw { .. } => return true,
     };
