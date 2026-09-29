@@ -26,6 +26,12 @@ pub enum GameplayCommand {
         orientation: f32,
     },
     StopMovement,
+    /// Cancel the player's currently active mount aura.
+    CancelMount,
+    /// Cancel one observed player aura before an on-foot action.
+    CancelAura {
+        spell: u32,
+    },
     ReleaseSpirit,
     QueryCorpse,
     ReclaimCorpse {
@@ -203,6 +209,8 @@ impl PlanOrigin {
                 command,
                 GameplayCommand::Raw { .. }
                     | GameplayCommand::Chat { .. }
+                    | GameplayCommand::CancelMount
+                    | GameplayCommand::CancelAura { .. }
                     | GameplayCommand::TradeAccept { .. }
                     | GameplayCommand::AuctionBuy { .. }
                     | GameplayCommand::MailTake { .. }

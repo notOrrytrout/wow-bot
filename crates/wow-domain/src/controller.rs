@@ -229,6 +229,8 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::PetSetAutocast { .. }
         | GameplayCommand::Fish
         | GameplayCommand::StopMovement
+        | GameplayCommand::CancelMount
+        | GameplayCommand::CancelAura { .. }
         | GameplayCommand::ReleaseSpirit
         | GameplayCommand::QueryCorpse
         | GameplayCommand::TradeAccept { .. }

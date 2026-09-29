@@ -425,9 +425,25 @@ enum DispatchOutcome {
     Sent,
     DeferredMovement,
     DeferredSpatial,
+    DeferredDismount,
     Rejected,
     TransportClosed,
 }
+
+struct PendingDismount {
+    action: Option<ProposedAction>,
+    quest_action: Option<PendingQuestAction>,
+    mission_revision: MissionRevision,
+    player: Option<EntityId>,
+    started_at: Instant,
+    last_sent_at: Option<Instant>,
+    attempts: u8,
+}
+
+const TRAVEL_FORM_SPELL_IDS: [u32; 2] = [783, 2645];
+const DISMOUNT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const DISMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DISMOUNT_ATTEMPTS: u8 = 5;
 
 pub struct LaneEngine {
     pub state: LaneState,
@@ -448,6 +464,7 @@ pub struct LaneEngine {
     next_movement: u64,
     route_job: Option<RoutePlanJob>,
     pending_facing: Option<PendingFacing>,
+    pending_dismount: Option<PendingDismount>,
     assumed_facing: Option<(EntityId, f32, Instant)>,
     pending_quest_action: Option<PendingQuestAction>,
     interaction_retry_after: BTreeMap<(u32, EntityId), (u8, Instant)>,
@@ -540,6 +557,7 @@ impl LaneEngine {
             next_movement: 1,
             route_job: None,
             pending_facing: None,
+            pending_dismount: None,
             assumed_facing: None,
             pending_quest_action: None,
             interaction_retry_after: BTreeMap::new(),
@@ -640,6 +658,159 @@ impl LaneEngine {
         if let Some(diagnostics) = &self.diagnostics {
             diagnostics.record(stream, self.state.lane, record_type, fields);
         }
+    }
+
+    fn action_requires_on_foot(command: &GameplayCommand) -> bool {
+        matches!(
+            command,
+            GameplayCommand::Attack(_)
+                | GameplayCommand::Cast { .. }
+                | GameplayCommand::CastOnItem { .. }
+                | GameplayCommand::AcceptQuest { .. }
+                | GameplayCommand::TurnInQuest { .. }
+                | GameplayCommand::RequestQuestReward { .. }
+                | GameplayCommand::ChooseQuestReward { .. }
+                | GameplayCommand::Interact(_)
+                | GameplayCommand::UseGameObject(_)
+                | GameplayCommand::CastGameObject { .. }
+                | GameplayCommand::Gather(_)
+                | GameplayCommand::VendorList { .. }
+                | GameplayCommand::VendorBuy { .. }
+                | GameplayCommand::VendorSell { .. }
+                | GameplayCommand::RepairEquipment { .. }
+                | GameplayCommand::TrainerList { .. }
+                | GameplayCommand::TrainerBuy { .. }
+                | GameplayCommand::BankActivate { .. }
+                | GameplayCommand::BankDeposit { .. }
+                | GameplayCommand::AuctionBuy { .. }
+                | GameplayCommand::TradeAccept { .. }
+                | GameplayCommand::MailboxList { .. }
+                | GameplayCommand::MailTake { .. }
+        )
+    }
+
+    fn observed_travel_forms(&self) -> Vec<u32> {
+        let Some(player) = self.authoritative_player_id() else {
+            return Vec::new();
+        };
+        let auras = self.state.authoritative.auras.spells(player);
+        TRAVEL_FORM_SPELL_IDS
+            .into_iter()
+            .filter(|spell| auras.contains(spell))
+            .collect()
+    }
+
+    fn authoritative_player_id(&self) -> Option<EntityId> {
+        self.state
+            .authoritative
+            .session
+            .character_guid
+            .map(EntityId)
+    }
+
+    fn observed_mounted(&self) -> Option<bool> {
+        self.authoritative_player_id()
+            .and_then(|player| self.state.authoritative.entities.0.get(&player))
+            .and_then(wow_state::entities::EntityState::mounted)
+    }
+
+    fn player_is_on_foot(&self) -> bool {
+        self.observed_mounted() == Some(false) && self.observed_travel_forms().is_empty()
+    }
+
+    fn travel_cleanup_required(&self) -> bool {
+        self.observed_mounted() == Some(true) || !self.observed_travel_forms().is_empty()
+    }
+
+    fn begin_travel_cleanup(&mut self) {
+        if self.pending_dismount.is_none() {
+            self.pending_dismount = Some(PendingDismount {
+                action: None,
+                quest_action: None,
+                mission_revision: self.state.mission_revision,
+                player: self.authoritative_player_id(),
+                started_at: Instant::now(),
+                last_sent_at: None,
+                attempts: 0,
+            });
+        }
+    }
+
+    async fn service_pending_dismount(&mut self) -> bool {
+        let Some(pending) = self.pending_dismount.as_ref() else {
+            return true;
+        };
+        if !self.state.runnable() || self.state.activation != ActivationStage::Act {
+            self.pending_dismount = None;
+            return true;
+        }
+        if pending.mission_revision != self.state.mission_revision
+            || pending.player != self.authoritative_player_id()
+            || pending
+                .action
+                .as_ref()
+                .is_some_and(|action| action.stamp.mission != self.state.stamp().mission)
+        {
+            tracing::info!(lane=?self.state.lane, command=?pending.action.as_ref().map(|action| &action.command), "travel-form cleanup canceled because its mission or player changed");
+            self.pending_dismount = None;
+            return true;
+        }
+        if self.player_is_on_foot() {
+            let Some(mut pending) = self.pending_dismount.take() else {
+                return true;
+            };
+            if let Some(mut action) = pending.action.take() {
+                action.stamp = self.state.stamp();
+                tracing::info!(lane=?self.state.lane, command=?action.command, attempts=pending.attempts, "authoritative on-foot state confirmed; resuming blocked action");
+                if let Some(quest_action) = pending.quest_action.take() {
+                    return self
+                        .dispatch_quest_semantic(action.command, quest_action)
+                        .await;
+                }
+                let _ = self.submit(action).await;
+            }
+            return true;
+        }
+        let now = Instant::now();
+        let expired = self.pending_dismount.as_ref().is_some_and(|pending| {
+            now.saturating_duration_since(pending.started_at) >= DISMOUNT_TIMEOUT
+                || pending.attempts >= MAX_DISMOUNT_ATTEMPTS
+        });
+        if expired {
+            let pending = self
+                .pending_dismount
+                .take()
+                .expect("pending cleanup was checked");
+            tracing::warn!(lane=?self.state.lane, command=?pending.action.map(|action| action.command), attempts=pending.attempts, timeout_ms=DISMOUNT_TIMEOUT.as_millis(), "travel-form cleanup stopped without authoritative on-foot confirmation");
+            self.waiting(
+                "travel-form cleanup was not confirmed; blocked action was canceled".into(),
+            );
+            return true;
+        }
+        let due = self.pending_dismount.as_ref().is_some_and(|pending| {
+            pending
+                .last_sent_at
+                .is_none_or(|last| now.saturating_duration_since(last) >= DISMOUNT_RETRY_INTERVAL)
+        });
+        if due {
+            let mounted = self.observed_mounted();
+            if mounted == Some(true) {
+                let _ = self
+                    .propose_command(GameplayCommand::CancelMount, false)
+                    .await;
+            }
+            for spell in self.observed_travel_forms() {
+                let _ = self
+                    .propose_command(GameplayCommand::CancelAura { spell }, false)
+                    .await;
+            }
+            if let Some(pending) = self.pending_dismount.as_mut() {
+                pending.last_sent_at = Some(now);
+                pending.attempts = pending.attempts.saturating_add(1);
+            }
+        }
+        self.waiting("travel-form cleanup is waiting for authoritative on-foot state".into());
+        true
     }
 
     pub async fn run(mut self) {
@@ -1389,14 +1560,17 @@ impl LaneEngine {
 
     async fn tick_mission(&mut self) -> bool {
         if !self.state.runnable() {
+            self.pending_dismount = None;
             self.waiting(format!("lane paused by {:?}", self.state.pause));
             return true;
         }
         if self.state.activation != ActivationStage::Act {
+            self.pending_dismount = None;
             self.waiting(format!("activation stage is {:?}", self.state.activation));
             return true;
         }
         if !self.state.authoritative.session.in_world {
+            self.pending_dismount = None;
             self.waiting("configured world session is not yet authoritative".to_owned());
             return true;
         }
@@ -1421,11 +1595,21 @@ impl LaneEngine {
             self.last_logged_player_life_status = Some(life_status);
         }
         if life_status.requires_recovery() {
+            self.pending_dismount = None;
             return self.tick_death_recovery().await;
         }
         self.corpse_reclaim_attempts = 0;
         let snapshot = Snapshot::from_state(&self.state.authoritative);
         if let Some(attacker) = wow_policy::combat::engagement::survival_attacker(&snapshot) {
+            if self
+                .pending_dismount
+                .as_ref()
+                .and_then(|pending| pending.action.as_ref())
+                .is_some_and(|action| action.origin == PlanOrigin::Recovery)
+            {
+                return self.service_pending_dismount().await;
+            }
+            self.pending_dismount = None;
             if self
                 .pending_movement
                 .as_ref()
@@ -1449,6 +1633,12 @@ impl LaneEngine {
             tracing::info!(lane=?self.state.lane, "survival approach ended because no authoritative attacker remains");
             self.stop_active_movement_for_handoff("survival approach ended")
                 .await;
+        }
+        if self.pending_dismount.is_some() && !self.service_pending_dismount().await {
+            return false;
+        }
+        if self.pending_dismount.is_some() {
+            return true;
         }
         if self
             .pending_movement
@@ -3797,6 +3987,10 @@ impl LaneEngine {
         }
         if distance <= movement.acceptable_range {
             tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, remaining=distance, purpose=?movement.purpose, "owned movement work reached interaction envelope");
+            let mounted = self.observed_mounted() == Some(true);
+            if mounted || !self.observed_travel_forms().is_empty() {
+                self.begin_travel_cleanup();
+            }
             self.record_search_arrival(&movement);
             self.stop_owned_movement(movement.purpose).await;
             // Keep the quest focus after reaching a search point. Reaching a
@@ -5934,6 +6128,11 @@ impl LaneEngine {
                     movement.resume_pending = Some(pending);
                 }
             }
+            DispatchOutcome::DeferredDismount => {
+                if let Some(dismount) = self.pending_dismount.as_mut() {
+                    dismount.quest_action = Some(pending);
+                }
+            }
             _ => {}
         }
         true
@@ -6078,6 +6277,36 @@ impl LaneEngine {
         }
         let original_command = action.command.clone();
         let action_origin = action.origin;
+        if Self::action_requires_on_foot(&original_command)
+            && (self.travel_cleanup_required()
+                || (self.pending_dismount.is_some() && !self.player_is_on_foot()))
+        {
+            if let Some(pending) = self.pending_dismount.as_mut() {
+                if pending.action.is_none()
+                    || pending.action.as_ref().is_some_and(|current| {
+                        current.command == original_command && current.origin == action_origin
+                    })
+                    || action_origin == PlanOrigin::Recovery
+                {
+                    pending.action = Some(action);
+                    if action_origin == PlanOrigin::Recovery {
+                        pending.quest_action = None;
+                    }
+                }
+            } else {
+                self.pending_dismount = Some(PendingDismount {
+                    action: Some(action),
+                    quest_action: None,
+                    mission_revision: self.state.mission_revision,
+                    player: self.authoritative_player_id(),
+                    started_at: Instant::now(),
+                    last_sent_at: None,
+                    attempts: 0,
+                });
+            }
+            self.last_dispatch = DispatchOutcome::DeferredDismount;
+            return true;
+        }
         let mut snapshot = Snapshot::from_state(&self.state.authoritative);
         if crate::action::spatial::profile(&original_command).is_some() {
             if let Some(pending) = self.pending_facing {
@@ -7980,6 +8209,209 @@ mod tests {
             activity: ActivityArbiter::default(),
         };
         (LaneEngine::new(state, lane_rx, proxy_tx), proxy_rx)
+    }
+
+    fn mounted_combat_fixture() -> (LaneEngine, mpsc::Receiver<WorkerToProxy>) {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.entities.0.insert(
+            EntityId(1),
+            wow_state::entities::EntityState {
+                id: EntityId(1),
+                kind: wow_state::entities::EntityKind::Player,
+                health: Some((100, 100)),
+                mount_display_id: Some(123),
+                unit_flags: Some(0),
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            EntityId(2),
+            wow_state::entities::EntityState {
+                id: EntityId(2),
+                kind: wow_state::entities::EntityKind::Unit,
+                hostile: true,
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+        let mission = Mission {
+            id: MissionId(91),
+            intent: MissionIntent::Goal {
+                text: "test dismount lifecycle".into(),
+            },
+            permissions: PermissionSet::MOVE | PermissionSet::COMBAT,
+        };
+        test_engine(mission, authoritative)
+    }
+
+    #[test]
+    fn on_foot_gate_covers_combat_and_service_interactions() {
+        let commands = [
+            GameplayCommand::Attack(EntityId(1)),
+            GameplayCommand::Cast {
+                spell: 1,
+                target: None,
+            },
+            GameplayCommand::AcceptQuest {
+                quest: 1,
+                giver: EntityId(1),
+            },
+            GameplayCommand::UseGameObject(EntityId(1)),
+            GameplayCommand::Gather(EntityId(1)),
+            GameplayCommand::VendorBuy {
+                vendor: EntityId(1),
+                item: 1,
+                slot: 0,
+                count: 1,
+            },
+            GameplayCommand::RepairEquipment {
+                vendor: EntityId(1),
+            },
+            GameplayCommand::TrainerList {
+                trainer: EntityId(1),
+            },
+            GameplayCommand::BankActivate {
+                banker: EntityId(1),
+            },
+            GameplayCommand::AuctionBuy {
+                query_generation: 1,
+                listing_id: 1,
+                max_buyout: 1,
+            },
+            GameplayCommand::TradeAccept {
+                generation: 1,
+                gift_only: true,
+            },
+            GameplayCommand::MailboxList {
+                mailbox: EntityId(1),
+            },
+        ];
+        assert!(commands.iter().all(LaneEngine::action_requires_on_foot));
+        assert!(!LaneEngine::action_requires_on_foot(
+            &GameplayCommand::UseItem {
+                item: 1,
+                target: None,
+            }
+        ));
+        assert!(!LaneEngine::action_requires_on_foot(
+            &GameplayCommand::MoveTo(Vec3::new(1.0, 0.0, 0.0),)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mounted_on_foot_action_waits_for_authoritative_mount_and_form_removal() {
+        let (mut engine, mut proxy) = mounted_combat_fixture();
+        engine.state.authoritative.auras.by_entity.insert(
+            EntityId(1),
+            [(
+                1,
+                wow_state::auras::AuraInstance {
+                    slot: 1,
+                    spell: 783,
+                    positive: Some(true),
+                    caster: Some(EntityId(1)),
+                    max_duration_ms: None,
+                    remaining_ms: None,
+                    observed_at_ms: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let action = ProposedAction {
+            id: ActionId(44),
+            task: TaskId(44),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: engine.state.stamp(),
+            command: GameplayCommand::Attack(EntityId(2)),
+        };
+
+        assert!(engine.submit(action).await);
+        assert_eq!(engine.last_dispatch, DispatchOutcome::DeferredDismount);
+        assert!(proxy.try_recv().is_err());
+
+        assert!(engine.service_pending_dismount().await);
+        let mut observed_cancel_mount = false;
+        let mut observed_cancel_form = false;
+        while let Ok(WorkerToProxy::Action(action)) = proxy.try_recv() {
+            match action.command() {
+                GameplayCommand::CancelMount => observed_cancel_mount = true,
+                GameplayCommand::CancelAura { spell: 783 } => observed_cancel_form = true,
+                command => panic!("unexpected cleanup command: {command:?}"),
+            }
+        }
+        assert!(observed_cancel_mount);
+        assert!(observed_cancel_form);
+
+        engine
+            .state
+            .authoritative
+            .entities
+            .0
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .mount_display_id = Some(0);
+        engine
+            .state
+            .authoritative
+            .auras
+            .by_entity
+            .remove(&EntityId(1));
+        assert!(engine.service_pending_dismount().await);
+        let Some(WorkerToProxy::Action(action)) = proxy.try_recv().ok() else {
+            panic!("expected the held attack after authoritative cleanup")
+        };
+        assert_eq!(action.command(), &GameplayCommand::Attack(EntityId(2)));
+        assert!(engine.pending_dismount.is_none());
+    }
+
+    #[tokio::test]
+    async fn travel_cleanup_cancels_after_timeout_and_does_not_resume_stale_work() {
+        let (mut engine, mut proxy) = mounted_combat_fixture();
+        let action = ProposedAction {
+            id: ActionId(45),
+            task: TaskId(45),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: engine.state.stamp(),
+            command: GameplayCommand::Attack(EntityId(2)),
+        };
+        assert!(engine.submit(action).await);
+        for attempt in 0..MAX_DISMOUNT_ATTEMPTS {
+            if attempt > 0 {
+                engine.pending_dismount.as_mut().unwrap().last_sent_at =
+                    Some(Instant::now() - DISMOUNT_RETRY_INTERVAL);
+            }
+            assert!(engine.service_pending_dismount().await);
+            while proxy.try_recv().is_ok() {}
+        }
+        assert_eq!(
+            engine.pending_dismount.as_ref().unwrap().attempts,
+            MAX_DISMOUNT_ATTEMPTS
+        );
+        assert!(engine.service_pending_dismount().await);
+        assert!(engine.pending_dismount.is_none());
+        assert!(proxy.try_recv().is_err());
+
+        let action = ProposedAction {
+            id: ActionId(46),
+            task: TaskId(46),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: engine.state.stamp(),
+            command: GameplayCommand::Attack(EntityId(2)),
+        };
+        assert!(engine.submit(action).await);
+        engine.state.mission_revision = MissionRevision(1);
+        assert!(engine.service_pending_dismount().await);
+        assert!(engine.pending_dismount.is_none());
+        assert!(proxy.try_recv().is_err());
+
+        engine.begin_travel_cleanup();
+        engine.state.mission_revision = MissionRevision(2);
+        assert!(engine.service_pending_dismount().await);
+        assert!(engine.pending_dismount.is_none());
+        assert!(proxy.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -721,6 +721,20 @@ pub(super) fn encode_gameplay_command(
             },
             None,
         ))),
+        GameplayCommand::CancelMount => Ok(Some((
+            ClientFrame {
+                opcode: 0x0375,
+                body: Vec::new(),
+            },
+            None,
+        ))),
+        GameplayCommand::CancelAura { spell } => Ok(Some((
+            ClientFrame {
+                opcode: 0x0136,
+                body: spell.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
         GameplayCommand::Loot(entity) => Ok(Some((
             ClientFrame {
                 opcode: CMSG_LOOT,
@@ -1488,6 +1502,34 @@ pub(super) fn validate_player_takeover(
 #[cfg(test)]
 mod movement_clock_tests {
     use super::*;
+
+    #[test]
+    fn typed_travel_cleanup_uses_wotlk_mount_and_aura_cancel_commands() {
+        let mut clock = MovementClock::default();
+        let (mount, _) = encode_gameplay_command(
+            GameplayCommand::CancelMount,
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mount.opcode, 0x0375);
+        assert!(mount.body.is_empty());
+
+        let (aura, _) = encode_gameplay_command(
+            GameplayCommand::CancelAura { spell: 783 },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(aura.opcode, 0x0136);
+        assert_eq!(aura.body, 783_u32.to_le_bytes());
+    }
 
     #[test]
     fn repair_all_uses_the_observed_vendor_and_never_uses_guild_funds() {

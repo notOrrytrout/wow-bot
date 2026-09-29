@@ -1068,7 +1068,9 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
     match command {
         GameplayCommand::MoveTo(_)
         | GameplayCommand::FaceDirection { .. }
-        | GameplayCommand::StopMovement => PermissionSet::MOVE,
+        | GameplayCommand::StopMovement
+        | GameplayCommand::CancelMount
+        | GameplayCommand::CancelAura { .. } => PermissionSet::MOVE,
         GameplayCommand::ReleaseSpirit
         | GameplayCommand::QueryCorpse
         | GameplayCommand::ReclaimCorpse { .. } => PermissionSet::empty(),
@@ -1125,7 +1127,9 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
 fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
     if matches!(
         command,
-        GameplayCommand::EquipItem { .. }
+        GameplayCommand::CancelMount
+            | GameplayCommand::CancelAura { .. }
+            | GameplayCommand::EquipItem { .. }
             | GameplayCommand::RepairEquipment { .. }
             | GameplayCommand::SetAmmo { .. }
             | GameplayCommand::PetSetReaction { .. }
@@ -1173,6 +1177,8 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::TrainerBuy { .. }
                 | GameplayCommand::MailboxList { .. }
                 | GameplayCommand::QueryItem { .. }
+                | GameplayCommand::CancelMount
+                | GameplayCommand::CancelAura { .. }
         ),
         ActivationStage::Move => matches!(
             command,
@@ -1199,6 +1205,8 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::MoveTo(_)
                 | GameplayCommand::FaceDirection { .. }
                 | GameplayCommand::StopMovement
+                | GameplayCommand::CancelMount
+                | GameplayCommand::CancelAura { .. }
         ),
         ActivationStage::Act => true,
     }
@@ -2285,5 +2293,66 @@ mod tests {
         assert!(
             matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "origin_forbidden")
         );
+    }
+
+    #[test]
+    fn travel_cleanup_commands_are_reserved_for_policy_or_operator_actions() {
+        assert!(origin_authorized(
+            PlanOrigin::SystemPolicy,
+            &GameplayCommand::CancelMount
+        ));
+        assert!(origin_authorized(
+            PlanOrigin::Operator,
+            &GameplayCommand::CancelAura { spell: 783 }
+        ));
+        assert!(!origin_authorized(
+            PlanOrigin::Llm,
+            &GameplayCommand::CancelAura { spell: 783 }
+        ));
+        assert!(!origin_authorized(
+            PlanOrigin::Recovery,
+            &GameplayCommand::CancelMount
+        ));
+
+        let system_action = ProposedAction {
+            id: ActionId(1),
+            task: TaskId(1),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: base_stamp(),
+            command: GameplayCommand::CancelMount,
+        };
+        let context = ValidationContext {
+            current: base_stamp(),
+            stage: ActivationStage::Act,
+            bank_keep_item_ids: Vec::new(),
+            auto_professions_enabled: true,
+            permissions: PermissionSet::MOVE,
+        };
+        assert!(matches!(
+            ActionValidator::validate(
+                &snapshot(),
+                ValidationContext {
+                    current: base_stamp(),
+                    stage: ActivationStage::Act,
+                    bank_keep_item_ids: Vec::new(),
+                    auto_professions_enabled: true,
+                    permissions: PermissionSet::MOVE,
+                },
+                system_action,
+            ),
+            ValidationOutcome::Sendable(_)
+        ));
+
+        let llm_action = ProposedAction {
+            id: ActionId(2),
+            task: TaskId(2),
+            origin: PlanOrigin::Llm,
+            stamp: base_stamp(),
+            command: GameplayCommand::CancelAura { spell: 783 },
+        };
+        assert!(matches!(
+            ActionValidator::validate(&snapshot(), context, llm_action),
+            ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "origin_forbidden"
+        ));
     }
 }
