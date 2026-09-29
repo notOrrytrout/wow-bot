@@ -2537,6 +2537,25 @@ impl LaneEngine {
                     .await,
                 )
             }
+            wow_policy::maintenance::MaintenanceDecision::SetAmmo { item } => {
+                self.last_maintenance_status = Some(format!("set_ranged_ammo:{item}"));
+                self.maintenance_retry_after.insert(
+                    (
+                        item,
+                        snapshot
+                            .state
+                            .session
+                            .character_guid
+                            .map(EntityId)
+                            .unwrap_or_default(),
+                    ),
+                    now + Duration::from_secs(3_600),
+                );
+                Some(
+                    self.propose_command(GameplayCommand::SetAmmo { item }, false)
+                        .await,
+                )
+            }
             wow_policy::maintenance::MaintenanceDecision::TrainerList { trainer } => {
                 self.last_maintenance_status = Some(format!("class_trainer_list:{}", trainer.0));
                 self.maintenance_retry_after

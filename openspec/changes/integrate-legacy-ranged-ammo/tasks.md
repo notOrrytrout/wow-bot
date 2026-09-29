@@ -1,0 +1,7 @@
+- [x] Require authoritative ranged equipment, ranged item template, inventory instances, and occupied backpack templates.
+- [x] Calculate a five-minute minimum and fifteen-minute target from ranged weapon delay.
+- [x] Buy only a compatible fixed-price offer from the existing nearby vendor path, with one-lot, stock, class/level, and reserve checks.
+- [x] Reuse the bounded inventory-change confirmation before another vendor purchase.
+- [x] Add typed ammo selection with final validation against current weapon metadata and observed bag contents.
+- [x] Add focused policy and packet tests.
+- [x] Run formatting, relevant focused tests, workspace check, and review the complete diff.

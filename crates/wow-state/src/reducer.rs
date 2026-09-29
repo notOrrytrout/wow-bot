@@ -48,6 +48,8 @@ fn clear_world_transients(state: &mut AuthoritativeState) {
     state.inventory.current_loot_owner = None;
     state.inventory.vendor = None;
     state.inventory.vendor_inventory = None;
+    state.inventory.instances_authoritative = false;
+    state.inventory.equipment_slots_authoritative = false;
     state.inventory.equipment_condition = Default::default();
     state.inventory.trade = Default::default();
     state.inventory.auction = Default::default();
@@ -306,6 +308,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 .into_iter()
                 .map(|instance| (instance.guid, instance))
                 .collect();
+            state.inventory.instances_authoritative = true;
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::EquipmentCondition(condition) => {
@@ -1037,6 +1040,7 @@ mod tests {
         );
         assert_eq!(state.inventory.instances.len(), 2);
         assert_eq!(state.inventory.usable_instance(99), Some(&second));
+        assert!(state.inventory.instances_authoritative);
     }
 
     #[test]
@@ -1052,6 +1056,8 @@ mod tests {
             ProtocolObservation::EquipmentCondition(condition),
         );
         assert_eq!(state.inventory.equipment_condition, condition);
+        state.inventory.instances_authoritative = true;
+        state.inventory.equipment_slots_authoritative = true;
 
         reduce(
             &mut state,
@@ -1068,6 +1074,8 @@ mod tests {
             state.inventory.equipment_condition,
             crate::inventory::EquipmentCondition::default()
         );
+        assert!(!state.inventory.instances_authoritative);
+        assert!(!state.inventory.equipment_slots_authoritative);
     }
 
     #[test]

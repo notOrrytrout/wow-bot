@@ -120,6 +120,9 @@ pub enum MaintenanceDecision {
         slot: u32,
         lots: u32,
     },
+    SetAmmo {
+        item: u32,
+    },
     TrainerList {
         trainer: EntityId,
     },
@@ -278,6 +281,11 @@ pub fn decide_next_with_nearby_services(
         return decision;
     }
     if let Some(decision) = recovery_supply_restock(snapshot, retry_after, now, nearby_sell_vendor)
+    {
+        return decision;
+    }
+    if let Some(decision) =
+        ranged_ammo_maintenance(snapshot, retry_after, now, nearby_sell_vendor, player)
     {
         return decision;
     }
@@ -1069,6 +1077,187 @@ fn poison_count(snapshot: &Snapshot, family: &str) -> u32 {
             .then_some(instance.count)
         })
         .fold(0_u32, u32::saturating_add)
+}
+
+fn ranged_ammo_maintenance(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+    nearby_vendor: Option<EntityId>,
+    player: EntityId,
+) -> Option<MaintenanceDecision> {
+    const RANGED_SLOT: u8 = 17;
+
+    let inventory = &snapshot.state.inventory;
+    if !inventory.equipment_slots_authoritative || !inventory.instances_authoritative {
+        return None;
+    }
+    let ranged_item = *inventory.equipped_items.get(&RANGED_SLOT)?;
+    if ranged_item == 0 {
+        return None;
+    }
+    let Some(ranged) = inventory.item_metadata.get(&ranged_item) else {
+        return (!retry_after
+            .get(&(ranged_item, EntityId(0)))
+            .is_some_and(|deadline| *deadline > now))
+        .then_some(MaintenanceDecision::QueryItem { item: ranged_item });
+    };
+    if ranged.ammo_type == 0 || ranged.delay_ms == 0 {
+        return None;
+    }
+    let Some(_player_level) = snapshot.state.entities.0.get(&player)?.level else {
+        return None;
+    };
+
+    // Unknown bag templates can hide compatible ammo, so wait until the
+    // authoritative inventory snapshot is fully classified before restocking.
+    if let Some(instance) = inventory
+        .instances
+        .values()
+        .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+        .find(|instance| !inventory.item_metadata.contains_key(&instance.item))
+    {
+        return (!retry_after
+            .get(&(instance.item, EntityId(0)))
+            .is_some_and(|deadline| *deadline > now))
+        .then_some(MaintenanceDecision::QueryItem {
+            item: instance.item,
+        });
+    }
+
+    let compatible = |item: u32| ranged_ammo_item_is_compatible(snapshot, item);
+    let current_count = inventory
+        .instances
+        .values()
+        .filter(|instance| instance.backpack_slot >= 23 && compatible(instance.item))
+        .map(|instance| instance.count)
+        .fold(0_u32, u32::saturating_add);
+    let (_, target_count) = ranged_ammo_target_counts(ranged.delay_ms)?;
+
+    if current_count < target_count
+        && let Some(vendor) = nearby_vendor
+    {
+        let offers = inventory
+            .vendor_inventory
+            .as_ref()
+            .filter(|offers| offers.vendor == vendor);
+        if inventory.vendor != Some(vendor) || offers.is_none() {
+            if !retry_after
+                .get(&(0, vendor))
+                .is_some_and(|deadline| *deadline > now)
+            {
+                return Some(MaintenanceDecision::VendorList { vendor });
+            }
+        } else if let Some(offers) = offers {
+            if let Some(offer) = offers.offers.iter().find(|offer| {
+                offer.extended_cost == 0
+                    && offer.buy_count > 0
+                    && !inventory.item_metadata.contains_key(&offer.item)
+                    && !retry_after
+                        .get(&(offer.item, EntityId(0)))
+                        .is_some_and(|deadline| *deadline > now)
+            }) {
+                return Some(MaintenanceDecision::QueryItem { item: offer.item });
+            }
+            if !retry_after
+                .get(&(u32::MAX, vendor))
+                .is_some_and(|deadline| *deadline > now)
+            {
+                let spendable = inventory
+                    .money
+                    .saturating_sub(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER);
+                if let Some(offer) = offers
+                    .offers
+                    .iter()
+                    .filter(|offer| offer.extended_cost == 0 && offer.buy_count > 0)
+                    .filter(|offer| offer.stock.is_none_or(|stock| stock >= offer.buy_count))
+                    .filter(|offer| u64::from(offer.price_copper) <= spendable)
+                    .filter(|offer| compatible(offer.item))
+                    .min_by_key(|offer| (offer.price_copper, offer.slot))
+                {
+                    return Some(MaintenanceDecision::RecoveryVendorBuy {
+                        vendor,
+                        item: offer.item,
+                        slot: offer.slot,
+                        lots: wow_domain::MAX_MAINTENANCE_VENDOR_BUY_LOTS,
+                    });
+                }
+            }
+        }
+    }
+
+    // The protocol has no reliable selected-ammo observation. Use a long
+    // per-item retry bound and only send after an authoritative bag snapshot
+    // proves that the compatible projectile stack exists.
+    if current_count > 0
+        && let Some(item) = inventory
+            .instances
+            .values()
+            .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+            .filter(|instance| compatible(instance.item))
+            .max_by_key(|instance| (instance.count, std::cmp::Reverse(instance.item)))
+            .map(|instance| instance.item)
+        && !retry_after
+            .get(&(item, player))
+            .is_some_and(|deadline| *deadline > now)
+    {
+        return Some(MaintenanceDecision::SetAmmo { item });
+    }
+    None
+}
+
+fn ranged_ammo_target_counts(delay_ms: u32) -> Option<(u32, u32)> {
+    if delay_ms == 0 {
+        return None;
+    }
+    let shots_per_minute = 60_000_u32.checked_div(delay_ms)?.max(1);
+    let minimum = shots_per_minute.saturating_mul(5);
+    let target = minimum.max(shots_per_minute.saturating_mul(15));
+    Some((minimum, target))
+}
+
+/// Return whether authoritative item templates prove the item is usable with
+/// the currently equipped ranged weapon.
+pub fn ranged_ammo_item_is_compatible(snapshot: &Snapshot, item: u32) -> bool {
+    let inventory = &snapshot.state.inventory;
+    if !inventory.equipment_slots_authoritative {
+        return false;
+    }
+    let Some(ranged_item) = inventory
+        .equipped_items
+        .get(&17)
+        .copied()
+        .filter(|item| *item != 0)
+    else {
+        return false;
+    };
+    let Some(ranged) = inventory.item_metadata.get(&ranged_item) else {
+        return false;
+    };
+    let Some(metadata) = inventory.item_metadata.get(&item) else {
+        return false;
+    };
+    let Some(level) = snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|player| snapshot.state.entities.0.get(&player))
+        .and_then(|entity| entity.level)
+    else {
+        return false;
+    };
+    let Some(class) = snapshot.state.capabilities.class_id else {
+        return false;
+    };
+    metadata.item_class == 6
+        && ranged.ammo_type != 0
+        && ranged.delay_ms != 0
+        && metadata.subclass == ranged.ammo_type
+        && metadata.required_level <= level
+        && (metadata.allowable_class == 0
+            || metadata.allowable_class == u32::MAX
+            || ((1..=32).contains(&class) && metadata.allowable_class & (1 << (class - 1)) != 0))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1865,6 +2054,186 @@ mod tests {
             },
         );
         (state, vendor)
+    }
+
+    fn ranged_ammo_state(count: u32) -> (AuthoritativeState, EntityId) {
+        let vendor = EntityId(56);
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(3);
+        state.entities.0.insert(
+            EntityId(7),
+            wow_state::entities::EntityState {
+                level: Some(20),
+                ..Default::default()
+            },
+        );
+        state.inventory.equipment_slots_authoritative = true;
+        state.inventory.equipped_items.insert(17, 10_001);
+        state.inventory.item_metadata.insert(
+            10_001,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 2,
+                ammo_type: 2,
+                delay_ms: 3_000,
+                ..Default::default()
+            },
+        );
+        state.inventory.instances_authoritative = true;
+        state.inventory.instances.insert(
+            EntityId(90),
+            wow_state::inventory::InventoryItemInstance {
+                item: 2512,
+                guid: EntityId(90),
+                backpack_slot: 23,
+                count,
+            },
+        );
+        state.inventory.item_metadata.insert(
+            2512,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 6,
+                subclass: 2,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        state.inventory.money = 5_000;
+        state.inventory.vendor = Some(vendor);
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![wow_state::inventory::VendorOffer {
+                slot: 4,
+                item: 2512,
+                stock: Some(200),
+                price_copper: 150,
+                buy_count: 100,
+                extended_cost: 0,
+            }],
+        });
+        (state, vendor)
+    }
+
+    #[test]
+    fn ranged_ammo_uses_five_minute_floor_and_fifteen_minute_target() {
+        assert_eq!(ranged_ammo_target_counts(3_000), Some((100, 300)));
+        assert_eq!(ranged_ammo_target_counts(0), None);
+    }
+
+    #[test]
+    fn ranged_ammo_buys_one_safe_observed_lot_and_sets_only_present_ammo() {
+        let (mut state, vendor) = ranged_ammo_state(100);
+        assert_eq!(
+            ranged_ammo_maintenance(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+                EntityId(7),
+            ),
+            Some(MaintenanceDecision::RecoveryVendorBuy {
+                vendor,
+                item: 2512,
+                slot: 4,
+                lots: 1,
+            })
+        );
+
+        state
+            .inventory
+            .instances
+            .get_mut(&EntityId(90))
+            .unwrap()
+            .count = 300;
+        assert_eq!(
+            ranged_ammo_maintenance(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                None,
+                EntityId(7),
+            ),
+            Some(MaintenanceDecision::SetAmmo { item: 2512 }),
+            "ammo selection requires an observed compatible bag stack"
+        );
+        state.inventory.instances_authoritative = false;
+        assert_eq!(
+            ranged_ammo_maintenance(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                None,
+                EntityId(7),
+            ),
+            None,
+            "a default or stale instance map is not proof of bag contents"
+        );
+    }
+
+    #[test]
+    fn ranged_ammo_rejects_wrong_subclass_and_unaffordable_offer() {
+        let (mut state, vendor) = ranged_ammo_state(0);
+        state
+            .inventory
+            .item_metadata
+            .get_mut(&2512)
+            .unwrap()
+            .subclass = 3;
+        assert_eq!(
+            ranged_ammo_maintenance(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+                EntityId(7),
+            ),
+            None,
+            "ammunition must match the ranged weapon subclass"
+        );
+        state
+            .inventory
+            .item_metadata
+            .get_mut(&2512)
+            .unwrap()
+            .subclass = 2;
+        state.inventory.money = 1_149;
+        assert_eq!(
+            ranged_ammo_maintenance(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+                EntityId(7),
+            ),
+            None,
+            "the purchase must preserve the 1,000-copper reserve"
+        );
+    }
+
+    #[test]
+    fn ranged_ammo_waits_for_unknown_backpack_templates() {
+        let (mut state, vendor) = ranged_ammo_state(0);
+        state.inventory.instances.insert(
+            EntityId(91),
+            wow_state::inventory::InventoryItemInstance {
+                item: 9876,
+                guid: EntityId(91),
+                backpack_slot: 24,
+                count: 1,
+            },
+        );
+        assert_eq!(
+            ranged_ammo_maintenance(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+                EntityId(7),
+            ),
+            Some(MaintenanceDecision::QueryItem { item: 9876 }),
+            "unknown occupied slots could already contain compatible ammo"
+        );
     }
 
     fn reagent_vendor_state() -> (AuthoritativeState, EntityId) {

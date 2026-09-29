@@ -222,6 +222,7 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::UseItemInstance { .. }
         | GameplayCommand::UseItemOnItem { .. }
         | GameplayCommand::EquipItem { .. }
+        | GameplayCommand::SetAmmo { .. }
         | GameplayCommand::PetSetReaction { .. }
         | GameplayCommand::PetSetAutocast { .. }
         | GameplayCommand::Fish

@@ -141,6 +141,8 @@ pub struct InventoryState {
     pub items: BTreeMap<u32, u32>,
     pub instances: BTreeMap<EntityId, InventoryItemInstance>,
     #[serde(default)]
+    pub instances_authoritative: bool,
+    #[serde(default)]
     pub item_metadata: BTreeMap<u32, ItemTemplateMetadata>,
     pub free_slots: u16,
     pub equipped_ranged_item: Option<u32>,

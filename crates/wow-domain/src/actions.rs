@@ -127,6 +127,9 @@ pub enum GameplayCommand {
     VendorList {
         vendor: EntityId,
     },
+    SetAmmo {
+        item: u32,
+    },
     TrainerList {
         trainer: EntityId,
     },

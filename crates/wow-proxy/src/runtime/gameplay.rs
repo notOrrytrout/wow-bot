@@ -475,6 +475,7 @@ pub(super) fn encode_gameplay_command(
     const CMSG_GET_MAIL_LIST: u32 = 0x023A;
     const CMSG_MAIL_TAKE_MONEY: u32 = 0x0245;
     const CMSG_MAIL_TAKE_ITEM: u32 = 0x0246;
+    const CMSG_SET_AMMO: u32 = 0x0268;
     match command {
         GameplayCommand::Raw { opcode, body } => Ok(Some((ClientFrame { opcode, body }, None))),
         GameplayCommand::QueryQuestGivers => Ok(Some((
@@ -546,6 +547,13 @@ pub(super) fn encode_gameplay_command(
                 None,
             )))
         }
+        GameplayCommand::SetAmmo { item } => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_SET_AMMO,
+                body: item.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
         GameplayCommand::VendorSell {
             vendor,
             item_guid,
@@ -1565,6 +1573,23 @@ mod movement_clock_tests {
         assert_eq!(&packet.body[12..16], &3_u32.to_le_bytes());
         assert_eq!(&packet.body[16..20], &1_u32.to_le_bytes());
         assert_eq!(packet.body[20], 0);
+    }
+
+    #[test]
+    fn set_ammo_uses_projectile_entry_payload() {
+        let mut clock = MovementClock::default();
+        let (packet, _) = encode_gameplay_command(
+            GameplayCommand::SetAmmo { item: 2512 },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(packet.opcode, 0x0268);
+        assert_eq!(packet.body, 2512_u32.to_le_bytes());
     }
 
     #[test]

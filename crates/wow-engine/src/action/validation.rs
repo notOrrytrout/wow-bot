@@ -444,6 +444,22 @@ fn validate_economy_command(
     command: &GameplayCommand,
 ) -> Result<(), ValidationOutcome> {
     match command {
+        GameplayCommand::SetAmmo { item } => {
+            let inventory = &snapshot.state.inventory;
+            let present_in_bags = inventory.instances_authoritative
+                && inventory.instances.values().any(|instance| {
+                    instance.item == *item && instance.backpack_slot >= 23 && instance.count > 0
+                });
+            if !present_in_bags
+                || !wow_policy::maintenance::ranged_ammo_item_is_compatible(snapshot, *item)
+            {
+                return Err(reject(
+                    "invalid_ammo_selection",
+                    "compatible ammo is not present in authoritative inventory",
+                    true,
+                ));
+            }
+        }
         GameplayCommand::EquipItem {
             item_guid,
             destination_slot,
@@ -655,6 +671,8 @@ fn validate_economy_command(
                         )
                     })
             });
+            let ranged_ammo =
+                wow_policy::maintenance::ranged_ammo_item_is_compatible(snapshot, *item);
             let trusted_seller = snapshot.state.entities.0.get(vendor).is_some_and(|entity| {
                 let nearby = snapshot
                     .state
@@ -674,7 +692,7 @@ fn validate_economy_command(
                         .any(|service| service.entry_id == entity.entry && service.can_sell)
             });
             if !valid
-                || (!poison && !recovery_supply)
+                || (!poison && !recovery_supply && !ranged_ammo)
                 || (poison && snapshot.state.capabilities.class_id != Some(4))
                 || !trusted_seller
             {
@@ -928,7 +946,9 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
         GameplayCommand::CastOnItem { .. } | GameplayCommand::UseItemOnItem { .. } => {
             PermissionSet::MAINTENANCE
         }
-        GameplayCommand::EquipItem { .. } => PermissionSet::MAINTENANCE,
+        GameplayCommand::EquipItem { .. } | GameplayCommand::SetAmmo { .. } => {
+            PermissionSet::MAINTENANCE
+        }
         GameplayCommand::RepairEquipment { .. } => PermissionSet::MAINTENANCE,
         GameplayCommand::PetSetReaction { .. } | GameplayCommand::PetSetAutocast { .. } => {
             PermissionSet::MAINTENANCE
@@ -968,6 +988,7 @@ fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
         command,
         GameplayCommand::EquipItem { .. }
             | GameplayCommand::RepairEquipment { .. }
+            | GameplayCommand::SetAmmo { .. }
             | GameplayCommand::PetSetReaction { .. }
             | GameplayCommand::PetSetAutocast { .. }
             | GameplayCommand::CastOnItem { .. }
@@ -998,6 +1019,7 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::SummonPet { .. }
                 | GameplayCommand::EquipItem { .. }
                 | GameplayCommand::RepairEquipment { .. }
+                | GameplayCommand::SetAmmo { .. }
                 | GameplayCommand::PetSetReaction { .. }
                 | GameplayCommand::PetSetAutocast { .. }
                 | GameplayCommand::CastOnItem { .. }
@@ -1018,6 +1040,7 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::SummonPet { .. }
                 | GameplayCommand::EquipItem { .. }
                 | GameplayCommand::RepairEquipment { .. }
+                | GameplayCommand::SetAmmo { .. }
                 | GameplayCommand::PetSetReaction { .. }
                 | GameplayCommand::PetSetAutocast { .. }
                 | GameplayCommand::CastOnItem { .. }
@@ -1660,6 +1683,57 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
+    }
+
+    #[test]
+    fn ammo_selection_requires_authoritative_compatible_bag_evidence() {
+        let mut state = AuthoritativeState::default();
+        state.revision = StateRevision(7);
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(3);
+        state.inventory.equipment_slots_authoritative = true;
+        state.inventory.instances_authoritative = true;
+        state.inventory.equipped_items.insert(17, 10_001);
+        state.inventory.item_metadata.insert(
+            10_001,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 2,
+                ammo_type: 2,
+                delay_ms: 3_000,
+                ..Default::default()
+            },
+        );
+        state.inventory.item_metadata.insert(
+            2512,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 6,
+                subclass: 2,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        state.inventory.instances.insert(
+            EntityId(90),
+            wow_state::inventory::InventoryItemInstance {
+                item: 2512,
+                guid: EntityId(90),
+                backpack_slot: 23,
+                count: 20,
+            },
+        );
+        state.entities.0.insert(
+            EntityId(7),
+            EntityState {
+                level: Some(20),
+                ..Default::default()
+            },
+        );
+        let command = GameplayCommand::SetAmmo { item: 2512 };
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_ok());
+
+        state.inventory.instances.remove(&EntityId(90));
         assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
     }
 
