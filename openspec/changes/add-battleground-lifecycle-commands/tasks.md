@@ -5,4 +5,8 @@
 - [x] Require Group mission permission and SystemPolicy or Operator origin.
 - [x] Revalidate invitation, queue, and active-match state before state-changing commands.
 - [x] Add validation and packet-layout regression tests.
-- [ ] Use these commands in the lane battleground lifecycle.
+- [x] Use these commands in the lane battleground lifecycle.
+- [x] Check for an existing queue before joining and use bounded queue, status, port, and exit retries.
+- [x] Accept invitations only with authoritative queue type plus known alive, out-of-combat, on-foot player state.
+- [x] Clean up queued or active battleground state when the mission changes.
+- [x] Defer active match operation until objective and combat context are projected.

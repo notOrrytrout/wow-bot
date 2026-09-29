@@ -293,6 +293,12 @@ const RECOVERY_VENDOR_BUY_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 const COMBAT_POTION_FALLBACK_LOCKOUT: Duration = Duration::from_secs(60 * 60);
 const COMBAT_HEALTHSTONE_RETRY: Duration = Duration::from_secs(5);
 const COMBAT_EMERGENCY_HEALTH_ITEM_RETRY: Duration = Duration::from_secs(30);
+const BATTLEGROUND_STATUS_RETRY: Duration = Duration::from_secs(15);
+const BATTLEGROUND_ACTIVE_STATUS_RETRY: Duration = Duration::from_secs(30);
+const BATTLEGROUND_QUEUE_START_DELAY: Duration = Duration::from_secs(2);
+const BATTLEGROUND_QUEUE_RETRY: Duration = Duration::from_secs(30);
+const BATTLEGROUND_PORT_RETRY: Duration = Duration::from_secs(15);
+const BATTLEGROUND_EXIT_RETRY: Duration = Duration::from_secs(5);
 const MOVEMENT_STEP_EARLY_TOLERANCE: Duration = Duration::from_millis(10);
 const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
@@ -545,6 +551,11 @@ pub struct LaneEngine {
     last_maintenance_tick: Option<Instant>,
     last_maintenance_status: Option<String>,
     post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
+    battleground_status_retry_after: Option<Instant>,
+    battleground_status_requested_at: Option<Instant>,
+    battleground_queue_retry_after: Option<Instant>,
+    battleground_port_retry_after: Option<Instant>,
+    battleground_exit_retry_after: Option<Instant>,
     last_recovery_action: Option<Instant>,
     last_logged_player_life_status: Option<PlayerLifeStatus>,
     corpse_reclaim_attempts: u8,
@@ -640,6 +651,11 @@ impl LaneEngine {
             last_maintenance_tick: None,
             last_maintenance_status: None,
             post_combat_loot: None,
+            battleground_status_retry_after: None,
+            battleground_status_requested_at: None,
+            battleground_queue_retry_after: None,
+            battleground_port_retry_after: None,
+            battleground_exit_retry_after: None,
             last_recovery_action: None,
             last_logged_player_life_status: None,
             corpse_reclaim_attempts: 0,
@@ -1458,6 +1474,7 @@ impl LaneEngine {
                 self.state.mission = m;
                 self.state.mission_revision = self.state.mission_revision.next();
                 self.group_pull_delay = None;
+                self.reset_battleground_timers();
                 self.last_quest_step = None;
                 self.pending_accept = None;
                 self.pending_turn_in = None;
@@ -1678,6 +1695,12 @@ impl LaneEngine {
         if self.pending_dismount.is_some() {
             return true;
         }
+        if let MissionIntent::Battleground { battleground } = self.state.mission.intent.clone() {
+            return self.tick_battleground(true, battleground.as_deref()).await;
+        }
+        if self.has_battleground_queue_state() {
+            return self.tick_battleground(false, None).await;
+        }
         if self
             .pending_movement
             .as_ref()
@@ -1761,7 +1784,7 @@ impl LaneEngine {
             }
             MissionIntent::Grind { creature } => self.tick_grind(&creature).await,
             MissionIntent::Battleground { battleground } => {
-                self.tick_battleground(battleground.as_deref()).await
+                self.tick_battleground(true, battleground.as_deref()).await
             }
             MissionIntent::Goal { text } => self.tick_goal(&text).await,
             MissionIntent::Party { .. } | MissionIntent::Raid { .. } => {
@@ -2108,15 +2131,222 @@ impl LaneEngine {
         true
     }
 
-    async fn tick_battleground(&mut self, battleground: Option<&str>) -> bool {
-        // The current protocol projection does not include authoritative queue,
-        // invite, battleground status, or objective state. Do not infer an invite
-        // from chat text or interact with an unclassified game object.
-        let label = battleground.unwrap_or("any battleground");
-        self.waiting(format!(
-            "battleground mission for {label:?} is waiting for authoritative queue, invite, or objective state"
-        ));
-        true
+    async fn tick_battleground(&mut self, active: bool, battleground: Option<&str>) -> bool {
+        use wow_state::battleground::BattlegroundQueueStatus as Status;
+
+        let now = Instant::now();
+        let label = battleground.unwrap_or("random battleground");
+        if let Some(requested) = battleground
+            && !requested.eq_ignore_ascii_case("random")
+        {
+            self.waiting(format!(
+                "battleground {requested:?} is not supported by the queue command; use random"
+            ));
+            return true;
+        }
+
+        let queues = &self.state.authoritative.battleground.queues;
+        if queues
+            .values()
+            .any(|queue| matches!(queue.status, Status::Unknown(_)))
+        {
+            self.waiting("battleground queue has an unknown server status; waiting for a known status update".into());
+            return true;
+        }
+        let queue = queues.values().next();
+        if queues.len() > 1 {
+            self.waiting("multiple battleground queue slots are active; waiting for a single authoritative queue".into());
+            return true;
+        }
+
+        if !active {
+            let Some(queue) = queue else {
+                self.reset_battleground_timers();
+                return false;
+            };
+            let Some(type_id) = queue.battleground_type_id else {
+                self.waiting(
+                    "battleground queue is active without a known battleground type; waiting"
+                        .into(),
+                );
+                return true;
+            };
+            return match queue.status {
+                Status::WaitQueue | Status::WaitJoin => {
+                    if self
+                        .battleground_port_retry_after
+                        .is_some_and(|deadline| now < deadline)
+                    {
+                        return true;
+                    }
+                    self.battleground_port_retry_after = Some(now + BATTLEGROUND_EXIT_RETRY);
+                    self.propose_command(
+                        GameplayCommand::BattlegroundPort {
+                            battleground_type_id: type_id,
+                            enter: false,
+                        },
+                        false,
+                    )
+                    .await
+                }
+                Status::InProgress | Status::WaitLeave => {
+                    if self
+                        .battleground_exit_retry_after
+                        .is_some_and(|deadline| now < deadline)
+                    {
+                        return true;
+                    }
+                    self.battleground_exit_retry_after = Some(now + BATTLEGROUND_EXIT_RETRY);
+                    self.propose_command(
+                        GameplayCommand::BattlegroundLeave {
+                            battleground_type_id: type_id,
+                        },
+                        false,
+                    )
+                    .await
+                }
+                Status::None => false,
+                Status::Unknown(_) => unreachable!(),
+            };
+        }
+
+        if let Some(queue) = queue {
+            match queue.status {
+                Status::WaitQueue => {
+                    self.battleground_status_requested_at = None;
+                    if self
+                        .battleground_status_retry_after
+                        .is_none_or(|deadline| now >= deadline)
+                    {
+                        self.battleground_status_retry_after =
+                            Some(now + BATTLEGROUND_STATUS_RETRY);
+                        return self
+                            .propose_command(GameplayCommand::BattlegroundStatus, false)
+                            .await;
+                    }
+                    self.waiting(format!("queued for {label}; waiting for an invitation"));
+                    return true;
+                }
+                Status::WaitJoin => {
+                    let safe_to_port = self.player_life_status() == PlayerLifeStatus::Alive
+                        && self.state.authoritative.transport.attached == Some(false)
+                        && self
+                            .state
+                            .authoritative
+                            .session
+                            .character_guid
+                            .map(EntityId)
+                            .and_then(|player| self.state.authoritative.entities.0.get(&player))
+                            .is_some_and(|player| player.in_combat() == Some(false));
+                    if !safe_to_port {
+                        self.waiting("battleground invitation is waiting for a living, out-of-combat player on foot".into());
+                        return true;
+                    }
+                    let Some(type_id) = queue.battleground_type_id else {
+                        self.waiting("battleground invitation has no known type; waiting".into());
+                        return true;
+                    };
+                    if self
+                        .battleground_port_retry_after
+                        .is_some_and(|deadline| now < deadline)
+                    {
+                        return true;
+                    }
+                    self.battleground_port_retry_after = Some(now + BATTLEGROUND_PORT_RETRY);
+                    return self
+                        .propose_command(
+                            GameplayCommand::BattlegroundPort {
+                                battleground_type_id: type_id,
+                                enter: true,
+                            },
+                            false,
+                        )
+                        .await;
+                }
+                Status::InProgress => {
+                    if self
+                        .battleground_status_retry_after
+                        .is_none_or(|deadline| now >= deadline)
+                    {
+                        self.battleground_status_retry_after =
+                            Some(now + BATTLEGROUND_ACTIVE_STATUS_RETRY);
+                        return self
+                            .propose_command(GameplayCommand::BattlegroundStatus, false)
+                            .await;
+                    }
+                    self.waiting("battleground match is active; objective and combat observations are not yet available".into());
+                    return true;
+                }
+                Status::WaitLeave => {
+                    let Some(type_id) = queue.battleground_type_id else {
+                        self.waiting(
+                            "battleground is waiting to leave without a known type; waiting".into(),
+                        );
+                        return true;
+                    };
+                    if self
+                        .battleground_exit_retry_after
+                        .is_some_and(|deadline| now < deadline)
+                    {
+                        return true;
+                    }
+                    self.battleground_exit_retry_after = Some(now + BATTLEGROUND_EXIT_RETRY);
+                    return self
+                        .propose_command(
+                            GameplayCommand::BattlegroundLeave {
+                                battleground_type_id: type_id,
+                            },
+                            false,
+                        )
+                        .await;
+                }
+                Status::None => {}
+                Status::Unknown(_) => unreachable!(),
+            }
+        }
+
+        if self.battleground_status_requested_at.is_none()
+            && self
+                .battleground_queue_retry_after
+                .is_some_and(|deadline| now < deadline)
+        {
+            self.waiting(
+                "battleground queue request is waiting for the server status update".into(),
+            );
+            return true;
+        }
+        if self.battleground_status_requested_at.is_none() {
+            self.battleground_status_requested_at = Some(now);
+            self.battleground_status_retry_after = Some(now + BATTLEGROUND_STATUS_RETRY);
+            return self
+                .propose_command(GameplayCommand::BattlegroundStatus, false)
+                .await;
+        }
+        if self
+            .battleground_status_requested_at
+            .is_some_and(|requested| now.duration_since(requested) < BATTLEGROUND_QUEUE_START_DELAY)
+        {
+            self.waiting(
+                "battleground mission is checking for an existing queue before joining".into(),
+            );
+            return true;
+        }
+        self.battleground_queue_retry_after = Some(now + BATTLEGROUND_QUEUE_RETRY);
+        self.battleground_status_requested_at = None;
+        self.propose_command(GameplayCommand::BattlegroundJoinRandom, false)
+            .await
+    }
+
+    fn has_battleground_queue_state(&self) -> bool {
+        !self.state.authoritative.battleground.queues.is_empty()
+    }
+
+    fn reset_battleground_timers(&mut self) {
+        self.battleground_status_retry_after = None;
+        self.battleground_status_requested_at = None;
+        self.battleground_queue_retry_after = None;
+        self.battleground_port_retry_after = None;
+        self.battleground_exit_retry_after = None;
     }
 
     async fn tick_goal(&mut self, text: &str) -> bool {
@@ -10316,7 +10546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn battleground_mission_defers_without_authoritative_lifecycle_or_objective_state() {
+    async fn named_battleground_waits_when_only_random_queueing_is_supported() {
         let mut authoritative = wow_state::AuthoritativeState::default();
         authoritative.session.in_world = true;
         let mission = Mission {
@@ -10329,10 +10559,39 @@ mod tests {
         let (mut engine, mut proxy) = test_engine(mission, authoritative);
 
         assert!(engine.tick_mission().await);
-        assert!(engine.last_wait_reason.as_deref().is_some_and(|reason| {
-            reason.contains("authoritative queue, invite, or objective state")
-        }));
+        assert!(
+            engine
+                .last_wait_reason
+                .as_deref()
+                .is_some_and(|reason| { reason.contains("is not supported by the queue command") })
+        );
         assert!(proxy.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn random_battleground_checks_queue_status_before_joining() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        let mission = Mission {
+            id: MissionId(4),
+            intent: MissionIntent::Battleground { battleground: None },
+            permissions: PermissionSet::GROUP,
+        };
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = proxy.recv().await.unwrap() else {
+            panic!("expected battleground status query")
+        };
+        assert_eq!(action.command(), &GameplayCommand::BattlegroundStatus);
+
+        engine.battleground_status_requested_at =
+            Some(Instant::now() - BATTLEGROUND_QUEUE_START_DELAY);
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = proxy.recv().await.unwrap() else {
+            panic!("expected random queue request")
+        };
+        assert_eq!(action.command(), &GameplayCommand::BattlegroundJoinRandom);
     }
 
     #[tokio::test]
