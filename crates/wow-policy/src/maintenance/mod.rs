@@ -876,7 +876,7 @@ fn rogue_poison_restock(
                 vendor,
                 item,
                 slot: offer.slot,
-                lots: 1,
+                lots: wow_domain::MAX_MAINTENANCE_VENDOR_BUY_LOTS,
             });
         }
     }

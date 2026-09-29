@@ -144,3 +144,7 @@ The system SHALL derive vendor offers from the server's current inventory respon
 #### Scenario: Offer data changes before purchase
 - **WHEN** the vendor, offer slot, item, stock, or funds no longer match the observation
 - **THEN** final validation rejects the purchase
+
+#### Scenario: Purchase requests more than one maintenance lot
+- **WHEN** an automatic maintenance purchase requests more than one server-defined lot
+- **THEN** final validation rejects the purchase even if the vendor reports enough stock and the player has enough money

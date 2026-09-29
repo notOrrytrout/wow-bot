@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub const QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID: u32 = 6_478;
 /// Keep this amount of copper after an automatic maintenance purchase.
 pub const MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER: u64 = 1_000;
+/// Limit each automatic vendor purchase to one server-defined lot.
+pub const MAX_MAINTENANCE_VENDOR_BUY_LOTS: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PlanOrigin {

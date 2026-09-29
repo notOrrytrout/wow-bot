@@ -578,12 +578,15 @@ fn validate_economy_command(
                 .and_then(|inventory| inventory.offers.iter().find(|offer| offer.slot == *slot));
             let valid = offer.is_some_and(|offer| {
                 offer.item == *item
-                    && *count > 0
+                    && (1..=wow_domain::MAX_MAINTENANCE_VENDOR_BUY_LOTS).contains(count)
                     && offer.buy_count > 0
                     && offer.extended_cost == 0
-                    && offer
-                        .stock
-                        .is_none_or(|stock| stock >= offer.buy_count.saturating_mul(*count))
+                    && offer.stock.is_none_or(|stock| {
+                        offer
+                            .buy_count
+                            .checked_mul(*count)
+                            .is_some_and(|required_stock| stock >= required_stock)
+                    })
                     && u64::from(offer.price_copper)
                         .saturating_mul(u64::from(*count))
                         .saturating_add(MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
@@ -1305,6 +1308,14 @@ mod tests {
             count: 1,
         };
         assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_ok());
+
+        let oversized = GameplayCommand::VendorBuy {
+            vendor,
+            item: 6947,
+            slot: 3,
+            count: wow_domain::MAX_MAINTENANCE_VENDOR_BUY_LOTS + 1,
+        };
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &oversized).is_err());
 
         state.inventory.money = 1_119;
         assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
