@@ -264,6 +264,9 @@ pub fn decide_next_with_nearby_services(
     {
         return decision;
     }
+    if let Some(decision) = spell_reagent_restock(snapshot, retry_after, now, nearby_sell_vendor) {
+        return decision;
+    }
     if class_id == 8
         && let Some(decision) = mage_supplies(snapshot, player, retry_after, now)
     {
@@ -919,6 +922,136 @@ fn rogue_poison_restock(
         }
     }
     None
+}
+
+/// Refill known combat and class-utility spell reagents from an already nearby vendor.
+fn spell_reagent_restock(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+    nearby_vendor: Option<EntityId>,
+) -> Option<MaintenanceDecision> {
+    const SOUL_SHARD: u32 = 6_265;
+    const SOLO_USES: u32 = 5;
+    const GROUP_USES: u32 = 10;
+
+    let mut per_item = BTreeMap::<u32, u32>::new();
+    for spell_id in &snapshot.state.capabilities.spells {
+        let Some(spell) = crate::combat::spells::metadata(*spell_id) else {
+            continue;
+        };
+        let spell_name = spell.name.to_ascii_lowercase();
+        let automated_utility = spell.cost.base > 0
+            || spell.cost.per_level > 0
+            || spell.cost.percent > 0
+            || spell.cost.per_second > 0
+            || spell.cost.per_second_per_level > 0
+            || spell.cost.use_all_power
+            || spell.attack_spell
+            || [
+                "reincarnation",
+                "soulstone",
+                "ritual",
+                "portal",
+                "teleport",
+                "rebirth",
+                "divine intervention",
+            ]
+            .iter()
+            .any(|needle| spell_name.contains(needle));
+        if !automated_utility {
+            continue;
+        }
+        for reagent in &spell.reagents {
+            let Ok(item) = u32::try_from(reagent.item) else {
+                continue;
+            };
+            if item == 0 || reagent.count == 0 || item == SOUL_SHARD {
+                continue;
+            }
+            per_item
+                .entry(item)
+                .and_modify(|count| *count = (*count).max(reagent.count))
+                .or_insert(reagent.count);
+        }
+    }
+    if per_item.is_empty() {
+        return None;
+    }
+
+    let grouped = snapshot.state.group.lifecycle != GroupLifecycle::Solo
+        || !snapshot.state.group.members.is_empty();
+    let desired_uses = if grouped { GROUP_USES } else { SOLO_USES };
+    let mut low_reagents = per_item
+        .into_iter()
+        .map(|(item, per_cast)| {
+            let count = snapshot.state.inventory.count(item);
+            (item, per_cast, count, per_cast.saturating_mul(desired_uses))
+        })
+        .filter(|(_, _, count, target)| count < target)
+        .collect::<Vec<_>>();
+    low_reagents.sort_by_key(|(item, per_cast, count, _)| {
+        (*count >= per_cast.saturating_mul(SOLO_USES), *count, *item)
+    });
+    if low_reagents.is_empty() {
+        return None;
+    }
+    let vendor = nearby_vendor?;
+    let inventory = &snapshot.state.inventory;
+    let offers = inventory
+        .vendor_inventory
+        .as_ref()
+        .filter(|offers| offers.vendor == vendor);
+    if inventory.vendor != Some(vendor) || offers.is_none() {
+        if retry_after
+            .get(&(0, vendor))
+            .is_some_and(|deadline| *deadline > now)
+        {
+            return None;
+        }
+        return Some(MaintenanceDecision::VendorList { vendor });
+    }
+    let offers = offers?;
+    for (item, _, _, _) in &low_reagents {
+        if !inventory.item_metadata.contains_key(item)
+            && offers.offers.iter().any(|offer| {
+                offer.item == *item
+                    && !retry_after
+                        .get(&(*item, EntityId(0)))
+                        .is_some_and(|deadline| *deadline > now)
+            })
+        {
+            return Some(MaintenanceDecision::QueryItem { item: *item });
+        }
+    }
+    if retry_after
+        .get(&(u32::MAX, vendor))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    let spendable = inventory
+        .money
+        .saturating_sub(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER);
+    let offer = low_reagents
+        .iter()
+        .flat_map(|(item, _, _, _)| {
+            offers
+                .offers
+                .iter()
+                .filter(move |offer| offer.item == *item)
+        })
+        .filter(|offer| inventory.item_metadata.contains_key(&offer.item))
+        .filter(|offer| offer.extended_cost == 0 && offer.buy_count > 0)
+        .filter(|offer| offer.stock.is_none_or(|stock| stock >= offer.buy_count))
+        .filter(|offer| u64::from(offer.price_copper) <= spendable)
+        .min_by_key(|offer| (offer.price_copper, offer.slot))?;
+    Some(MaintenanceDecision::RecoveryVendorBuy {
+        vendor,
+        item: offer.item,
+        slot: offer.slot,
+        lots: wow_domain::MAX_MAINTENANCE_VENDOR_BUY_LOTS,
+    })
 }
 
 fn poison_count(snapshot: &Snapshot, family: &str) -> u32 {
@@ -1692,6 +1825,190 @@ mod tests {
             },
         );
         (state, vendor)
+    }
+
+    fn reagent_vendor_state() -> (AuthoritativeState, EntityId) {
+        let vendor = EntityId(77);
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(8);
+        state.capabilities.spells.insert(130); // Slow Fall uses one Light Feather.
+        state.inventory.money = 5_000;
+        state.inventory.vendor = Some(vendor);
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![wow_state::inventory::VendorOffer {
+                slot: 3,
+                item: 17_056,
+                stock: Some(20),
+                price_copper: 100,
+                buy_count: 5,
+                extended_cost: 0,
+            }],
+        });
+        state.inventory.item_metadata.insert(
+            17_056,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Light Feather".into(),
+                ..Default::default()
+            },
+        );
+        (state, vendor)
+    }
+
+    #[test]
+    fn reagent_restock_uses_known_spell_cost_and_one_affordable_vendor_lot() {
+        let (state, vendor) = reagent_vendor_state();
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            Some(MaintenanceDecision::RecoveryVendorBuy {
+                vendor,
+                item: 17_056,
+                slot: 3,
+                lots: wow_domain::MAX_MAINTENANCE_VENDOR_BUY_LOTS,
+            })
+        );
+    }
+
+    #[test]
+    fn reagent_restock_is_local_advisory_and_keeps_the_money_reserve() {
+        let (mut state, vendor) = reagent_vendor_state();
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                None
+            ),
+            None,
+            "a reagent shortage must not trigger travel"
+        );
+        state.inventory.money = 1_099;
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None,
+            "the purchase must preserve 1,000 copper"
+        );
+        state.inventory.money = 5_000;
+        state.inventory.items.insert(17_056, 5);
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None,
+            "five casts of the reagent satisfy the solo reserve"
+        );
+        state.group.lifecycle = GroupLifecycle::Active;
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            )
+            .map(|decision| match decision {
+                MaintenanceDecision::RecoveryVendorBuy { item, .. } => item,
+                _ => 0,
+            }),
+            Some(17_056),
+            "grouped play keeps ten casts when practical"
+        );
+        state.inventory.items.insert(17_056, 10);
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn reagent_restock_rejects_unsafe_offers_and_soul_shards() {
+        let (mut state, vendor) = reagent_vendor_state();
+        let now = Instant::now();
+        for (stock, extended_cost) in [(Some(4), 0), (Some(20), 1)] {
+            let offer = &mut state.inventory.vendor_inventory.as_mut().unwrap().offers[0];
+            offer.stock = stock;
+            offer.extended_cost = extended_cost;
+            assert_eq!(
+                spell_reagent_restock(
+                    &Snapshot::from_state(&state),
+                    &BTreeMap::new(),
+                    now,
+                    Some(vendor),
+                ),
+                None
+            );
+        }
+        state.capabilities.class_id = Some(9);
+        state.capabilities.spells.clear();
+        state.capabilities.spells.insert(691); // Summon Felhunter consumes a Soul Shard.
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].item = 6_265;
+        state.inventory.item_metadata.insert(
+            6_265,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Soul Shard".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                now,
+                Some(vendor),
+            ),
+            None,
+            "Soul Shards are created from combat and must not be bought"
+        );
+    }
+
+    #[test]
+    fn reagent_restock_queries_unknown_offer_templates_before_buying() {
+        let (mut state, vendor) = reagent_vendor_state();
+        state.inventory.item_metadata.remove(&17_056);
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            Some(MaintenanceDecision::QueryItem { item: 17_056 })
+        );
+        let retrying = [(
+            (17_056, EntityId(0)),
+            Instant::now() + Duration::from_secs(5),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            spell_reagent_restock(
+                &Snapshot::from_state(&state),
+                &retrying,
+                Instant::now(),
+                Some(vendor),
+            ),
+            None,
+            "an item metadata query in backoff does not authorize purchase"
+        );
     }
 
     #[test]
