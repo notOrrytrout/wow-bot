@@ -2312,6 +2312,13 @@ impl LaneEngine {
                         .await;
                 }
                 Status::InProgress => {
+                    if wow_policy::battleground::match_is_ending(queue) {
+                        self.waiting(
+                            "battleground match ended; waiting for the server leave transition"
+                                .into(),
+                        );
+                        return true;
+                    }
                     if self
                         .battleground_status_retry_after
                         .is_none_or(|deadline| now >= deadline)

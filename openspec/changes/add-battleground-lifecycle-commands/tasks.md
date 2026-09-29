@@ -10,4 +10,6 @@
 - [x] Accept invitations only with authoritative queue type plus known alive, out-of-combat, on-foot player state.
 - [x] Clean up queued or active battleground state when the mission changes.
 - [x] Run proactive player combat only on supported battleground maps with battleground mission authority.
-- [x] Defer objective actions until authoritative objective state is projected.
+- [x] Project full and incremental battleground world-state observations with map, zone, and area identity.
+- [ ] Add and verify team-aware objective selection, routing, interactions, and match completion behavior.
+- [ ] Verify objective and vehicle behavior against live AzerothCore battleground matches.
