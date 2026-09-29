@@ -55,6 +55,7 @@
 
 - [ ] 7.1 Add server-observed group loot method and live roll-request state to the loot decision path; verify no roll is emitted without a matching active request and eligibility.
 - [ ] 7.2 Implement configurable pass, greed, disenchant, and need decisions using usable-upgrade evidence and operator limits; verify master-loot and need-before-greed fixtures cannot be bypassed.
+- [x] 7.2a Add a shared pure roll-vote policy primitive that requires a caller-supplied active request and explicit eligibility, permits only Group Loot or Need Before Greed, requires known usable-upgrade evidence for need and known non-upgrade evidence for greed or disenchant, and defaults to pass; verify absent requests, unknown eligibility, master loot, disallowed choices, and conservative defaults.
 - [ ] 7.3 Keep direct corpse and object looting behind existing ownership and lootability validation in group missions; verify party pet kills remain lootable only when the server authorizes this player or group.
 
 ## 8. Integration and Release Validation
