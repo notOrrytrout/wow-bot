@@ -879,6 +879,16 @@ fn select_heal(snapshot: &Snapshot) -> Option<(u32, EntityId)> {
     })
 }
 
+/// Return whether combat policy can cast a legal direct heal on the player now.
+pub fn has_legal_self_heal(snapshot: &Snapshot) -> bool {
+    let Some(player) = snapshot.state.session.character_guid.map(EntityId) else {
+        return false;
+    };
+    let mut self_only = snapshot.clone();
+    self_only.state.group.members.clear();
+    select_heal(&self_only).is_some_and(|(_, target)| target == player)
+}
+
 pub fn supported_class_trees() -> impl Iterator<Item = (u8, u8, Vec<(u8, u32)>)> {
     combat_catalog()
         .classes

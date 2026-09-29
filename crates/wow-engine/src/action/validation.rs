@@ -1374,6 +1374,23 @@ mod tests {
         state.inventory.item_metadata.insert(
             6947,
             wow_state::inventory::ItemTemplateMetadata {
+                name: "Mana Potion".into(),
+                item_class: 0,
+                subclass: 1,
+                allowable_class: 0,
+                required_level: 1,
+                use_spell_id: 103,
+                ..Default::default()
+            },
+        );
+        assert!(
+            validate_economy_command(&Snapshot::from_state(&state), &command).is_ok(),
+            "class and level eligible potion templates are valid maintenance offers"
+        );
+
+        state.inventory.item_metadata.insert(
+            6947,
+            wow_state::inventory::ItemTemplateMetadata {
                 name: "Unrelated Consumable".into(),
                 item_class: 0,
                 subclass: 0,

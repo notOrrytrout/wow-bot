@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod consumables;
 pub mod crowd_control;
 pub mod engagement;
 pub mod mechanics;

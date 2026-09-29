@@ -1076,6 +1076,8 @@ enum RecoverySupplyKind {
     Food,
     Drink,
     Bandage,
+    HealthPotion,
+    ManaPotion,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1083,6 +1085,8 @@ struct RecoveryKinds {
     food: bool,
     drink: bool,
     bandage: bool,
+    health_potion: bool,
+    mana_potion: bool,
 }
 
 fn recovery_kinds(metadata: &wow_state::inventory::ItemTemplateMetadata) -> RecoveryKinds {
@@ -1112,7 +1116,15 @@ fn recovery_kinds(metadata: &wow_state::inventory::ItemTemplateMetadata) -> Reco
             RecoveryKinds {
                 food: is_food,
                 drink: is_drink,
-                bandage: false,
+                ..Default::default()
+            }
+        }
+        1 => {
+            let potion = crate::combat::consumables::potion_kinds(metadata);
+            RecoveryKinds {
+                health_potion: potion.health,
+                mana_potion: potion.mana,
+                ..Default::default()
             }
         }
         _ => RecoveryKinds::default(),
@@ -1129,7 +1141,7 @@ pub fn recovery_supply_item_is_eligible(
         || metadata.allowable_class == u32::MAX
         || ((1..=32).contains(&class_id) && metadata.allowable_class & (1 << (class_id - 1)) != 0);
     let kinds = recovery_kinds(metadata);
-    (kinds.food || kinds.drink || kinds.bandage)
+    (kinds.food || kinds.drink || kinds.bandage || kinds.health_potion || kinds.mana_potion)
         && metadata.required_level <= level
         && class_allowed
 }
@@ -1139,6 +1151,8 @@ fn matches_recovery_kind(kind: RecoverySupplyKind, kinds: RecoveryKinds) -> bool
         RecoverySupplyKind::Food => kinds.food,
         RecoverySupplyKind::Drink => kinds.drink,
         RecoverySupplyKind::Bandage => kinds.bandage,
+        RecoverySupplyKind::HealthPotion => kinds.health_potion,
+        RecoverySupplyKind::ManaPotion => kinds.mana_potion,
     }
 }
 
@@ -1148,10 +1162,9 @@ fn recovery_supply_restock(
     now: Instant,
     nearby_vendor: Option<EntityId>,
 ) -> Option<MaintenanceDecision> {
-    const TARGET_COUNT: u32 = 10;
-    if snapshot.state.capabilities.class_id == Some(8) {
-        return None;
-    }
+    const RECOVERY_TARGET_COUNT: u32 = 10;
+    const POTION_TARGET_COUNT: u32 = 3;
+    let mage_conjures_recovery = snapshot.state.capabilities.class_id == Some(8);
     let player = EntityId(snapshot.state.session.character_guid?);
     let inventory = &snapshot.state.inventory;
 
@@ -1164,7 +1177,14 @@ fn recovery_supply_restock(
     }) {
         return None;
     }
-    let mut counts = [0_u32; 3];
+    let kinds = [
+        RecoverySupplyKind::Food,
+        RecoverySupplyKind::Drink,
+        RecoverySupplyKind::Bandage,
+        RecoverySupplyKind::HealthPotion,
+        RecoverySupplyKind::ManaPotion,
+    ];
+    let mut counts = [0_u32; 5];
     for instance in inventory
         .instances
         .values()
@@ -1172,9 +1192,15 @@ fn recovery_supply_restock(
     {
         if let Some(metadata) = inventory.item_metadata.get(&instance.item) {
             let kinds = recovery_kinds(metadata);
-            for (index, matches) in [kinds.food, kinds.drink, kinds.bandage]
-                .into_iter()
-                .enumerate()
+            for (index, matches) in [
+                kinds.food,
+                kinds.drink,
+                kinds.bandage,
+                kinds.health_potion,
+                kinds.mana_potion,
+            ]
+            .into_iter()
+            .enumerate()
             {
                 if matches {
                     counts[index] = counts[index].saturating_add(instance.count);
@@ -1182,15 +1208,29 @@ fn recovery_supply_restock(
             }
         }
     }
-    let low_kinds: Vec<_> = [
-        RecoverySupplyKind::Food,
-        RecoverySupplyKind::Drink,
-        RecoverySupplyKind::Bandage,
-    ]
-    .into_iter()
-    .enumerate()
-    .filter_map(|(index, kind)| (counts[index] < TARGET_COUNT).then_some((kind, counts[index])))
-    .collect();
+    let low_kinds: Vec<_> = kinds
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, kind)| {
+            if mage_conjures_recovery
+                && matches!(
+                    kind,
+                    RecoverySupplyKind::Food
+                        | RecoverySupplyKind::Drink
+                        | RecoverySupplyKind::Bandage
+                )
+            {
+                return None;
+            }
+            let target = match kind {
+                RecoverySupplyKind::HealthPotion | RecoverySupplyKind::ManaPotion => {
+                    POTION_TARGET_COUNT
+                }
+                _ => RECOVERY_TARGET_COUNT,
+            };
+            (counts[index] < target).then_some((kind, counts[index]))
+        })
+        .collect();
     if low_kinds.is_empty() {
         return None;
     }
@@ -2097,6 +2137,160 @@ mod tests {
             ),
             None,
             "unknown backpack metadata blocks purchases"
+        );
+    }
+
+    #[test]
+    fn potion_restock_targets_three_and_uses_exact_nearby_offer() {
+        let (mut state, vendor) = recovery_vendor_state();
+        let offer = &mut state.inventory.vendor_inventory.as_mut().unwrap().offers[0];
+        offer.item = 119;
+        offer.slot = 7;
+        offer.buy_count = 2;
+        offer.stock = Some(4);
+        offer.price_copper = 300;
+        state.inventory.item_metadata.remove(&117);
+        state.inventory.item_metadata.insert(
+            119,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Lesser Healing Potion".into(),
+                item_class: 0,
+                subclass: 1,
+                use_spell_id: 112,
+                allowable_class: 0,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        let decision = recovery_supply_restock(
+            &Snapshot::from_state(&state),
+            &BTreeMap::new(),
+            Instant::now(),
+            Some(vendor),
+        );
+        assert_eq!(
+            decision,
+            Some(MaintenanceDecision::RecoveryVendorBuy {
+                vendor,
+                item: 119,
+                slot: 7,
+                lots: 1,
+            })
+        );
+
+        for guid in 120..123 {
+            state.inventory.instances.insert(
+                EntityId(guid),
+                wow_state::inventory::InventoryItemInstance {
+                    item: 120,
+                    guid: EntityId(guid),
+                    backpack_slot: 23 + guid as u8 - 120,
+                    count: 1,
+                },
+            );
+        }
+        state.inventory.item_metadata.insert(
+            120,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Health Potion".into(),
+                item_class: 0,
+                subclass: 1,
+                use_spell_id: 113,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None,
+            "do not buy health potions when the backpack count reaches three"
+        );
+        state
+            .inventory
+            .vendor_inventory
+            .as_mut()
+            .unwrap()
+            .offers
+            .push(wow_state::inventory::VendorOffer {
+                slot: 8,
+                item: 121,
+                stock: Some(2),
+                price_copper: 250,
+                buy_count: 1,
+                extended_cost: 0,
+            });
+        state.inventory.item_metadata.insert(
+            121,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Minor Mana Potion".into(),
+                item_class: 0,
+                subclass: 1,
+                use_spell_id: 114,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            Some(MaintenanceDecision::RecoveryVendorBuy {
+                vendor,
+                item: 121,
+                slot: 8,
+                lots: 1,
+            }),
+            "mana potions have their own reserve target"
+        );
+    }
+
+    #[test]
+    fn potion_restock_rejects_wrong_class_level_and_name_cues() {
+        let (mut state, vendor) = recovery_vendor_state();
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].item = 119;
+        state.inventory.item_metadata.remove(&117);
+        state.inventory.item_metadata.insert(
+            119,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Healing Potion".into(),
+                item_class: 0,
+                subclass: 1,
+                use_spell_id: 112,
+                allowable_class: 1 << 1,
+                required_level: 11,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None
+        );
+        state
+            .inventory
+            .item_metadata
+            .get_mut(&119)
+            .unwrap()
+            .required_level = 1;
+        state.inventory.item_metadata.get_mut(&119).unwrap().name = "Unrelated Consumable".into();
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None
         );
     }
 

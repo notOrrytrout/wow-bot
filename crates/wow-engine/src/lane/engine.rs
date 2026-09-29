@@ -241,6 +241,7 @@ const MOVEMENT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const MOVEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const QUEST_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RECOVERY_VENDOR_BUY_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
+const COMBAT_POTION_FALLBACK_LOCKOUT: Duration = Duration::from_secs(60 * 60);
 const MOVEMENT_STEP_EARLY_TOLERANCE: Duration = Duration::from_millis(10);
 const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
@@ -257,6 +258,10 @@ fn recovery_vendor_buy_pending_done(
     now: Instant,
 ) -> bool {
     current_count != baseline_count || deadline <= now
+}
+
+fn combat_potion_lockout_ready(lockout_until: Option<Instant>, now: Instant) -> bool {
+    lockout_until.is_none_or(|deadline| deadline <= now)
 }
 
 #[derive(Clone, Debug)]
@@ -371,6 +376,7 @@ pub struct LaneEngine {
     behind_retry_after: BTreeMap<(u32, EntityId), Instant>,
     behind_retry_cast_allowed: BTreeSet<(u32, EntityId)>,
     maintenance_retry_after: BTreeMap<(u32, EntityId), Instant>,
+    combat_potion_lockout_until: Option<Instant>,
     recovery_vendor_buy_pending: Option<(u32, u32, Instant)>,
     repair_pending: Option<(wow_state::inventory::EquipmentCondition, Instant)>,
     repair_retry_after: Option<Instant>,
@@ -450,6 +456,7 @@ impl LaneEngine {
             behind_retry_after: BTreeMap::new(),
             behind_retry_cast_allowed: BTreeSet::new(),
             maintenance_retry_after: BTreeMap::new(),
+            combat_potion_lockout_until: None,
             recovery_vendor_buy_pending: None,
             repair_pending: None,
             repair_retry_after: None,
@@ -4912,6 +4919,19 @@ impl LaneEngine {
 
     async fn dispatch_combat_target(&mut self, target: EntityId, recovery: bool) -> bool {
         let snapshot = Snapshot::from_state(&self.state.authoritative);
+        if let Some(command) = self.select_combat_potion(&snapshot, target, recovery) {
+            tracing::info!(lane=?self.state.lane, ?target, ?command, "critical combat potion selected");
+            let proposed = if recovery {
+                self.propose_recovery(command).await
+            } else {
+                self.propose_command(command, false).await
+            };
+            if proposed {
+                self.combat_potion_lockout_until =
+                    Some(Instant::now() + COMBAT_POTION_FALLBACK_LOCKOUT);
+            }
+            return proposed;
+        }
         let selected = match wow_policy::combat::selector::select_action(&snapshot, target) {
             Ok(selected) => selected,
             Err(reason) => {
@@ -4941,6 +4961,83 @@ impl LaneEngine {
             )
             .await
         }
+    }
+
+    fn select_combat_potion(
+        &self,
+        snapshot: &Snapshot,
+        target: EntityId,
+        recovery: bool,
+    ) -> Option<GameplayCommand> {
+        let player = EntityId(snapshot.state.session.character_guid?);
+        let confirmed_in_combat = recovery
+            || snapshot
+                .state
+                .entities
+                .0
+                .get(&player)
+                .and_then(wow_state::entities::EntityState::in_combat)
+                == Some(true)
+            || snapshot
+                .state
+                .entities
+                .0
+                .get(&target)
+                .and_then(wow_state::entities::EntityState::in_combat)
+                == Some(true);
+        if !confirmed_in_combat {
+            return None;
+        }
+        let health_percent = snapshot
+            .state
+            .entities
+            .0
+            .get(&player)
+            .and_then(|entity| entity.health)
+            .filter(|(_, maximum)| *maximum > 0)
+            .map(|(health, maximum)| health.saturating_mul(100) / maximum);
+        let self_heal_available = wow_policy::combat::selector::has_legal_self_heal(snapshot);
+        let healer = matches!(
+            &self.state.mission.intent,
+            wow_domain::MissionIntent::Party {
+                role: wow_domain::GroupRole::Healer
+            } | wow_domain::MissionIntent::Raid {
+                role: wow_domain::GroupRole::Healer
+            }
+        ) || matches!(
+            (
+                snapshot.state.capabilities.class_id,
+                snapshot.state.capabilities.specialization_tree,
+            ),
+            (Some(2), Some(0)) | (Some(5), Some(0 | 1)) | (Some(7), Some(2)) | (Some(11), Some(2))
+        );
+        let target_health = snapshot
+            .state
+            .entities
+            .0
+            .get(&target)
+            .and_then(|entity| entity.health)
+            .filter(|(_, maximum)| *maximum > 0)
+            .map(|(health, maximum)| health.saturating_mul(100) / maximum);
+        let active_mana_work = healer || target_health.is_some_and(|health| health > 20);
+        let now = Instant::now();
+        let shared_lockout_ready =
+            combat_potion_lockout_ready(self.combat_potion_lockout_until, now);
+        let selection = wow_policy::combat::consumables::select_combat_potion(
+            snapshot,
+            target,
+            health_percent.map(|_| (25, self_heal_available)),
+            Some((if healer { 20 } else { 15 }, active_mana_work)),
+            shared_lockout_ready,
+        )?;
+        Some(GameplayCommand::UseItemInstance {
+            item: selection.item,
+            item_guid: selection.instance.guid,
+            backpack_slot: selection.instance.backpack_slot,
+            spell: selection.spell,
+            target: Some(player),
+            cast_count: 0,
+        })
     }
 
     fn combat_pending(&self, target: EntityId, cycle: Duration) -> PendingQuestAction {
@@ -5961,6 +6058,16 @@ mod tests {
         assert!(!recovery_vendor_buy_pending_done(4, 4, deadline, now));
         assert!(recovery_vendor_buy_pending_done(4, 5, deadline, now));
         assert!(recovery_vendor_buy_pending_done(4, 4, deadline, deadline));
+    }
+
+    #[test]
+    fn health_and_mana_potions_share_a_one_hour_fallback_lockout() {
+        let now = Instant::now();
+        let lockout = now + COMBAT_POTION_FALLBACK_LOCKOUT;
+        assert!(!combat_potion_lockout_ready(Some(lockout), now));
+        assert!(combat_potion_lockout_ready(Some(lockout), lockout));
+        assert!(combat_potion_lockout_ready(None, now));
+        assert_eq!(COMBAT_POTION_FALLBACK_LOCKOUT, Duration::from_secs(3_600));
     }
     use crate::activity::ActivityArbiter;
 
