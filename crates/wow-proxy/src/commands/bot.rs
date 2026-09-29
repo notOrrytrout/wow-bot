@@ -4,6 +4,7 @@ use wow_domain::{GroupRole, Mission, MissionId};
 pub enum BotCommand {
     On,
     Off,
+    Clear(Mission),
     Status,
     Help,
     Mission(Mission),
@@ -71,7 +72,7 @@ fn take_word(text: &str) -> Option<(&str, &str)> {
 pub const BOT_HELP_LINES: &[&str] = &[
     ".bot quest | .bot gather \"resource\" | .bot grind \"creature\" | .bot pvp bg | .bot goal \"text\"",
     ".bot party [auto|tank|healer|melee|ranged|support] | .bot raid [auto|tank|healer|melee|ranged|support]",
-    ".bot on | .bot off | .bot status | .bot help",
+    ".bot on | .bot off | .bot clear | .bot status | .bot help",
 ];
 
 pub const HELP_LINES: &[&str] = &[
@@ -93,6 +94,12 @@ pub fn parse(text: &str, mission_id: MissionId) -> Result<Option<BotCommand>, St
     }
     if rest.eq_ignore_ascii_case("off") {
         return Ok(Some(BotCommand::Off));
+    }
+    if rest.eq_ignore_ascii_case("clear") {
+        return Ok(Some(BotCommand::Clear(Mission {
+            id: mission_id,
+            ..Mission::idle()
+        })));
     }
     if rest.eq_ignore_ascii_case("status") {
         return Ok(Some(BotCommand::Status));
@@ -194,5 +201,15 @@ mod tests {
                 role: GroupRole::Auto
             }
         );
+    }
+
+    #[test]
+    fn clear_creates_idle_mission_with_fresh_revision_id() {
+        let BotCommand::Clear(mission) = parse(".bot clear", MissionId(11)).unwrap().unwrap()
+        else {
+            panic!("clear command expected");
+        };
+        assert_eq!(mission.id, MissionId(11));
+        assert_eq!(mission.intent, MissionIntent::Idle);
     }
 }

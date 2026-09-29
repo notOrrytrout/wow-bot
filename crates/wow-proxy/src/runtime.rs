@@ -3594,6 +3594,34 @@ async fn execute_bot_command(
                 "mission set: {description}; automation enabled"
             )])
         }
+        BotCommand::Clear(mission) => {
+            let _ = account.visual_fence.send(());
+            account
+                .supervisor_tx
+                .send(SupervisorCommand::ReplaceMission {
+                    lane: account.config.lane,
+                    mission,
+                })
+                .await
+                .map_err(|error| format!("failed to clear bot mission: {error}"))?;
+            let (committed, receiver) = oneshot::channel();
+            account
+                .session_tx
+                .send(SessionMessage::BotOff {
+                    committed: Some(committed),
+                })
+                .await
+                .map_err(|error| {
+                    format!("mission was cleared, but bot control could not stop: {error}")
+                })?;
+            if !receiver.await.map_err(|error| {
+                format!("mission was cleared, but bot control result was lost: {error}")
+            })? {
+                return Err("mission was cleared, but bot control did not stop".into());
+            }
+            tracing::info!(account=%account.config.account_name, command=".bot clear", "bot mission cleared and automation disabled");
+            Ok(vec!["mission cleared; automation disabled".into()])
+        }
         BotCommand::Status => {
             let owner = *account.ownership_state.borrow();
             let character = account

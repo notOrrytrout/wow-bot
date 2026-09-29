@@ -1,0 +1,5 @@
+- [x] Add a typed `.bot clear` parser result with a fresh mission ID.
+- [x] Replace only the current lane mission with idle and stop bot control.
+- [x] Add parser regression coverage.
+- [x] Add the OpenSpec behavior delta.
+- [x] Run focused proxy tests, formatting, diff checks, and OpenSpec validation.
