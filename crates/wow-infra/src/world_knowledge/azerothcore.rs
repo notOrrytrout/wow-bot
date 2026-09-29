@@ -272,6 +272,16 @@ pub struct VendorService {
     pub spawns: Vec<KnowledgeSpawn>,
 }
 
+impl VendorService {
+    fn supports(&self, service: VendorKind) -> bool {
+        match service {
+            VendorKind::Sell => self.can_sell,
+            VendorKind::Repair => self.can_repair,
+            VendorKind::Auction => self.can_auction,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct TrainerService {
     pub entry_id: u32,
@@ -448,11 +458,7 @@ impl AzerothCoreCatalog {
             self.world
                 .vendor_services
                 .iter()
-                .filter(|vendor| match service {
-                    VendorKind::Sell => vendor.can_sell,
-                    VendorKind::Repair => vendor.can_repair,
-                    VendorKind::Auction => vendor.can_auction,
-                })
+                .filter(|vendor| vendor.supports(service))
                 .flat_map(|vendor| {
                     vendor
                         .spawns
@@ -462,6 +468,12 @@ impl AzerothCoreCatalog {
             map,
             from,
         )
+    }
+    pub fn vendor_offers_service(&self, entry_id: u32, service: VendorKind) -> bool {
+        self.world
+            .vendor_services
+            .iter()
+            .any(|vendor| vendor.entry_id == entry_id && vendor.supports(service))
     }
     pub fn nearest_profession_trainer(
         &self,
@@ -761,5 +773,25 @@ mod tests {
             catalog.profession_skill_for_trainer_spell(trainer.entry_id, u32::MAX),
             None
         );
+    }
+
+    #[test]
+    fn catalog_vendor_service_lookup_matches_each_generated_capability() {
+        let catalog = embedded_azerothcore_catalog();
+        for vendor in &catalog.world().vendor_services {
+            for (service, expected) in [
+                (VendorKind::Sell, vendor.can_sell),
+                (VendorKind::Repair, vendor.can_repair),
+                (VendorKind::Auction, vendor.can_auction),
+            ] {
+                assert_eq!(
+                    catalog.vendor_offers_service(vendor.entry_id, service),
+                    expected
+                );
+            }
+        }
+        for service in [VendorKind::Sell, VendorKind::Repair, VendorKind::Auction] {
+            assert!(!catalog.vendor_offers_service(u32::MAX, service));
+        }
     }
 }

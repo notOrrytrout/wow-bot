@@ -856,10 +856,10 @@ fn validate_economy_command(
                     && entity.interactable
                     && nearby
                     && wow_infra::world_knowledge::embedded_azerothcore_catalog()
-                        .world()
-                        .vendor_services
-                        .iter()
-                        .any(|service| service.entry_id == entity.entry && service.can_sell)
+                        .vendor_offers_service(
+                            entity.entry,
+                            wow_infra::world_knowledge::VendorKind::Sell,
+                        )
             });
             if !valid
                 || (!poison && !recovery_supply && !ranged_ammo && !vendor_gear)
@@ -902,10 +902,10 @@ fn validate_economy_command(
             let is_repair_vendor = entity.kind == wow_state::entities::EntityKind::Unit
                 && entity.interactable
                 && wow_infra::world_knowledge::embedded_azerothcore_catalog()
-                    .world()
-                    .vendor_services
-                    .iter()
-                    .any(|service| service.entry_id == entity.entry && service.can_repair);
+                    .vendor_offers_service(
+                        entity.entry,
+                        wow_infra::world_knowledge::VendorKind::Repair,
+                    );
             if !is_repair_vendor {
                 return Err(reject(
                     "not_a_repair_vendor",

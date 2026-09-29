@@ -88,13 +88,6 @@ fn nearby_sell_vendor(snapshot: &Snapshot) -> Option<EntityId> {
         .control
         .active_position(snapshot.state.position.player)?;
     let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
-    let sell_entries: BTreeSet<u32> = catalog
-        .world()
-        .vendor_services
-        .iter()
-        .filter(|service| service.can_sell)
-        .map(|service| service.entry_id)
-        .collect();
     snapshot
         .state
         .entities
@@ -103,7 +96,10 @@ fn nearby_sell_vendor(snapshot: &Snapshot) -> Option<EntityId> {
         .filter(|entity| {
             entity.kind == wow_state::entities::EntityKind::Unit
                 && entity.interactable
-                && sell_entries.contains(&entity.entry)
+                && catalog.vendor_offers_service(
+                    entity.entry,
+                    wow_infra::world_knowledge::VendorKind::Sell,
+                )
         })
         .filter_map(|entity| {
             entity
