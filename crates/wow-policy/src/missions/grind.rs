@@ -1,9 +1,8 @@
 use wow_domain::EntityId;
 use wow_state::{Snapshot, entities::EntityKind};
 
-/// Keep voluntary Grind pulls within the range used by the legacy target
-/// chooser's bounded nearby-target selection.
-pub const GRIND_TARGET_MAX_DISTANCE_YARDS: f32 = 100.0;
+/// Keep voluntary Grind pulls within the legacy bounded observation horizon.
+pub const GRIND_TARGET_MAX_DISTANCE_YARDS: f32 = 400.0;
 const CLUSTER_RADIUS_YARDS: f32 = 9.0;
 
 /// Select the nearest safe, exact-name hostile for a named Grind mission.
@@ -229,7 +228,8 @@ mod tests {
             .get_mut(&missing_position)
             .unwrap()
             .position = None;
-        let distant = hostile(&mut state, 3, "Wolf", 101.0);
+        let horizon_target = hostile(&mut state, 3, "Wolf", 400.0);
+        let distant = hostile(&mut state, 6, "Wolf", 401.0);
         let wrong_map = hostile(&mut state, 4, "Wolf", 5.0);
         state
             .entities
@@ -241,8 +241,13 @@ mod tests {
             .unwrap()
             .map = 2;
         let non_finite = hostile(&mut state, 5, "Wolf", f32::NAN);
-        assert!(select_named_grind_target(&Snapshot::from_state(&state), "Wolf").is_none());
+        assert_eq!(
+            select_named_grind_target(&Snapshot::from_state(&state), "Wolf"),
+            Some(horizon_target),
+            "the legacy 400-yard observation boundary is inclusive"
+        );
 
+        state.entities.0.remove(&horizon_target);
         state.entities.0.remove(&distant);
         state.entities.0.remove(&wrong_map);
         state.entities.0.remove(&non_finite);

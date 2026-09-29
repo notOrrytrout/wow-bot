@@ -1,6 +1,6 @@
 # Design
 
-The lane delegates Grind target selection to pure `wow-policy` logic. The selector reads the current `Snapshot`, uses the active mover position when present, requires a finite position on the same map, and caps voluntary selection at 100 yards. It orders eligible candidates by distance and then `EntityId` so repeated evaluations are deterministic.
+The lane delegates Grind target selection to pure `wow-policy` logic. The selector reads the current `Snapshot`, uses the active mover position when present, requires a finite position on the same map, and preserves the legacy 400-yard observation horizon for voluntary selection. It orders eligible candidates by distance and then `EntityId` so repeated evaluations are deterministic.
 
 The legacy level rule rejects a target only when both player and target levels are known and the target is more than two levels above the player. Missing player health, mana, maximum values, or target level do not create invented evidence. Known health below 45 percent or mana below 20 percent blocks a pull. A cluster of at least three other hostiles within nine yards blocks a pull; a smaller cluster requires known reserves of at least 75 percent health and 45 percent mana where those values are available.
 

@@ -1,5 +1,5 @@
 ### Requirement: Named Grind selects a safe nearby exact target
-When a named Grind mission selects a voluntary target, it SHALL select only a live hostile unit whose trimmed name matches the mission name exactly without regard to case. It SHALL use a current finite same-map position within 100 yards and choose the nearest candidate, breaking equal-distance ties by entity ID. It SHALL reject a target more than two levels above the player only when both levels are known. It SHALL NOT reject a target solely because target level is unknown.
+When a named Grind mission selects a voluntary target, it SHALL select only a live hostile unit whose trimmed name matches the mission name exactly without regard to case. It SHALL use a current finite same-map position within the legacy 400-yard observation horizon and choose the nearest candidate, breaking equal-distance ties by entity ID. It SHALL reject a target more than two levels above the player only when both levels are known. It SHALL NOT reject a target solely because target level is unknown.
 
 Known player health below 45 percent or known mana below 20 percent for a mana user SHALL block a voluntary pull. A target with three or more other live hostile units within nine yards SHALL be rejected. A smaller cluster SHALL require at least 75 percent health and 45 percent mana when the respective values are known. Unknown health, mana, or maximum values alone SHALL NOT reject a pull.
 
@@ -9,9 +9,10 @@ The current entity model does not expose elite/boss rank or observation timestam
 
 #### Scenario: Exact target selection is local and deterministic
 - **GIVEN** several live hostile units match the requested creature name
-- **WHEN** their positions are finite, on the player's map, and within 100 yards
+- **WHEN** their positions are finite, on the player's map, and within 400 yards
 - **THEN** Grind selects the nearest one and uses entity ID to break distance ties
-- **AND** it ignores loosely similar names, unavailable positions, wrong-map positions, and targets beyond the range bound
+- **AND** it accepts a target at the 400-yard boundary but ignores targets beyond that range
+- **AND** it ignores loosely similar names, unavailable positions, and wrong-map positions
 
 #### Scenario: Missing level or creature rank is not invented
 - **GIVEN** a live exact-name target has an unknown level and the current entity model has no creature-rank data
