@@ -4188,7 +4188,8 @@ mod quest_protocol_tests {
         body.extend_from_slice(&0_u32.to_le_bytes());
         body.extend_from_slice(&0x08000000_u32.to_le_bytes());
         body.extend_from_slice(&(51858_u32 | (8_u32 << 24)).to_le_bytes());
-        for _ in 1..10 {
+        body.extend_from_slice(&(51858_u32 | (0xc1_u32 << 24)).to_le_bytes());
+        for _ in 2..10 {
             body.extend_from_slice(&0_u32.to_le_bytes());
         }
         body.push(0);
@@ -4197,6 +4198,8 @@ mod quest_protocol_tests {
         assert!(
             matches!(obs, ProtocolObservation::ControlledAbilities { mover: EntityId(28511), ref spells } if spells == &vec![51858])
         );
+        assert!(controlled_abilities_observation(0x0179, &body[..57]).is_none());
+        assert!(controlled_abilities_observation(0x0179, &[0; 8]).is_none());
     }
 
     #[test]

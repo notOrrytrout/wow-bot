@@ -238,46 +238,15 @@ impl ObjectObservationRuntime {
         {
             observations.push(ProtocolObservation::BattlegroundQueue(queue));
         }
-        if opcode == SMSG_PET_SPELLS && body.len() >= 8 {
-            let raw_pet = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
-            if raw_pet == 0 {
-                observations.push(ProtocolObservation::PetControl {
-                    pet: None,
-                    reaction: None,
-                    abilities: Vec::new(),
-                });
-                self.pet_control_observed = true;
-            } else if body.len() >= 58 {
-                let reaction = Some(body[14]);
-                let mut abilities = Vec::new();
-                for index in 0..10 {
-                    let offset = 18 + index * 4;
-                    let packed =
-                        u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap_or_default());
-                    let spell = packed & 0x00ff_ffff;
-                    let action_type = (packed >> 24) as u8;
-                    let autocast = match action_type {
-                        0xc1 => Some(true),
-                        0x81 => Some(false),
-                        _ => None,
-                    };
-                    if spell != 0
-                        && !abilities
-                            .iter()
-                            .any(|ability: &wow_state::pets::PetAbilityState| {
-                                ability.spell == spell
-                            })
-                    {
-                        abilities.push(wow_state::pets::PetAbilityState { spell, autocast });
-                    }
-                }
-                observations.push(ProtocolObservation::PetControl {
-                    pet: Some(EntityId(raw_pet)),
-                    reaction,
-                    abilities,
-                });
-                self.pet_control_observed = true;
-            }
+        if opcode == SMSG_PET_SPELLS
+            && let Some(packet) = wow_state::pets::parse_controlled_unit_spell_bar(body)
+        {
+            observations.push(ProtocolObservation::PetControl {
+                pet: packet.mover,
+                reaction: packet.reaction,
+                abilities: packet.abilities,
+            });
+            self.pet_control_observed = true;
         } else if opcode == SMSG_TALENTS_INFO
             && body.first().copied() == Some(0)
             && !self.pet_control_observed
@@ -1105,6 +1074,7 @@ mod tests {
         pet_packet[..8].copy_from_slice(&55_u64.to_le_bytes());
         pet_packet[14] = 2;
         pet_packet[18..22].copy_from_slice(&(0xc100_0085_u32).to_le_bytes());
+        pet_packet[22..26].copy_from_slice(&(0x8100_0085_u32).to_le_bytes());
         let observations = runtime
             .observe(SMSG_PET_SPELLS, &pet_packet)
             .await

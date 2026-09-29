@@ -1187,25 +1187,16 @@ pub(super) fn controlled_abilities_observation(
     body: &[u8],
 ) -> Option<ProtocolObservation> {
     const SMSG_PET_SPELLS: u32 = 0x0179;
-    if opcode != SMSG_PET_SPELLS || body.len() < 58 {
+    if opcode != SMSG_PET_SPELLS {
         return None;
     }
-    let mover = read_guid(body, 0)?;
-    if mover.0 == 0 {
-        return None;
-    }
-    // AzerothCore VehicleSpellInitialize writes GUID, family, duration, one packed
-    // react/command/disable-actions u32, then ten action-bar u32 values.
-    let mut offset = 8 + 2 + 4 + 4;
-    let mut spells = Vec::new();
-    for _ in 0..10 {
-        let packed = u32_le_at(body, offset)?;
-        offset += 4;
-        let spell = packed & 0x00FF_FFFF;
-        if spell != 0 && !spells.contains(&spell) {
-            spells.push(spell);
-        }
-    }
+    let packet = wow_state::pets::parse_controlled_unit_spell_bar(body)?;
+    let mover = packet.mover?;
+    let spells = packet
+        .abilities
+        .into_iter()
+        .map(|ability| ability.spell)
+        .collect();
     Some(ProtocolObservation::ControlledAbilities { mover, spells })
 }
 
