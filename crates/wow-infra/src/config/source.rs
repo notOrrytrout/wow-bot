@@ -7,7 +7,7 @@ use super::{
     runtime_data::RuntimeTuning,
 };
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::{
     collections::HashSet,
     env, fs,
@@ -119,27 +119,25 @@ fn secure_input_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn read_secure_toml<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
+    secure_input_file(path).with_context(|| format!("secure {label} {}", path.display()))?;
+    let source =
+        fs::read_to_string(path).with_context(|| format!("read {label} {}", path.display()))?;
+    toml::from_str(&source).with_context(|| format!("parse {label} {}", path.display()))
+}
+
 /// Load the user-edited TOML config and roster, then build the supervisor's runtime config.
 /// The JSON `AppConfig` remains a private runtime representation only.
 pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
     let path = path.as_ref();
-    secure_input_file(path).with_context(|| format!("secure TOML config {}", path.display()))?;
-    let source =
-        fs::read_to_string(path).with_context(|| format!("read TOML config {}", path.display()))?;
-    let values: toml::Value =
-        toml::from_str(&source).with_context(|| format!("parse TOML config {}", path.display()))?;
+    let values: toml::Value = read_secure_toml(path, "TOML config")?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
     let roster_path = string(&values, &["bots", "roster_file"])
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("bots.toml"));
     let roster_path = resolve_from(parent, roster_path);
-    secure_input_file(&roster_path)
-        .with_context(|| format!("secure bot roster {}", roster_path.display()))?;
-    let roster_text = fs::read_to_string(&roster_path)
-        .with_context(|| format!("read bot roster {}", roster_path.display()))?;
-    let roster: BotRoster = toml::from_str(&roster_text)
-        .with_context(|| format!("parse bot roster {}", roster_path.display()))?;
+    let roster: BotRoster = read_secure_toml(&roster_path, "bot roster")?;
     if roster.version.is_some_and(|version| version != 1) {
         bail!(
             "unsupported bot roster version in {}",
@@ -476,6 +474,47 @@ character = "Test Character"
                 .mount_min_travel_yards,
             80
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&config_path, &roster_path] {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toml_config_and_roster_loaders_keep_symlink_error_context() {
+        use std::os::unix::fs::symlink;
+
+        let unique = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let directory = Path::new("/private/tmp").join(format!(
+            "wow-infra-secure-toml-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let config_link = directory.join("config-link.toml");
+        let roster_path = directory.join("bots.toml");
+        let roster_link = directory.join("roster-link.toml");
+        fs::write(&config_path, "[bots]\nroster_file = 'bots.toml'\n").unwrap();
+        fs::write(&roster_path, "").unwrap();
+        symlink(&config_path, &config_link).unwrap();
+        symlink(&roster_path, &roster_link).unwrap();
+
+        let config_error = load_toml(&config_link).unwrap_err().to_string();
+        assert!(config_error.contains("secure TOML config"));
+
+        fs::write(&config_path, "[bots]\nroster_file = 'roster-link.toml'\n").unwrap();
+        let roster_error = load_toml(&config_path).unwrap_err().to_string();
+        assert!(roster_error.contains("secure bot roster"));
 
         fs::remove_dir_all(directory).unwrap();
     }
