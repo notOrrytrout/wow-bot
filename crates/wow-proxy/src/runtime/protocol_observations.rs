@@ -436,7 +436,16 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
     const SMSG_TRAINER_LIST: u32 = 0x01B1;
     const SMSG_MAIL_LIST_RESULT: u32 = 0x023B;
     const SMSG_SHOW_BANK: u32 = 0x01B8;
+    const SMSG_GROUP_UNINVITE: u32 = 0x0077;
+    const SMSG_GROUP_DESTROYED: u32 = 0x007C;
+    const SMSG_GROUP_LIST: u32 = 0x007D;
+    const SMSG_LOOT_START_ROLL: u32 = 0x02A1;
     match opcode {
+        SMSG_GROUP_LIST => parse_group_loot_method(body).into_iter().collect(),
+        SMSG_GROUP_UNINVITE | SMSG_GROUP_DESTROYED => {
+            vec![ProtocolObservation::GroupLootMethod(None)]
+        }
+        SMSG_LOOT_START_ROLL => parse_group_loot_roll(body).into_iter().collect(),
         SMSG_ITEM_QUERY_SINGLE_RESPONSE => parse_item_template(body).into_iter().collect(),
         SMSG_LIST_INVENTORY => parse_vendor_list(body).into_iter().collect(),
         SMSG_BUY_ITEM => parse_vendor_buy_response(body).into_iter().collect(),
@@ -467,6 +476,131 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_CORPSE_RECLAIM_DELAY => parse_reclaim_delay(body).into_iter().collect(),
         SMSG_PARTYKILLLOG => parse_creature_killed(body).into_iter().collect(),
         _ => Vec::new(),
+    }
+}
+
+fn parse_group_loot_method(body: &[u8]) -> Option<ProtocolObservation> {
+    let group_type = *body.first()?;
+    let mut cursor = 4usize;
+    if group_type & 0x08 != 0 {
+        cursor = cursor.checked_add(5)?;
+    }
+    cursor = cursor.checked_add(8 + 4)?; // group GUID and update counter
+    let count = usize::try_from(u32_le_at(body, cursor)?).ok()?;
+    cursor = cursor.checked_add(4)?;
+    if count > 39 {
+        return None;
+    }
+    for _ in 0..count {
+        let name_length = body.get(cursor..)?.iter().position(|byte| *byte == 0)?;
+        cursor = cursor.checked_add(name_length + 1 + 8 + 4)?;
+        body.get(..cursor)?;
+    }
+    let leader = u64_le_at(body, cursor)?;
+    cursor = cursor.checked_add(8)?;
+    let method = if count > 0 && leader != 0 {
+        Some(wow_state::group::GroupLootMethod::from_wire(
+            *body.get(cursor)?,
+        ))
+    } else {
+        None
+    };
+    Some(ProtocolObservation::GroupLootMethod(method))
+}
+
+fn parse_group_loot_roll(body: &[u8]) -> Option<ProtocolObservation> {
+    let item_guid = u64_le_at(body, 0)?;
+    let map_id = u32_le_at(body, 8)?;
+    let item_slot = u32_le_at(body, 12)?;
+    let item_id = u32_le_at(body, 16)?;
+    // Random suffix and property fields are protocol facts that policy does not use.
+    let item_count = u32_le_at(body, 28)?;
+    let countdown_ms = u32_le_at(body, 32)?;
+    let vote_mask = *body.get(36)?;
+    if item_guid == 0 || item_id == 0 || vote_mask == 0 {
+        return None;
+    }
+    Some(ProtocolObservation::GroupLootRollStarted(
+        wow_state::group::GroupLootRollRequest {
+            item: EntityId(item_guid),
+            map_id,
+            item_slot,
+            item_id,
+            item_count,
+            countdown_ms,
+            vote_mask,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod group_loot_observation_tests {
+    use super::*;
+
+    fn group_list(method: u8) -> Vec<u8> {
+        let mut body = vec![0; 4]; // party flags, subgroup, flags, roles
+        body.extend_from_slice(&[0; 8]); // group GUID
+        body.extend_from_slice(&0_u32.to_le_bytes()); // update counter
+        body.extend_from_slice(&1_u32.to_le_bytes()); // one other member
+        body.extend_from_slice(b"Member\0");
+        body.extend_from_slice(&7_u64.to_le_bytes()); // member GUID
+        body.extend_from_slice(&[1, 0, 0, 0]); // online, subgroup, flags, roles
+        body.extend_from_slice(&8_u64.to_le_bytes()); // leader GUID
+        body.push(method);
+        body.extend_from_slice(&8_u64.to_le_bytes()); // master looter GUID
+        body.push(2); // threshold
+        body
+    }
+
+    #[test]
+    fn group_list_projects_known_and_unknown_server_loot_methods() {
+        assert!(matches!(
+            maintenance_observations(0x007D, &group_list(4)).as_slice(),
+            [ProtocolObservation::GroupLootMethod(Some(
+                wow_state::group::GroupLootMethod::NeedBeforeGreed
+            ))]
+        ));
+        assert!(matches!(
+            maintenance_observations(0x007D, &group_list(9)).as_slice(),
+            [ProtocolObservation::GroupLootMethod(Some(
+                wow_state::group::GroupLootMethod::Unknown(9)
+            ))]
+        ));
+        assert!(maintenance_observations(0x007D, &group_list(4)[..20]).is_empty());
+        assert!(matches!(
+            maintenance_observations(0x007C, &[]).as_slice(),
+            [ProtocolObservation::GroupLootMethod(None)]
+        ));
+    }
+
+    #[test]
+    fn loot_roll_start_keeps_server_item_identity_and_allowed_vote_mask() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1122_u64.to_le_bytes());
+        body.extend_from_slice(&571_u32.to_le_bytes());
+        body.extend_from_slice(&3_u32.to_le_bytes());
+        body.extend_from_slice(&1234_u32.to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes()); // random suffix
+        body.extend_from_slice(&0_u32.to_le_bytes()); // random property
+        body.extend_from_slice(&2_u32.to_le_bytes());
+        body.extend_from_slice(&30_000_u32.to_le_bytes());
+        body.push(0b0111);
+        let observations = maintenance_observations(0x02A1, &body);
+        let [ProtocolObservation::GroupLootRollStarted(request)] = observations.as_slice() else {
+            panic!("valid server roll request expected");
+        };
+        assert_eq!(request.item, EntityId(0x1122));
+        assert_eq!(request.map_id, 571);
+        assert_eq!(request.item_slot, 3);
+        assert_eq!(request.item_id, 1234);
+        assert_eq!(request.item_count, 2);
+        assert_eq!(request.countdown_ms, 30_000);
+        assert!(request.allows(0));
+        assert!(request.allows(2));
+        assert!(!request.allows(3));
+        assert!(maintenance_observations(0x02A1, &body[..36]).is_empty());
+        body[0..8].fill(0);
+        assert!(maintenance_observations(0x02A1, &body).is_empty());
     }
 }
 

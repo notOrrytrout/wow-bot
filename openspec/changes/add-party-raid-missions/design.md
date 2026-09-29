@@ -76,6 +76,8 @@ Enrich current group and entity observations for group type, raid flags, raid ta
 
 Group policy can recommend loot and roll choices, but the existing action validator remains the final authority. Roll actions require a live server roll request, eligibility, and an allowed policy result. Direct loot keeps current ownership and lootability checks.
 
+The WotLK observation boundary projects group loot method from `SMSG_GROUP_LIST` and each request from `SMSG_LOOT_START_ROLL`. Unknown loot-method values remain typed as unknown, and the request keeps its server item GUID, slot, item ID, count, countdown, and vote mask. The lane must still enforce the countdown, group-method gate, explicit eligibility, and allowed vote before it sends a vote. A missing or ended group clears pending roll requests.
+
 ## Risks / Trade-offs
 
 - [Some server observations do not contain full threat, pet ownership, or hazard data] → Preserve unknown values and enable only tactics supported by evidence.

@@ -631,6 +631,21 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.group = group;
             delta.changed.push("group".into());
         }
+        ProtocolObservation::GroupLootMethod(method) => {
+            state.group.loot_method = method;
+            if method.is_none() {
+                state.group.loot_rolls.clear();
+            }
+            delta.changed.push("group".into());
+        }
+        ProtocolObservation::GroupLootRollStarted(request) => {
+            state
+                .group
+                .loot_rolls
+                .retain(|roll| roll.item != request.item);
+            state.group.loot_rolls.push(request);
+            delta.changed.push("group".into());
+        }
         ProtocolObservation::BattlegroundQueue(queue) => {
             if queue.status == crate::battleground::BattlegroundQueueStatus::None {
                 state.battleground.queues.remove(&queue.queue_slot);
