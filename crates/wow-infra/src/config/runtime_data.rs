@@ -54,6 +54,7 @@ pub struct RuntimeConfig {
 pub struct RuntimeTuning {
     pub movement: MovementTuning,
     pub maintenance: MaintenanceTuning,
+    pub group: GroupTuning,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,11 +79,30 @@ pub struct MaintenanceTuning {
     pub bank_keep_item_ids: Vec<u32>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GroupTuning {
+    /// Time a non-tank waits after a group target is observed engaged.
+    pub threat_delay_ms: u64,
+}
+
+impl GroupTuning {
+    pub const MIN_THREAT_DELAY_MS: u64 = 1;
+    pub const MAX_THREAT_DELAY_MS: u64 = 30_000;
+
+    /// Keep user configuration within a short, nonzero wait window.
+    pub fn threat_delay_ms(&self) -> u64 {
+        self.threat_delay_ms
+            .clamp(Self::MIN_THREAT_DELAY_MS, Self::MAX_THREAT_DELAY_MS)
+    }
+}
+
 impl Default for RuntimeTuning {
     fn default() -> Self {
         Self {
             movement: MovementTuning::default(),
             maintenance: MaintenanceTuning::default(),
+            group: GroupTuning::default(),
         }
     }
 }
@@ -104,6 +124,14 @@ impl Default for MaintenanceTuning {
             auto_bank_deposit_enabled: true,
             auto_professions_enabled: true,
             bank_keep_item_ids: Vec::new(),
+        }
+    }
+}
+
+impl Default for GroupTuning {
+    fn default() -> Self {
+        Self {
+            threat_delay_ms: 1_500,
         }
     }
 }
@@ -159,5 +187,18 @@ mod tests {
                 .bank_keep_item_ids
                 .is_empty()
         );
+        assert_eq!(config.runtime_tuning.group.threat_delay_ms(), 1_500);
+    }
+
+    #[test]
+    fn group_threat_delay_is_configurable_and_bounded() {
+        let tuning: GroupTuning = serde_json::from_str(r#"{"threat_delay_ms":4200}"#).unwrap();
+        assert_eq!(tuning.threat_delay_ms(), 4_200);
+
+        let too_short: GroupTuning = serde_json::from_str(r#"{"threat_delay_ms":0}"#).unwrap();
+        assert_eq!(too_short.threat_delay_ms(), 1);
+
+        let too_long: GroupTuning = serde_json::from_str(r#"{"threat_delay_ms":60000}"#).unwrap();
+        assert_eq!(too_long.threat_delay_ms(), 30_000);
     }
 }

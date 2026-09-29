@@ -50,7 +50,7 @@ The system SHALL apply the same combat authorization and self-defense boundaries
 - **THEN** defensive combat may respond according to self-defense policy
 
 ### Requirement: Role-aware pull authorization
-The system SHALL initiate voluntary group combat only against the currently observed group encounter target. A configured tank may initiate that target. Other roles SHALL wait until the target is observed in combat against the player or an online group member. Unknown combat or victim state SHALL NOT authorize a voluntary pull.
+The system SHALL initiate voluntary group combat only against the currently observed group encounter target. A configured tank may initiate that target. Other roles SHALL wait until the target is observed in combat against the player or an online group member, then wait for the configured threat-establishment interval. The interval SHALL be at least one millisecond and at most thirty seconds. Unknown combat or victim state SHALL NOT authorize or start the delay for a voluntary pull. The delay SHALL use a monotonic clock, apply to one target, group generation, and map at a time, and reset when engagement ends, the mission changes, or the world changes.
 
 #### Scenario: Tank initiates the assigned encounter target
 - **WHEN** the tank role observes a live hostile as the current group encounter target
@@ -62,7 +62,11 @@ The system SHALL initiate voluntary group combat only against the currently obse
 
 #### Scenario: Non-tank assists a group-engaged target
 - **WHEN** a non-tank role observes the assigned hostile in combat against an online group member
-- **THEN** the bot may assist that target
+- **THEN** the bot waits until the configured threat-establishment interval has elapsed before it starts threat-producing combat
+
+#### Scenario: Threat-establishment delay is scoped to one encounter
+- **WHEN** the assigned target, group generation, map, mission, or world changes during the delay
+- **THEN** the bot starts a new delay from the next valid observed engagement
 
 #### Scenario: Nearby hostile is not assigned to the group encounter
 - **WHEN** an observed hostile is not the current group encounter target

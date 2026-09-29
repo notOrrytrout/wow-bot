@@ -5,6 +5,7 @@ use wow_state::Snapshot;
 pub enum PullDecision {
     Engage,
     WaitForGroupEngagement,
+    WaitForThreatDelay,
 }
 #[derive(Clone, Debug, Default)]
 pub struct EncounterIntent {
@@ -31,6 +32,7 @@ pub fn pull_decision(
     role: GroupRole,
     player: Option<EntityId>,
     target: EntityId,
+    threat_delay_elapsed: bool,
 ) -> PullDecision {
     if !state
         .state
@@ -45,17 +47,37 @@ pub fn pull_decision(
         return PullDecision::Engage;
     }
 
-    let Some(target_state) = state.state.entities.0.get(&target) else {
+    if !is_group_engaged(state, player, target) {
         return PullDecision::WaitForGroupEngagement;
+    }
+    if threat_delay_elapsed {
+        PullDecision::Engage
+    } else {
+        PullDecision::WaitForThreatDelay
+    }
+}
+
+/// Confirm the assigned target is visibly fighting the player or an online
+/// group member. Unknown combat or victim state cannot start the delay.
+pub fn is_group_engaged(state: &Snapshot, player: Option<EntityId>, target: EntityId) -> bool {
+    if !state
+        .state
+        .group
+        .encounter_target
+        .is_some_and(|authorized| authorized == target)
+    {
+        return false;
+    }
+    let Some(target_state) = state.state.entities.0.get(&target) else {
+        return false;
     };
     let targets_group_member = target_state.target.is_some_and(|victim| {
         Some(victim) == player || crate::group::state::observed_member(state, victim)
     });
-    if target_state.in_combat() == Some(true) && targets_group_member {
-        PullDecision::Engage
-    } else {
-        PullDecision::WaitForGroupEngagement
-    }
+    target_state.hostile
+        && !target_state.is_dead()
+        && target_state.in_combat() == Some(true)
+        && targets_group_member
 }
 
 #[cfg(test)]
@@ -67,6 +89,7 @@ mod tests {
         role: GroupRole,
         target_victim: Option<EntityId>,
         in_combat: Option<bool>,
+        threat_delay_elapsed: bool,
     ) -> PullDecision {
         let target = EntityId(9);
         let member = EntityId(2);
@@ -92,13 +115,14 @@ mod tests {
             role,
             Some(EntityId(1)),
             target,
+            threat_delay_elapsed,
         )
     }
 
     #[test]
     fn tank_can_initiate_only_the_observed_group_encounter_target() {
         assert_eq!(
-            encounter(GroupRole::Tank, None, Some(false)),
+            encounter(GroupRole::Tank, None, Some(false), false),
             PullDecision::Engage
         );
     }
@@ -106,11 +130,15 @@ mod tests {
     #[test]
     fn non_tank_waits_until_target_is_in_combat_against_observed_member() {
         assert_eq!(
-            encounter(GroupRole::Ranged, None, Some(false)),
+            encounter(GroupRole::Ranged, None, Some(false), false),
             PullDecision::WaitForGroupEngagement
         );
         assert_eq!(
-            encounter(GroupRole::Ranged, Some(EntityId(2)), Some(true)),
+            encounter(GroupRole::Ranged, Some(EntityId(2)), Some(true), false),
+            PullDecision::WaitForThreatDelay
+        );
+        assert_eq!(
+            encounter(GroupRole::Ranged, Some(EntityId(2)), Some(true), true),
             PullDecision::Engage
         );
     }
@@ -118,11 +146,11 @@ mod tests {
     #[test]
     fn non_tank_does_not_infer_authority_from_combat_flag_alone() {
         assert_eq!(
-            encounter(GroupRole::Healer, Some(EntityId(88)), Some(true)),
+            encounter(GroupRole::Healer, Some(EntityId(88)), Some(true), true),
             PullDecision::WaitForGroupEngagement
         );
         assert_eq!(
-            encounter(GroupRole::Healer, Some(EntityId(2)), None),
+            encounter(GroupRole::Healer, Some(EntityId(2)), None, true),
             PullDecision::WaitForGroupEngagement
         );
     }
@@ -148,6 +176,7 @@ mod tests {
                 GroupRole::Melee,
                 Some(EntityId(1)),
                 target,
+                true,
             ),
             PullDecision::WaitForGroupEngagement
         );

@@ -23,6 +23,9 @@
         "auto_bank_deposit_enabled": true,
         "auto_professions_enabled": true,
         "bank_keep_item_ids": []
+      },
+      "group": {
+        "threat_delay_ms": 1500
       }
     }
   },

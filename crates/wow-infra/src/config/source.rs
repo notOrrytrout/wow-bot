@@ -391,6 +391,9 @@ path_straightness = 0.75
 [runtime_tuning.maintenance]
 auto_mount_enabled = true
 mount_min_travel_yards = 80
+
+[runtime_tuning.group]
+threat_delay_ms = 4200
 "#,
         )
         .unwrap();
@@ -437,6 +440,7 @@ character = "Test Character"
             0.75
         );
         assert!(config.runtime.runtime_tuning.maintenance.auto_mount_enabled);
+        assert_eq!(config.runtime.runtime_tuning.group.threat_delay_ms(), 4_200);
         assert_eq!(
             config
                 .runtime

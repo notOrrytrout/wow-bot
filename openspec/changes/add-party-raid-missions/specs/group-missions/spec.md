@@ -88,6 +88,14 @@ Non-tank group roles SHALL wait for an observed tank or leader pull and a config
 - **WHEN** the leader targets an unengaged enemy and the bot is a non-tank
 - **THEN** the bot waits and does not turn the target selection into a pull
 
+#### Scenario: Non-tank waits for observed group threat
+- **WHEN** the assigned target is observed attacking the player or an online group member
+- **THEN** the non-tank starts its configured threat delay and does not produce combat threat until that monotonic interval expires
+
+#### Scenario: Pull delay resets after encounter authority changes
+- **WHEN** the target loses observed group engagement, the assigned target changes, the group generation changes, or the mission or world changes
+- **THEN** the old delay cannot authorize combat in the next encounter
+
 #### Scenario: Skull and X are present
 - **WHEN** both skull and X marked encounter targets are alive
 - **THEN** the configured mark priority selects skull before X unless an explicit assist assignment overrides it

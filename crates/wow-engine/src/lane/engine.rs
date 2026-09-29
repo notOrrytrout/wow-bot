@@ -440,6 +440,14 @@ struct PendingDismount {
     attempts: u8,
 }
 
+#[derive(Clone, Copy)]
+struct GroupPullDelay {
+    target: EntityId,
+    group_generation: u64,
+    map: Option<u32>,
+    started_at: Instant,
+}
+
 const TRAVEL_FORM_SPELL_IDS: [u32; 2] = [783, 2645];
 const DISMOUNT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const DISMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -529,6 +537,7 @@ pub struct LaneEngine {
     last_survival_action: Option<(EntityId, Instant)>,
     fishing_cast_at: Option<Instant>,
     fishing_retry_after: Option<Instant>,
+    group_pull_delay: Option<GroupPullDelay>,
 }
 
 impl LaneEngine {
@@ -622,6 +631,7 @@ impl LaneEngine {
             last_survival_action: None,
             fishing_cast_at: None,
             fishing_retry_after: None,
+            group_pull_delay: None,
         }
     }
 
@@ -950,7 +960,14 @@ impl LaneEngine {
                             .await;
                     }
                 }
-                if matches!(o, ProtocolObservation::LeftWorld) {
+                if matches!(
+                    &o,
+                    ProtocolObservation::EnteredWorld { .. }
+                        | ProtocolObservation::WorldChanged { .. }
+                ) {
+                    self.group_pull_delay = None;
+                }
+                if matches!(&o, ProtocolObservation::LeftWorld) {
                     self.reset_session_work();
                 }
                 match &o {
@@ -1424,6 +1441,7 @@ impl LaneEngine {
             LaneMessage::ReplaceMission(m) => {
                 self.state.mission = m;
                 self.state.mission_revision = self.state.mission_revision.next();
+                self.group_pull_delay = None;
                 self.last_quest_step = None;
                 self.pending_accept = None;
                 self.pending_turn_in = None;
@@ -2113,21 +2131,25 @@ impl LaneEngine {
                 .next()
                 .is_some();
         if !has_observed_group_member {
+            self.group_pull_delay = None;
             self.waiting("group mission is waiting for an observed online group member".into());
             return true;
         }
 
         let Some(target) = wow_policy::group::encounter::from_observed(&snapshot).preferred_target
         else {
+            self.group_pull_delay = None;
             return self.tick_group_follow(&snapshot, player).await;
         };
         let Some(target_state) = self.state.authoritative.entities.0.get(&target) else {
+            self.group_pull_delay = None;
             self.waiting(
                 "observed group encounter target is not present in current entity state".into(),
             );
             return true;
         };
         if !target_state.hostile || target_state.is_dead() {
+            self.group_pull_delay = None;
             self.waiting("observed group encounter target is not a live hostile".into());
             return true;
         }
@@ -2136,14 +2158,69 @@ impl LaneEngine {
             MissionIntent::Party { role } | MissionIntent::Raid { role } => *role,
             _ => GroupRole::Auto,
         };
-        if wow_policy::group::encounter::pull_decision(&snapshot, role, player, target)
-            == wow_policy::group::encounter::PullDecision::WaitForGroupEngagement
-        {
-            self.waiting("group role is waiting for an observed authorized pull".into());
-            return true;
+        let threat_delay_elapsed =
+            self.group_pull_delay_elapsed(&snapshot, role, player, target, Instant::now());
+        match wow_policy::group::encounter::pull_decision(
+            &snapshot,
+            role,
+            player,
+            target,
+            threat_delay_elapsed,
+        ) {
+            wow_policy::group::encounter::PullDecision::WaitForGroupEngagement => {
+                self.waiting("group role is waiting for an observed authorized pull".into());
+                return true;
+            }
+            wow_policy::group::encounter::PullDecision::WaitForThreatDelay => {
+                self.waiting(
+                    "group role is waiting for the configured threat-establishment delay".into(),
+                );
+                return true;
+            }
+            wow_policy::group::encounter::PullDecision::Engage => {}
         }
 
         self.dispatch_combat_target(target, false).await
+    }
+
+    fn group_pull_delay_elapsed(
+        &mut self,
+        snapshot: &Snapshot,
+        role: GroupRole,
+        player: Option<EntityId>,
+        target: EntityId,
+        now: Instant,
+    ) -> bool {
+        if role == GroupRole::Tank {
+            self.group_pull_delay = None;
+            return true;
+        }
+        if !wow_policy::group::encounter::is_group_engaged(snapshot, player, target) {
+            self.group_pull_delay = None;
+            return false;
+        }
+        let generation = snapshot.state.group.generation;
+        let map = snapshot.state.position.player.map(|position| position.map);
+        let started_at = match self.group_pull_delay {
+            Some(delay)
+                if delay.target == target
+                    && delay.group_generation == generation
+                    && delay.map == map =>
+            {
+                delay.started_at
+            }
+            _ => {
+                self.group_pull_delay = Some(GroupPullDelay {
+                    target,
+                    group_generation: generation,
+                    map,
+                    started_at: now,
+                });
+                now
+            }
+        };
+        now.duration_since(started_at)
+            >= Duration::from_millis(self.runtime_tuning.group.threat_delay_ms())
     }
 
     async fn tick_group_follow(&mut self, snapshot: &Snapshot, player: Option<EntityId>) -> bool {
@@ -6709,6 +6786,7 @@ impl LaneEngine {
     }
 
     fn reset_session_work(&mut self) {
+        self.group_pull_delay = None;
         self.last_quest_step = None;
         self.pending_accept = None;
         self.pending_giver_interaction = None;
@@ -7089,6 +7167,207 @@ mod tests {
         ] {
             assert_eq!(group_follow_stop_distance(&intent), expected);
         }
+    }
+
+    fn group_engagement_fixture() -> (LaneEngine, Snapshot, EntityId) {
+        let player = EntityId(1);
+        let member = EntityId(2);
+        let target = EntityId(9);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        authoritative.group.lifecycle = wow_state::group::GroupLifecycle::Active;
+        authoritative.group.generation = 4;
+        authoritative
+            .group
+            .members
+            .push(wow_state::group::GroupMember {
+                entity: member,
+                online: true,
+                ..Default::default()
+            });
+        authoritative.group.encounter_target = Some(target);
+        authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                hostile: true,
+                health: Some((100, 100)),
+                target: Some(member),
+                unit_flags: Some(0x0008_0000),
+                ..Default::default()
+            },
+        );
+        let (engine, _) = test_engine(
+            Mission {
+                id: MissionId(92),
+                intent: MissionIntent::Party {
+                    role: GroupRole::Melee,
+                },
+                permissions: PermissionSet::MOVE | PermissionSet::COMBAT,
+            },
+            authoritative,
+        );
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        (engine, snapshot, target)
+    }
+
+    #[test]
+    fn group_pull_timer_starts_on_observed_engagement_and_is_target_scoped() {
+        let (mut engine, snapshot, target) = group_engagement_fixture();
+        let now = Instant::now();
+        assert!(!engine.group_pull_delay_elapsed(
+            &snapshot,
+            GroupRole::Melee,
+            Some(EntityId(1)),
+            target,
+            now,
+        ));
+        assert!(engine.group_pull_delay.is_some());
+
+        engine.group_pull_delay = Some(GroupPullDelay {
+            target,
+            group_generation: snapshot.state.group.generation,
+            map: Some(1),
+            started_at: now - Duration::from_millis(1_501),
+        });
+        assert!(engine.group_pull_delay_elapsed(
+            &snapshot,
+            GroupRole::Melee,
+            Some(EntityId(1)),
+            target,
+            now,
+        ));
+
+        let other_target = EntityId(10);
+        let mut changed = snapshot.clone();
+        changed.state.group.encounter_target = Some(other_target);
+        changed.state.entities.0.insert(
+            other_target,
+            wow_state::entities::EntityState {
+                id: other_target,
+                hostile: true,
+                target: Some(EntityId(2)),
+                unit_flags: Some(0x0008_0000),
+                ..Default::default()
+            },
+        );
+        assert!(!engine.group_pull_delay_elapsed(
+            &changed,
+            GroupRole::Melee,
+            Some(EntityId(1)),
+            other_target,
+            now,
+        ));
+        assert_eq!(engine.group_pull_delay.unwrap().target, other_target);
+
+        engine.group_pull_delay.as_mut().unwrap().started_at = now - Duration::from_millis(1_501);
+        let mut new_group = changed.clone();
+        new_group.state.group.generation += 1;
+        assert!(!engine.group_pull_delay_elapsed(
+            &new_group,
+            GroupRole::Melee,
+            Some(EntityId(1)),
+            other_target,
+            now,
+        ));
+        assert_eq!(
+            engine.group_pull_delay.unwrap().group_generation,
+            new_group.state.group.generation
+        );
+
+        engine.group_pull_delay.as_mut().unwrap().started_at = now - Duration::from_millis(1_501);
+        let mut new_map = new_group.clone();
+        new_map.state.position.player.as_mut().unwrap().map = 2;
+        assert!(!engine.group_pull_delay_elapsed(
+            &new_map,
+            GroupRole::Melee,
+            Some(EntityId(1)),
+            other_target,
+            now,
+        ));
+        assert_eq!(engine.group_pull_delay.unwrap().map, Some(2));
+    }
+
+    #[test]
+    fn group_pull_timer_clears_when_engagement_is_lost_or_tank_takes_over() {
+        let (mut engine, snapshot, target) = group_engagement_fixture();
+        let now = Instant::now();
+        engine.group_pull_delay_elapsed(
+            &snapshot,
+            GroupRole::Melee,
+            Some(EntityId(1)),
+            target,
+            now,
+        );
+
+        let mut disengaged = snapshot.clone();
+        disengaged
+            .state
+            .entities
+            .0
+            .get_mut(&target)
+            .unwrap()
+            .unit_flags = Some(0);
+        assert!(!engine.group_pull_delay_elapsed(
+            &disengaged,
+            GroupRole::Melee,
+            Some(EntityId(1)),
+            target,
+            now,
+        ));
+        assert!(engine.group_pull_delay.is_none());
+
+        engine.group_pull_delay_elapsed(
+            &snapshot,
+            GroupRole::Melee,
+            Some(EntityId(1)),
+            target,
+            now,
+        );
+        assert!(engine.group_pull_delay_elapsed(
+            &snapshot,
+            GroupRole::Tank,
+            Some(EntityId(1)),
+            target,
+            now,
+        ));
+        assert!(engine.group_pull_delay.is_none());
+    }
+
+    #[tokio::test]
+    async fn group_pull_timer_clears_on_world_and_mission_changes() {
+        let (mut engine, _, target) = group_engagement_fixture();
+        let timer = || GroupPullDelay {
+            target,
+            group_generation: 4,
+            map: Some(1),
+            started_at: Instant::now(),
+        };
+        engine.group_pull_delay = Some(timer());
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::WorldChanged {
+                    character_guid: 1,
+                    position: WorldPosition {
+                        map: 2,
+                        point: Vec3::new(10.0, 10.0, 0.0),
+                        orientation: 0.0,
+                    },
+                },
+            ))
+            .await;
+        assert!(engine.group_pull_delay.is_none());
+
+        engine.group_pull_delay = Some(timer());
+        engine
+            .handle(LaneMessage::ReplaceMission(Mission::idle()))
+            .await;
+        assert!(engine.group_pull_delay.is_none());
     }
 
     #[test]
