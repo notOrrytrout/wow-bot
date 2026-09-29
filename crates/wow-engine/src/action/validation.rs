@@ -844,22 +844,13 @@ fn validate_economy_command(
                 && wow_policy::maintenance::vendor_gear_upgrade_destination(snapshot, *item)
                     .is_some();
             let trusted_seller = snapshot.state.entities.0.get(vendor).is_some_and(|entity| {
-                let nearby = snapshot
-                    .state
-                    .position
-                    .player
-                    .zip(entity.position)
-                    .is_some_and(|(player, seller)| {
-                        player.map == seller.map && player.point.distance(seller.point) <= 5.0
-                    });
-                entity.kind == wow_state::entities::EntityKind::Unit
-                    && entity.interactable
-                    && nearby
-                    && wow_infra::world_knowledge::embedded_azerothcore_catalog()
-                        .vendor_offers_service(
-                            entity.entry,
-                            wow_infra::world_knowledge::VendorKind::Sell,
-                        )
+                snapshot.state.position.player.is_some_and(|player| {
+                    wow_policy::interaction::is_nearby_interactable_unit(entity, player, 5.0)
+                }) && wow_infra::world_knowledge::embedded_azerothcore_catalog()
+                    .vendor_offers_service(
+                        entity.entry,
+                        wow_infra::world_knowledge::VendorKind::Sell,
+                    )
             });
             if !valid
                 || (!poison && !recovery_supply && !ranged_ammo && !vendor_gear)

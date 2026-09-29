@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use wow_domain::EntityId;
-use wow_state::{Snapshot, entities::EntityKind};
+use wow_state::Snapshot;
 
 pub const BANK_BAG_PRESSURE_FREE_SLOTS: u16 = 2;
 pub const BANK_INTERACTION_RANGE_YARDS: f32 = 5.0;
@@ -61,13 +61,11 @@ pub fn trusted_nearby_bankers(snapshot: &Snapshot) -> Vec<EntityId> {
         .0
         .values()
         .filter(|entity| {
-            entity.kind == EntityKind::Unit
-                && entity.interactable
-                && entity.npc_flags.is_some_and(is_banker_flags)
-                && entity.position.is_some_and(|position| {
-                    position.map == player.map
-                        && position.point.distance(player.point) <= BANK_INTERACTION_RANGE_YARDS
-                })
+            crate::interaction::is_nearby_interactable_unit(
+                entity,
+                player,
+                BANK_INTERACTION_RANGE_YARDS,
+            ) && entity.npc_flags.is_some_and(is_banker_flags)
         })
         .map(|entity| entity.id)
         .collect::<Vec<_>>();

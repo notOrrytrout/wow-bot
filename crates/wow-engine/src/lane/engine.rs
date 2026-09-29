@@ -127,29 +127,12 @@ fn nearby_class_trainer(snapshot: &Snapshot) -> Option<EntityId> {
         .state
         .control
         .active_position(snapshot.state.position.player)?;
-    snapshot
-        .state
-        .entities
-        .0
-        .values()
-        .filter(|entity| {
-            entity.kind == wow_state::entities::EntityKind::Unit
-                && entity.interactable
-                && entity
-                    .npc_flags
-                    .is_some_and(wow_policy::maintenance::is_class_trainer_flags)
-        })
-        .filter_map(|entity| entity.position.map(|point| (entity, point)))
-        .filter(|(_, trainer_position)| {
-            trainer_position.map == position.map
-                && trainer_position.point.distance(position.point) <= 5.0
-        })
-        .min_by(|(_, left), (_, right)| {
-            left.point
-                .distance(position.point)
-                .total_cmp(&right.point.distance(position.point))
-        })
-        .map(|(entity, _)| entity.id)
+    nearest_interactable_unit(&snapshot.state.entities.0, position, Some(5.0), |entity| {
+        entity
+            .npc_flags
+            .is_some_and(wow_policy::maintenance::is_class_trainer_flags)
+    })
+    .map(|(trainer, _)| trainer)
 }
 
 fn nearby_profession_trainer(snapshot: &Snapshot) -> Option<EntityId> {
