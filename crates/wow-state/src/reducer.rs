@@ -740,6 +740,45 @@ mod tests {
     }
 
     #[test]
+    fn battleground_world_state_snapshot_replaces_values_and_updates_one_value() {
+        let mut state = AuthoritativeState::default();
+        reduce(
+            &mut state,
+            ProtocolObservation::BattlegroundWorldStatesInitialized {
+                map_id: 529,
+                zone_id: 0,
+                area_id: 0,
+                states: vec![(1770, 1), (1773, -1)],
+            },
+        );
+        assert_eq!(state.battleground.map_id, Some(529));
+        assert_eq!(state.battleground.world_states.get(&1770), Some(&1));
+        assert_eq!(state.battleground.world_states.get(&1773), Some(&-1));
+
+        reduce(
+            &mut state,
+            ProtocolObservation::BattlegroundWorldStateUpdated {
+                variable: 1770,
+                value: 0,
+            },
+        );
+        assert_eq!(state.battleground.world_states.get(&1770), Some(&0));
+        assert_eq!(state.battleground.world_states.get(&1773), Some(&-1));
+
+        reduce(
+            &mut state,
+            ProtocolObservation::BattlegroundWorldStatesInitialized {
+                map_id: 529,
+                zone_id: 0,
+                area_id: 0,
+                states: vec![(1770, 2)],
+            },
+        );
+        assert_eq!(state.battleground.world_states.len(), 1);
+        assert_eq!(state.battleground.world_states.get(&1770), Some(&2));
+    }
+
+    #[test]
     fn world_transitions_clear_battleground_queue_observations() {
         let mut state = AuthoritativeState::default();
         reduce(
