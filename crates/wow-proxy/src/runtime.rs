@@ -19,12 +19,13 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use gameplay::*;
 use protocol_observations::*;
+use sha1::{Digest, Sha1};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::Write as _,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -40,8 +41,8 @@ use wow_control_proto::{ProxyToWorker, SupervisorCommand, WorkerToProxy};
 #[cfg(test)]
 use wow_domain::Vec3;
 use wow_domain::{
-    AccountId, EntityId, GameplayCommand, LaneId, Mission, MissionId, WorkerGeneration,
-    WorldPosition,
+    AccountId, EntityId, GameplayCommand, LaneId, Mission, MissionId,
+    QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID, WorkerGeneration, WorldPosition,
 };
 use wow_infra::logging::structured::{DiagnosticLogger, DiagnosticStream, diagnostic_path};
 use wow_login_messages::Message as _;
@@ -55,7 +56,7 @@ use wow_login_messages::{
 };
 use wow_srp::{normalized_string::NormalizedString, wrath_header::ProofSeed};
 use wow_state::ProtocolObservation;
-use wow_tentacli_adapter::runtime::{ObjectObservationRuntime, login_verify_world};
+use wow_tentacli_adapter::runtime::{ObjectObservationRuntime, login_verify_world, new_world};
 use wow_world_messages::Message as _;
 use wow_world_messages::wrath::{
     CMSG_AUTH_SESSION, CMSG_WARDEN_DATA, ClientMessage as _, SMSG_AUTH_CHALLENGE, SMSG_WARDEN_DATA,
@@ -68,6 +69,28 @@ use wow_world_messages::wrath::{
 fn bot_loot_target_for_command(command: &GameplayCommand) -> Option<EntityId> {
     match command {
         GameplayCommand::Loot(target) | GameplayCommand::UseGameObject(target) => Some(*target),
+        GameplayCommand::CastGameObject {
+            spell,
+            target,
+            report_use: true,
+        } if *spell == QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID => Some(*target),
+        _ => None,
+    }
+}
+
+fn gameobject_report_use_for_command(command: &GameplayCommand) -> Option<(EntityId, ClientFrame)> {
+    match command {
+        GameplayCommand::CastGameObject {
+            target,
+            report_use: true,
+            ..
+        } => Some((
+            *target,
+            ClientFrame {
+                opcode: 0x0481,
+                body: target.0.to_le_bytes().to_vec(),
+            },
+        )),
         _ => None,
     }
 }
@@ -129,19 +152,61 @@ fn log_loot_wire_packet(account: &str, direction: &str, opcode: u32, body: &[u8]
 }
 
 #[cfg(test)]
-mod single_port_route_tests {
+mod auth_registry_tests {
     use super::*;
 
-    #[test]
-    fn world_routes_are_consumed_in_login_order_per_client_ip() {
-        let routes = WorldRouteRegistry::default();
-        let ip = IpAddr::from([203, 0, 113, 7]);
-        routes.record(ip, WorldRoute::Configured);
-        routes.record(ip, WorldRoute::PassThrough);
+    fn proof(account: &str, client_seed: u32, server_seed: u32, key: &[u8; 40]) -> [u8; 20] {
+        let mut hasher = Sha1::new();
+        hasher.update(account.to_ascii_uppercase().as_bytes());
+        hasher.update([0_u8; 4]);
+        hasher.update(client_seed.to_le_bytes());
+        hasher.update(server_seed.to_le_bytes());
+        hasher.update(key);
+        hasher.finalize().into()
+    }
 
-        assert_eq!(routes.take(ip).unwrap(), WorldRoute::Configured);
-        assert_eq!(routes.take(ip).unwrap(), WorldRoute::PassThrough);
-        assert!(routes.take(ip).is_err());
+    #[tokio::test]
+    async fn auth_registry_matches_world_login_to_the_right_key_behind_one_ip() {
+        let registry = AuthRegistry::default();
+        let ip = IpAddr::from([203, 0, 113, 7]);
+        let first = [0x11; 40];
+        let second = [0x22; 40];
+        registry.put("TEST1", ip, first).await;
+        registry.put("TEST2", ip, second).await;
+
+        let matched = registry
+            .verify("TEST1", ip, 3, 5, &proof("TEST1", 3, 5, &first))
+            .await
+            .unwrap();
+        assert_eq!(matched.key, first);
+        assert!(
+            registry
+                .verify("TEST1", ip, 3, 5, &proof("TEST1", 3, 5, &first))
+                .await
+                .is_none()
+        );
+        assert!(
+            registry
+                .verify("TEST1", ip, 3, 5, &proof("TEST1", 3, 5, &second))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_registry_rejects_proof_from_a_different_peer_ip() {
+        let registry = AuthRegistry::default();
+        let ip = IpAddr::from([203, 0, 113, 7]);
+        let other_ip = IpAddr::from([203, 0, 113, 8]);
+        let key = [0x5a; 40];
+        registry.put("TEST1", ip, key).await;
+
+        assert!(
+            registry
+                .verify("TEST1", other_ip, 3, 5, &proof("TEST1", 3, 5, &key))
+                .await
+                .is_none()
+        );
     }
 }
 
@@ -168,7 +233,7 @@ pub struct ProxyRuntimeConfig {
 pub struct ProxyAccountConfig {
     pub account: AccountId,
     pub lane: LaneId,
-    pub worker: WorkerGeneration,
+    pub worker: Option<WorkerGeneration>,
     pub account_name: String,
     pub password: String,
     pub character: Option<String>,
@@ -176,9 +241,15 @@ pub struct ProxyAccountConfig {
 
 pub struct ManagedLane {
     pub config: ProxyAccountConfig,
-    pub worker_rx: mpsc::Receiver<WorkerToProxy>,
-    pub worker_tx: mpsc::Sender<ProxyToWorker>,
+    pub worker_rx: Option<mpsc::Receiver<WorkerToProxy>>,
+    pub worker_tx: Option<mpsc::Sender<ProxyToWorker>>,
     pub supervisor_tx: mpsc::Sender<SupervisorCommand>,
+    pub terminal_commands: mpsc::Receiver<TerminalBotCommand>,
+}
+
+pub struct TerminalBotCommand {
+    pub text: String,
+    pub reply: oneshot::Sender<Result<Vec<String>, String>>,
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -262,6 +333,17 @@ fn is_server_movement_visual_opcode(opcode: u32) -> bool {
     matches!(opcode, 0x00C7 | 0x00DD | 0x02AE)
 }
 
+fn movement_visual_source_is_owned(
+    source: MovementVisualSource,
+    owner: crate::ownership::OwnershipSnapshot,
+) -> bool {
+    match source {
+        MovementVisualSource::Bot => owner.permits(crate::ownership::ClientKind::Bot),
+        MovementVisualSource::ProxyHandoff => owner.mode == crate::ownership::ControlMode::Manual,
+        MovementVisualSource::Player | MovementVisualSource::Server => false,
+    }
+}
+
 fn is_movement_observation(observation: &ProtocolObservation) -> bool {
     matches!(
         observation,
@@ -322,6 +404,7 @@ struct AccountRuntime {
     headless_active: Arc<std::sync::atomic::AtomicBool>,
     assistance_armed: watch::Sender<bool>,
     ownership_state: watch::Sender<crate::ownership::OwnershipSnapshot>,
+    visual_fence: broadcast::Sender<()>,
     movement_gate: Arc<tokio::sync::Mutex<()>>,
     player_worlds: Arc<Mutex<PlayerWorlds>>,
 }
@@ -374,96 +457,267 @@ impl Drop for PlayerWorldHandoff {
 
 #[derive(Clone, Default)]
 struct AuthRegistry {
-    keys: Arc<RwLock<HashMap<String, [u8; 40]>>>,
+    keys: Arc<RwLock<HashMap<String, VecDeque<DownstreamAuthSession>>>>,
+    next_generation: Arc<AtomicU64>,
+}
+#[derive(Clone)]
+struct DownstreamAuthSession {
+    peer_ip: IpAddr,
+    generation: u64,
+    created_at: tokio::time::Instant,
+    key: [u8; 40],
 }
 impl AuthRegistry {
-    async fn put(&self, account: &str, key: [u8; 40]) {
-        self.keys.write().await.insert(account.to_uppercase(), key);
+    async fn put(&self, account: &str, peer_ip: IpAddr, key: [u8; 40]) {
+        const MAX_SESSIONS_PER_ACCOUNT: usize = 32;
+        const SESSION_TTL: Duration = Duration::from_secs(45);
+        let now = tokio::time::Instant::now();
+        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel).max(1);
+        let mut keys = self.keys.write().await;
+        let sessions = keys.entry(account.to_uppercase()).or_default();
+        sessions.retain(|session| now.duration_since(session.created_at) <= SESSION_TTL);
+        sessions.push_back(DownstreamAuthSession {
+            peer_ip,
+            generation,
+            created_at: now,
+            key,
+        });
+        while sessions.len() > MAX_SESSIONS_PER_ACCOUNT {
+            sessions.pop_front();
+        }
     }
-    async fn get(&self, account: &str) -> Option<[u8; 40]> {
-        self.keys.read().await.get(&account.to_uppercase()).copied()
+
+    async fn verify(
+        &self,
+        account: &str,
+        peer_ip: IpAddr,
+        client_seed: u32,
+        server_seed: u32,
+        client_proof: &[u8; 20],
+    ) -> Option<DownstreamAuthSession> {
+        const SESSION_TTL: Duration = Duration::from_secs(45);
+        let now = tokio::time::Instant::now();
+        let mut keys = self.keys.write().await;
+        let sessions = keys.get_mut(&account.to_uppercase())?;
+        sessions.retain(|session| now.duration_since(session.created_at) <= SESSION_TTL);
+        let index = sessions.iter().rposition(|session| {
+            session.peer_ip == peer_ip
+                && world_auth_proof_matches(
+                    account,
+                    client_seed,
+                    server_seed,
+                    &session.key,
+                    client_proof,
+                )
+        })?;
+        sessions.remove(index)
     }
+}
+
+fn world_auth_proof_matches(
+    account: &str,
+    client_seed: u32,
+    server_seed: u32,
+    session_key: &[u8; 40],
+    client_proof: &[u8; 20],
+) -> bool {
+    let mut hasher = Sha1::new();
+    hasher.update(account.to_ascii_uppercase().as_bytes());
+    hasher.update([0_u8; 4]);
+    hasher.update(client_seed.to_le_bytes());
+    hasher.update(server_seed.to_le_bytes());
+    hasher.update(session_key);
+    let expected = hasher.finalize();
+    expected
+        .iter()
+        .zip(client_proof)
+        .fold(0_u8, |difference, (expected, actual)| {
+            difference | (expected ^ actual)
+        })
+        == 0
 }
 
 #[derive(Clone)]
 struct ActionLogManager {
     dir: PathBuf,
     sessions: Arc<tokio::sync::Mutex<HashMap<String, ActionLogSession>>>,
+    operation: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct ActionLogSession {
     path: PathBuf,
-    file: File,
+    tx: mpsc::Sender<ActionLogRecord>,
+    failure: Arc<Mutex<Option<String>>>,
 }
+
+enum ActionLogRecord {
+    Value(serde_json::Value),
+    Stop(oneshot::Sender<Result<(), String>>),
+}
+
+static NEXT_ACTION_LOG_ID: AtomicU64 = AtomicU64::new(1);
 
 impl ActionLogManager {
     fn new(dir: PathBuf) -> Self {
         Self {
             dir,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            operation: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    async fn start(&self, account: &str) -> Result<PathBuf> {
-        std::fs::create_dir_all(&self.dir)?;
+    async fn start(&self, account: &str, label: Option<&str>) -> Result<PathBuf> {
+        let _operation = self.operation.lock().await;
+        let _ = self.stop_inner(account).await?;
+        prepare_action_log_directory(&self.dir)?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let unique = NEXT_ACTION_LOG_ID.fetch_add(1, Ordering::Relaxed);
         let safe = account
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect::<String>();
-        let path = self.dir.join(format!("action-{safe}-{stamp}.jsonl"));
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(
-            file,
-            "{{\"event\":\"start\",\"account\":{:?},\"unix_s\":{stamp}}}",
-            account
-        )?;
+        let path = self.dir.join(format!(
+            "action-{safe}-{stamp}-{}-{unique}.jsonl",
+            std::process::id(),
+        ));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options.open(&path)?;
+        let start = serde_json::json!({
+            "event": "start",
+            "account": account,
+            "label": label,
+            "unix_s": stamp,
+        });
+        writeln!(file, "{start}")?;
         file.flush()?;
+        let (tx, mut rx) = mpsc::channel::<ActionLogRecord>(4096);
+        let failure = Arc::new(Mutex::new(None));
+        let writer_failure = failure.clone();
+        tokio::task::spawn_blocking(move || {
+            while let Some(record) = rx.blocking_recv() {
+                match record {
+                    ActionLogRecord::Value(value) => {
+                        if let Err(error) = writeln!(file, "{value}").and_then(|_| file.flush()) {
+                            *writer_failure
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(error.to_string());
+                            break;
+                        }
+                    }
+                    ActionLogRecord::Stop(reply) => {
+                        let result = file.flush().map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                        break;
+                    }
+                }
+            }
+        });
         self.sessions.lock().await.insert(
             account.to_uppercase(),
             ActionLogSession {
                 path: path.clone(),
-                file,
+                tx,
+                failure,
             },
         );
         Ok(path)
     }
 
-    async fn stop(&self, account: &str) -> Result<Option<PathBuf>> {
+    async fn stop(&self, account: &str) -> Result<Option<(PathBuf, Option<String>)>> {
+        let _operation = self.operation.lock().await;
+        self.stop_inner(account).await
+    }
+
+    async fn stop_inner(&self, account: &str) -> Result<Option<(PathBuf, Option<String>)>> {
         let mut sessions = self.sessions.lock().await;
-        if let Some(mut session) = sessions.remove(&account.to_uppercase()) {
-            writeln!(session.file, "{{\"event\":\"stop\"}}")?;
-            session.file.flush()?;
-            return Ok(Some(session.path));
+        if let Some(session) = sessions.remove(&account.to_uppercase()) {
+            let failure = session
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if failure.is_some() {
+                return Ok(Some((session.path, failure)));
+            }
+            let (reply, result) = oneshot::channel();
+            let record = serde_json::json!({"event": "stop"});
+            if session
+                .tx
+                .send(ActionLogRecord::Value(record))
+                .await
+                .is_err()
+            {
+                return Ok(Some((
+                    session.path,
+                    Some("Action Log writer stopped before capture completed".into()),
+                )));
+            }
+            if session.tx.send(ActionLogRecord::Stop(reply)).await.is_err() {
+                return Ok(Some((
+                    session.path,
+                    Some("Action Log writer stopped before flush".into()),
+                )));
+            }
+            let flush = result.await.context("Action Log writer result was lost")?;
+            if let Err(error) = flush {
+                return Ok(Some((session.path, Some(error))));
+            }
+            return Ok(Some((session.path, failure)));
         }
         Ok(None)
     }
 
-    async fn status(&self, account: &str) -> Option<PathBuf> {
+    async fn status(&self, account: &str) -> Option<(PathBuf, Option<String>)> {
         self.sessions
             .lock()
             .await
             .get(&account.to_uppercase())
-            .map(|s| s.path.clone())
+            .map(|session| {
+                (
+                    session.path.clone(),
+                    session
+                        .failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                )
+            })
     }
 
     async fn mark(&self, account: &str, label: Option<&str>) -> Result<bool> {
-        let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get_mut(&account.to_uppercase()) else {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(&account.to_uppercase()) else {
             return Ok(false);
         };
-        let label = label.unwrap_or("mark").replace('"', "'");
-        writeln!(session.file, "{{\"event\":\"mark\",\"label\":{:?}}}", label)?;
-        session.file.flush()?;
-        Ok(true)
+        let record = serde_json::json!({"event": "mark", "label": label.unwrap_or("mark")});
+        match session.tx.try_send(ActionLogRecord::Value(record)) {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                *session
+                    .failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(format!("Action Log queue unavailable: {error}"));
+                Err(anyhow::anyhow!("Action Log queue is unavailable"))
+            }
+        }
     }
 
     async fn packet(&self, account: &str, stream: &str, direction: &str, opcode: u32, body: &[u8]) {
-        let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get_mut(&account.to_uppercase()) else {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(&account.to_uppercase()) else {
             return;
         };
         let unix_ms = SystemTime::now()
@@ -473,7 +727,9 @@ impl ActionLogManager {
         let fingerprint = body.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         });
-        let body_hex = encode_body_hex(body);
+        const MAX_LOGGED_PACKET_BODY: usize = 4096;
+        let body_hex = encode_body_hex(&body[..body.len().min(MAX_LOGGED_PACKET_BODY)]);
+        let redaction_reason = action_log_redaction_reason(direction, opcode);
         let record = serde_json::json!({
             "event": "packet",
             "unix_ms": unix_ms,
@@ -481,11 +737,22 @@ impl ActionLogManager {
             "direction": direction,
             "opcode": opcode,
             "body_len": body.len(),
+            "body_truncated": redaction_reason.is_none() && body.len() > MAX_LOGGED_PACKET_BODY,
             "fingerprint": format!("{fingerprint:016X}"),
-            "body_hex": body_hex,
+            "body_hex": if redaction_reason.is_none() { Some(body_hex) } else { None },
+            "redaction_reason": redaction_reason,
         });
-        let _ = writeln!(session.file, "{record}");
-        let _ = session.file.flush();
+        if let Err(error) = session.tx.try_send(ActionLogRecord::Value(record)) {
+            *session
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(format!("Action Log queue unavailable: {error}"));
+            tracing::warn!(
+                account,
+                "Action Log dropped a packet record because its bounded writer queue is full"
+            );
+        }
     }
 
     async fn position(
@@ -501,8 +768,8 @@ impl ActionLogManager {
         if !position.point.is_finite() || !position.orientation.is_finite() {
             return;
         }
-        let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get_mut(&account.to_uppercase()) else {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(&account.to_uppercase()) else {
             return;
         };
         let unix_ms = SystemTime::now()
@@ -523,9 +790,49 @@ impl ActionLogManager {
             "flags": flags,
             "client_time": client_time,
         });
-        let _ = writeln!(session.file, "{record}");
-        let _ = session.file.flush();
+        if let Err(error) = session.tx.try_send(ActionLogRecord::Value(record)) {
+            *session
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(format!("Action Log queue unavailable: {error}"));
+            tracing::warn!(
+                account,
+                "Action Log dropped a position record because its bounded writer queue is full"
+            );
+        }
     }
+}
+
+fn action_log_redaction_reason(direction: &str, opcode: u32) -> Option<&'static str> {
+    match (direction, opcode) {
+        ("C2S", 0x0095) | ("S2C", 0x0096 | 0x03B3) => Some("chat payload redacted"),
+        ("C2S", opcode) if opcode == CMSG_WARDEN_DATA::OPCODE => Some("Warden payload redacted"),
+        ("S2C", opcode) if opcode == SMSG_WARDEN_DATA::OPCODE => Some("Warden payload redacted"),
+        _ => None,
+    }
+}
+
+fn prepare_action_log_directory(path: &Path) -> Result<()> {
+    wow_infra::security::paths::reject_symlink_path(path)
+        .context("Action Log path cannot traverse a symbolic link")?;
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Action Log path must be a real directory"
+        );
+    } else {
+        std::fs::create_dir_all(path)?;
+    }
+    wow_infra::security::paths::reject_symlink_path(path)
+        .context("Action Log path cannot traverse a symbolic link")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -533,55 +840,8 @@ struct SharedRuntime {
     config: Arc<ProxyRuntimeConfig>,
     accounts: Arc<HashMap<String, AccountRuntime>>,
     auth: AuthRegistry,
-    world_routes: Arc<WorldRouteRegistry>,
+    admission: AdmissionController,
     action_logs: ActionLogManager,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorldRoute {
-    Configured,
-    PassThrough,
-}
-
-#[derive(Default)]
-struct WorldRouteRegistry(Mutex<HashMap<IpAddr, VecDeque<WorldRoute>>>);
-
-impl WorldRouteRegistry {
-    fn record(&self, ip: IpAddr, route: WorldRoute) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(ip)
-            .or_default()
-            .push_back(route);
-    }
-
-    fn take(&self, ip: IpAddr) -> Result<WorldRoute> {
-        let mut routes = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let queue = routes
-            .get_mut(&ip)
-            .with_context(|| format!("no recent login route for client IP {ip}"))?;
-        let route = queue
-            .pop_front()
-            .with_context(|| format!("no pending world route for client IP {ip}"))?;
-        if queue.is_empty() {
-            routes.remove(&ip);
-        }
-        Ok(route)
-    }
-}
-
-impl SharedRuntime {
-    fn record_world_route(&self, ip: IpAddr, route: WorldRoute) {
-        self.world_routes.record(ip, route);
-    }
-
-    fn take_world_route(&self, ip: IpAddr) -> Result<WorldRoute> {
-        self.world_routes.take(ip)
-    }
 }
 
 pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<()> {
@@ -597,6 +857,7 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
     let diagnostics = DiagnosticLogger::new(config.run_id.clone(), diagnostic_files);
     let mut session_actors = Vec::new();
     let mut accounts = HashMap::new();
+    let mut terminal_command_receivers = Vec::new();
     for lane in lanes {
         for stream in DiagnosticStream::PROXY {
             diagnostics.record(
@@ -613,6 +874,7 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
         let (command_bus, _) = broadcast::channel(256);
         let (headless_enabled, _) = watch::channel(true);
         let (assistance_armed, _) = watch::channel(false);
+        let (visual_fence, _) = broadcast::channel(16);
         let headless_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let state =
             ConfiguredSessionState::new(lane.config.account, lane.config.lane, lane.config.worker);
@@ -623,7 +885,7 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
             ConfiguredSessionActor {
                 state,
                 rx: session_rx,
-                worker_tx: lane.worker_tx,
+                worker_tx: lane.worker_tx.clone(),
                 upstream_tx: command_tx.clone(),
                 supervisor_tx: lane.supervisor_tx,
                 diagnostics: diagnostics.clone(),
@@ -636,23 +898,25 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
             }
             .run(),
         ));
-        let session = session_tx.clone();
-        tokio::spawn(async move {
-            let mut worker_rx = lane.worker_rx;
-            while let Some(message) = worker_rx.recv().await {
-                if session.send(SessionMessage::Worker(message)).await.is_err() {
-                    break;
+        if let Some(mut worker_rx) = lane.worker_rx {
+            let session = session_tx.clone();
+            tokio::spawn(async move {
+                while let Some(message) = worker_rx.recv().await {
+                    if session.send(SessionMessage::Worker(message)).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            });
+        }
         let bus = command_bus.clone();
         tokio::spawn(async move {
             while let Some(command) = command_rx.recv().await {
                 let _ = bus.send(command);
             }
         });
+        let account_key = lane.config.account_name.to_uppercase();
         accounts.insert(
-            lane.config.account_name.to_uppercase(),
+            account_key.clone(),
             AccountRuntime {
                 config: lane.config,
                 session_tx,
@@ -663,29 +927,92 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
                 headless_active,
                 assistance_armed,
                 ownership_state,
+                visual_fence,
                 movement_gate,
                 player_worlds: Arc::new(Mutex::new(PlayerWorlds::default())),
             },
         );
+        terminal_command_receivers.push((account_key, lane.terminal_commands));
     }
     let action_logs = ActionLogManager::new(config.log_dir.clone());
+    let admission = AdmissionController::new(AdmissionLimits {
+        max_total: config.max_pre_auth_connections,
+        max_per_ip: config.max_pre_auth_connections_per_ip,
+    });
     let shared = SharedRuntime {
         config: Arc::new(config),
         accounts: Arc::new(accounts),
         auth: AuthRegistry::default(),
-        world_routes: Arc::new(WorldRouteRegistry::default()),
+        admission,
         action_logs,
     };
-    for account in shared.accounts.values().cloned() {
-        let shared_for_headless = shared.clone();
-        tokio::spawn(async move {
-            headless_session_manager(shared_for_headless, account).await;
-        });
+    let mut terminal_tasks = Vec::new();
+    for (account_key, mut receiver) in terminal_command_receivers {
+        let account = shared.accounts[&account_key].clone();
+        terminal_tasks.push(tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                let reply = execute_terminal_bot_command(&account, &request.text).await;
+                let _ = request.reply.send(reply);
+            }
+        }));
     }
-    let player = tokio::spawn(serve_player(shared.clone()));
-    tokio::select! {
-        r = player => r??,
-        _ = tokio::signal::ctrl_c() => {}
+    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+    let auth_ready = ready_tx.clone();
+    let world_ready = ready_tx.clone();
+    let auth = tokio::spawn(serve_player_auth(shared.clone(), auth_ready));
+    let world = tokio::spawn(serve_configured_world(shared.clone(), world_ready));
+    let transparent = tokio::spawn(serve_transparent_world(shared.clone(), ready_tx));
+    let mut auth = auth;
+    let mut world = world;
+    let mut transparent = transparent;
+    if let Err(error) =
+        wait_for_listener_readiness(&mut ready_rx, &mut auth, &mut world, &mut transparent).await
+    {
+        stop_listener(&mut auth).await;
+        stop_listener(&mut world).await;
+        stop_listener(&mut transparent).await;
+        for task in terminal_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        for account in shared.accounts.values() {
+            let _ = account.session_tx.send(SessionMessage::Shutdown).await;
+        }
+        for actor in session_actors {
+            let _ = actor.await;
+        }
+        diagnostics.flush();
+        return Err(error);
+    }
+    tracing::info!("all proxy listeners are ready");
+    let mut headless_tasks = Vec::new();
+    for account in shared
+        .accounts
+        .values()
+        .filter(|account| account.config.worker.is_some())
+        .cloned()
+    {
+        let shared_for_headless = shared.clone();
+        headless_tasks.push(tokio::spawn(async move {
+            headless_session_manager(shared_for_headless, account).await;
+        }));
+    }
+    let runtime_result = tokio::select! {
+        r = &mut auth => r.context("auth listener task failed").and_then(|result| result),
+        r = &mut world => r.context("configured world listener task failed").and_then(|result| result),
+        r = &mut transparent => r.context("transparent world listener task failed").and_then(|result| result),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
+    stop_listener(&mut auth).await;
+    stop_listener(&mut world).await;
+    stop_listener(&mut transparent).await;
+    for task in terminal_tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    for task in headless_tasks {
+        task.abort();
+        let _ = task.await;
     }
     for account in shared.accounts.values() {
         let _ = account.session_tx.send(SessionMessage::Shutdown).await;
@@ -696,19 +1023,48 @@ pub async fn run(config: ProxyRuntimeConfig, lanes: Vec<ManagedLane>) -> Result<
         }
     }
     diagnostics.flush();
+    runtime_result
+}
+
+async fn wait_for_listener_readiness(
+    ready_rx: &mut mpsc::UnboundedReceiver<()>,
+    auth: &mut tokio::task::JoinHandle<Result<()>>,
+    world: &mut tokio::task::JoinHandle<Result<()>>,
+    transparent: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    for _ in 0..3 {
+        tokio::select! {
+            ready = ready_rx.recv() => { ready.context("proxy listener readiness channel closed")?; }
+            result = &mut *auth => { result.context("auth listener task failed")??; bail!("auth listener stopped before startup completed"); }
+            result = &mut *world => { result.context("configured world listener task failed")??; bail!("configured world listener stopped before startup completed"); }
+            result = &mut *transparent => { result.context("transparent world listener task failed")??; bail!("transparent world listener stopped before startup completed"); }
+            _ = tokio::signal::ctrl_c() => bail!("proxy startup cancelled before listeners were ready"),
+        }
+    }
     Ok(())
 }
 
-async fn serve_player(shared: SharedRuntime) -> Result<()> {
+async fn stop_listener(listener: &mut tokio::task::JoinHandle<Result<()>>) {
+    if !listener.is_finished() {
+        listener.abort();
+        let _ = listener.await;
+    }
+}
+
+async fn serve_player_auth(shared: SharedRuntime, ready: mpsc::UnboundedSender<()>) -> Result<()> {
     let listener = TcpListener::bind(&shared.config.auth_bind).await?;
-    let limiter = AdmissionController::new(AdmissionLimits {
-        max_total: shared.config.max_pre_auth_connections,
-        max_per_ip: shared.config.max_pre_auth_connections_per_ip,
-    });
-    tracing::info!(bind=%shared.config.auth_bind, "single-port player listener ready for auth and world traffic");
+    let _ = ready.send(());
+    tracing::info!(bind=%shared.config.auth_bind, "player auth listener ready");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let permit = match limiter.try_acquire(peer.ip()) {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!(%error, "player auth connection task failed"); }
+                continue;
+            }
+        };
+        let permit = match shared.admission.try_acquire(peer.ip()) {
             Ok(p) => p,
             Err(reason) => {
                 tracing::warn!(%peer, reason, "rejected pre-auth connection");
@@ -716,50 +1072,97 @@ async fn serve_player(shared: SharedRuntime) -> Result<()> {
             }
         };
         let shared = shared.clone();
-        tokio::spawn(async move {
-            let mut permit = Some(permit);
-            // Auth starts with a client login challenge. A world connection
-            // waits for the server challenge and remains silent during detection.
-            let detect_deadline = tokio::time::Instant::now()
-                + shared
-                    .config
-                    .handshake_timeout
-                    .min(Duration::from_millis(250));
-            let mut first = [0_u8; 1];
-            let is_auth = match tokio::time::timeout_at(detect_deadline, stream.peek(&mut first))
-                .await
-            {
-                Ok(Ok(n)) if n > 0 => true,
-                Ok(Ok(_)) => {
-                    tracing::debug!(%peer, "player connection closed before protocol detection");
-                    return;
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(%peer, %error, "player connection protocol detection failed");
-                    return;
-                }
-                Err(_) => false,
-            };
-            let result = if is_auth {
-                tokio::time::timeout(
-                    shared.config.handshake_timeout,
-                    handle_auth(shared.clone(), stream, peer.ip()),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("auth handshake timed out"))
-                .and_then(|result| result)
-            } else {
-                // World relays can stay open for hours. Do not hold a pre-auth
-                // admission slot for the lifetime of a successful game session.
-                drop(permit.take());
-                handle_world(shared.clone(), stream, peer.ip()).await
-            };
-            drop(permit.take());
+        connections.spawn(async move {
+            let result = handle_auth(shared.clone(), stream, peer.ip(), permit).await;
             match result {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(%peer, error=%format_args!("{e:#}"), "single-port player connection failed")
                 }
+            }
+        });
+    }
+}
+
+async fn serve_configured_world(
+    shared: SharedRuntime,
+    ready: mpsc::UnboundedSender<()>,
+) -> Result<()> {
+    let listener = TcpListener::bind(&shared.config.world_bind).await?;
+    let _ = ready.send(());
+    tracing::info!(bind=%shared.config.world_bind, "configured player world listener ready");
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!(%error, "configured world connection task failed"); }
+                continue;
+            }
+        };
+        let permit = match shared.admission.try_acquire(peer.ip()) {
+            Ok(permit) => permit,
+            Err(reason) => {
+                tracing::warn!(%peer, reason, "rejected configured world connection");
+                continue;
+            }
+        };
+        let shared = shared.clone();
+        connections.spawn(async move {
+            let result = configured_world(shared.clone(), stream, peer.ip(), permit).await;
+            if let Err(error) = result {
+                tracing::warn!(%peer, error=%format_args!("{error:#}"), "configured world connection failed");
+            }
+        });
+    }
+}
+
+async fn serve_transparent_world(
+    shared: SharedRuntime,
+    ready: mpsc::UnboundedSender<()>,
+) -> Result<()> {
+    let listener = TcpListener::bind(&shared.config.transparent_world_bind).await?;
+    let _ = ready.send(());
+    tracing::info!(bind=%shared.config.transparent_world_bind, "transparent world listener ready");
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        let (mut downstream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!(%error, "transparent world connection task failed"); }
+                continue;
+            }
+        };
+        let permit = match shared.admission.try_acquire(peer.ip()) {
+            Ok(permit) => permit,
+            Err(reason) => {
+                tracing::warn!(%peer, reason, "rejected transparent world connection");
+                continue;
+            }
+        };
+        let shared = shared.clone();
+        connections.spawn(async move {
+            let addr = advertised(
+                &shared.config.upstream_world_host,
+                shared.config.upstream_world_port,
+            );
+            let result = async {
+                let mut upstream = TcpStream::connect(&addr)
+                    .await
+                    .with_context(|| format!("connect upstream world {addr}"))?;
+                let mut initial = [0_u8; 1];
+                let received = tokio::time::timeout(shared.config.handshake_timeout, upstream.peek(&mut initial))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("transparent world handshake timed out"))??;
+                if received == 0 { bail!("upstream world closed before its first handshake byte"); }
+                drop(permit);
+                let (up, down) = transparent_relay(&mut downstream, &mut upstream).await?;
+                tracing::debug!(%peer, up, down, upstream=%addr, "transparent world relay ended");
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(%peer, error=%format_args!("{error:#}"), "transparent world connection failed");
             }
         });
     }
@@ -793,25 +1196,40 @@ async fn handle_auth(
     shared: SharedRuntime,
     mut downstream: TcpStream,
     peer_ip: IpAddr,
+    permit: crate::auth::limits::AdmissionPermit,
 ) -> Result<()> {
-    let challenge = read_stock_challenge(&mut downstream).await?;
+    let deadline = tokio::time::Instant::now() + shared.config.handshake_timeout;
+    let challenge = tokio::time::timeout_at(deadline, read_stock_challenge(&mut downstream))
+        .await
+        .context("downstream auth challenge timed out")??;
     let key = challenge.account.to_uppercase();
     if let Some(account) = shared.accounts.get(&key) {
-        let upstream =
-            upstream_login(&upstream_config(&shared, account), &account.config.password).await?;
-        let authenticated = crate::auth::login::terminate_configured_downstream(
-            &mut downstream,
-            &ConfiguredCredential {
-                account: account.config.account_name.clone(),
-                password: account.config.password.clone(),
-            },
+        let upstream = tokio::time::timeout_at(
+            deadline,
+            upstream_login(&upstream_config(&shared, account), &account.config.password),
         )
-        .await?;
-        shared.auth.put(&key, authenticated.session_key).await;
-        shared.record_world_route(peer_ip, WorldRoute::Configured);
+        .await
+        .context("upstream auth handshake timed out")??;
+        let authenticated = tokio::time::timeout_at(
+            deadline,
+            crate::auth::login::terminate_configured_downstream(
+                &mut downstream,
+                &ConfiguredCredential {
+                    account: account.config.account_name.clone(),
+                    password: account.config.password.clone(),
+                },
+            ),
+        )
+        .await
+        .context("downstream auth proof timed out")??;
+        shared
+            .auth
+            .put(&key, peer_ip, authenticated.session_key)
+            .await;
+        drop(permit);
         serve_configured_realms(&shared, &mut downstream, &upstream.realm_name, peer_ip).await
     } else {
-        transparent_auth(shared, challenge, downstream, peer_ip).await
+        transparent_auth(shared, challenge, downstream, peer_ip, permit, deadline).await
     }
 }
 
@@ -862,38 +1280,64 @@ async fn transparent_auth(
     challenge: StockChallenge,
     mut downstream: TcpStream,
     peer_ip: IpAddr,
+    permit: crate::auth::limits::AdmissionPermit,
+    deadline: tokio::time::Instant,
 ) -> Result<()> {
     let addr = advertised(
         &shared.config.upstream_auth_host,
         shared.config.upstream_auth_port,
     );
-    let mut upstream = TcpStream::connect(&addr).await?;
-    upstream.write_all(&challenge.raw).await?;
+    let mut upstream = tokio::time::timeout_at(deadline, TcpStream::connect(&addr))
+        .await
+        .context("transparent upstream auth connect timed out")??;
+    tokio::time::timeout_at(deadline, upstream.write_all(&challenge.raw))
+        .await
+        .context("transparent challenge write timed out")??;
     // Relay challenge and proof without deriving the unknown account session key.
-    let response = tokio_expect_server_message_protocol::<
-        wow_login_messages::version_8::CMD_AUTH_LOGON_CHALLENGE_Server,
-        _,
-    >(&mut upstream, ProtocolVersion::Eight)
-    .await?;
-    response.tokio_write(&mut downstream).await?;
-    let proof = tokio_expect_client_message_protocol::<
-        wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Client,
-        _,
-    >(&mut downstream, ProtocolVersion::Eight)
-    .await?;
-    proof.tokio_write(&mut upstream).await?;
-    let response = tokio_expect_server_message_protocol::<
-        wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Server,
-        _,
-    >(&mut upstream, ProtocolVersion::Eight)
-    .await?;
-    response.tokio_write(&mut downstream).await?;
-    if matches!(
+    let response = tokio::time::timeout_at(
+        deadline,
+        tokio_expect_server_message_protocol::<
+            wow_login_messages::version_8::CMD_AUTH_LOGON_CHALLENGE_Server,
+            _,
+        >(&mut upstream, ProtocolVersion::Eight),
+    )
+    .await
+    .context("transparent auth challenge response timed out")??;
+    tokio::time::timeout_at(deadline, response.tokio_write(&mut downstream))
+        .await
+        .context("transparent challenge relay timed out")??;
+    let proof = tokio::time::timeout_at(
+        deadline,
+        tokio_expect_client_message_protocol::<
+            wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Client,
+            _,
+        >(&mut downstream, ProtocolVersion::Eight),
+    )
+    .await
+    .context("transparent downstream proof timed out")??;
+    tokio::time::timeout_at(deadline, proof.tokio_write(&mut upstream))
+        .await
+        .context("transparent proof relay timed out")??;
+    let response = tokio::time::timeout_at(
+        deadline,
+        tokio_expect_server_message_protocol::<
+            wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Server,
+            _,
+        >(&mut upstream, ProtocolVersion::Eight),
+    )
+    .await
+    .context("transparent upstream proof response timed out")??;
+    tokio::time::timeout_at(deadline, response.tokio_write(&mut downstream))
+        .await
+        .context("transparent proof response timed out")??;
+    let authenticated = matches!(
         &response,
         wow_login_messages::version_8::CMD_AUTH_LOGON_PROOF_Server::Success { .. }
-    ) {
-        shared.record_world_route(peer_ip, WorldRoute::PassThrough);
+    );
+    if !authenticated {
+        return Ok(());
     }
+    drop(permit);
     loop {
         let request = match tokio_expect_client_message_protocol::<CMD_REALM_LIST_Client, _>(
             &mut downstream,
@@ -918,7 +1362,7 @@ async fn transparent_auth(
                         &shared.config.upstream_world_host,
                         &shared.config.advertise_host,
                     ),
-                    port_of(&shared.config.auth_bind)?,
+                    port_of(&shared.config.transparent_world_bind)?,
                 );
             }
         }
@@ -934,7 +1378,7 @@ fn downstream_realm_address(shared: &SharedRuntime, peer_ip: IpAddr) -> Result<S
             &shared.config.upstream_world_host,
             &shared.config.advertise_host,
         ),
-        port_of(&shared.config.auth_bind)?,
+        port_of(&shared.config.world_bind)?,
     ))
 }
 
@@ -955,29 +1399,13 @@ fn is_local_network(ip: IpAddr) -> bool {
     }
 }
 
-async fn handle_world(
+async fn configured_world(
     shared: SharedRuntime,
     mut downstream: TcpStream,
     peer_ip: IpAddr,
+    permit: crate::auth::limits::AdmissionPermit,
 ) -> Result<()> {
-    match shared.take_world_route(peer_ip)? {
-        WorldRoute::Configured => configured_world(shared, downstream).await,
-        WorldRoute::PassThrough => {
-            let addr = advertised(
-                &shared.config.upstream_world_host,
-                shared.config.upstream_world_port,
-            );
-            let mut upstream = TcpStream::connect(&addr)
-                .await
-                .with_context(|| format!("connect upstream world {addr}"))?;
-            let (up, down) = transparent_relay(&mut downstream, &mut upstream).await?;
-            tracing::debug!(%peer_ip, up, down, upstream=%addr, "single-port pass-through world relay ended");
-            Ok(())
-        }
-    }
-}
-
-async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> Result<()> {
+    let handshake_deadline = tokio::time::Instant::now() + shared.config.handshake_timeout;
     let seed = ProofSeed::new();
     SMSG_AUTH_CHALLENGE {
         unknown1: 1,
@@ -986,23 +1414,41 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     }
     .tokio_write_unencrypted_server(&mut downstream)
     .await?;
-    let auth = world_expect_client_message::<CMSG_AUTH_SESSION, _>(&mut downstream).await?;
+    let auth = tokio::time::timeout_at(
+        handshake_deadline,
+        world_expect_client_message::<CMSG_AUTH_SESSION, _>(&mut downstream),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("configured world auth session timed out"))??;
     let account_name = auth.username.to_uppercase();
     let account = shared
         .accounts
         .get(&account_name)
         .with_context(|| format!("world account {account_name} is not configured"))?
         .clone();
+    let downstream_session = shared
+        .auth
+        .verify(
+            &account_name,
+            peer_ip,
+            auth.client_seed,
+            seed.seed(),
+            &auth.client_proof,
+        )
+        .await
+        .context("no matching fresh downstream auth proof for configured world connection")?;
+    tracing::debug!(account=%account_name, auth_generation=downstream_session.generation, "matched configured world login to auth session");
+    let downstream_key = downstream_session.key;
     let handoff = PlayerWorldHandoff::begin(
         account.player_worlds.clone(),
         account.headless_enabled.clone(),
     );
-    wait_for_headless_state(&account, false, Duration::from_secs(6)).await?;
-    let downstream_key = shared
-        .auth
-        .get(&account_name)
-        .await
-        .context("no fresh downstream login session key for configured world connection")?;
+    tokio::time::timeout_at(
+        handshake_deadline,
+        wait_for_headless_state(&account, false, Duration::from_secs(6)),
+    )
+    .await
+    .context("headless session handoff timed out")??;
     let normalized = NormalizedString::new(&account_name)?;
     let downstream_crypto = seed.into_server_header_crypto(
         &normalized,
@@ -1012,16 +1458,26 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     )?;
     let (mut down_enc, mut down_dec) = downstream_crypto.split();
 
-    let upstream_login = upstream_login(
-        &upstream_config(&shared, &account),
-        &account.config.password,
+    let upstream_login = tokio::time::timeout_at(
+        handshake_deadline,
+        upstream_login(
+            &upstream_config(&shared, &account),
+            &account.config.password,
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| anyhow::anyhow!("upstream player authentication timed out"))??;
     let addr = advertised(&upstream_login.world_host, upstream_login.world_port);
-    let mut upstream = TcpStream::connect(&addr)
+    let mut upstream = tokio::time::timeout_at(handshake_deadline, TcpStream::connect(&addr))
         .await
+        .map_err(|_| anyhow::anyhow!("upstream world connect timed out"))?
         .with_context(|| format!("connect upstream world {addr}"))?;
-    let challenge = world_expect_server_message::<SMSG_AUTH_CHALLENGE, _>(&mut upstream).await?;
+    let challenge = tokio::time::timeout_at(
+        handshake_deadline,
+        world_expect_server_message::<SMSG_AUTH_CHALLENGE, _>(&mut upstream),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("upstream world challenge timed out"))??;
     let up_seed = ProofSeed::new();
     let client_seed = up_seed.seed();
     let (proof, up_crypto) = up_seed.into_client_header_crypto(
@@ -1036,8 +1492,9 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
         .send(SessionMessage::PreparePlayerLogin { connection, ready })
         .await
         .context("configured session actor is unavailable during player login")?;
-    if !paused
+    if !tokio::time::timeout_at(handshake_deadline, paused)
         .await
+        .context("configured session actor handoff timed out")?
         .context("configured session actor stopped before player login handoff")?
     {
         bail!("failed to pause configured bot lane before player login");
@@ -1057,12 +1514,14 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     }
     .tokio_write_unencrypted_client(&mut upstream)
     .await?;
+    drop(permit);
     let (mut up_enc, mut up_dec) = up_crypto.split();
     let mut warden = WardenBridge::new(&upstream_login.session_key, &downstream_key);
 
     let mut commands = account.command_bus.subscribe();
     let assistance_armed = account.assistance_armed.subscribe();
     let ownership_state = account.ownership_state.subscribe();
+    let mut visual_fence = account.visual_fence.subscribe();
     account
         .session_tx
         .send(SessionMessage::UpstreamConnected(true))
@@ -1079,12 +1538,16 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
     let mut controlled_flags: u32 = 0;
     let mut canonical_flags: u32 = 0;
     let mut movement_clock = MovementClock::default();
+    let mut server_motion = ServerMotionProjection::default();
+    let mut projected_mover: Option<EntityId> = None;
     static NEXT_WORLD_SESSION: AtomicU64 = AtomicU64::new(1);
     let movement_session_id = NEXT_WORLD_SESSION.fetch_add(1, Ordering::Relaxed).max(1);
     let mut movement_world_generation = 1_u64;
     let mut last_bot_visual: Option<(WorldPosition, EntityId, u32, std::time::Instant)> = None;
+    let mut last_bot_movement_at: Option<std::time::Instant> = None;
     let mut last_bot_command_sequence: Option<(u64, u64, u64)> = None;
     let mut pending_near_teleport_ack: Option<(EntityId, u32)> = None;
+    let mut pending_near_teleport_position: Option<(EntityId, WorldPosition)> = None;
     let mut pending_movement_corrections: VecDeque<MovementCorrectionExpectation> = VecDeque::new();
     let (movement_mirror_tx, mut movement_mirror_rx) = watch::channel(None::<MovementMirror>);
     let mut movement_mirror_sequence = 0_u64;
@@ -1148,6 +1611,19 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         tracing::warn!(account=%account_name, source="server_correction", sequence=movement_mirror_sequence, session=movement_session_id, world_generation=movement_world_generation, opcode=frame.opcode, expected_ack=?expected_ack, ownership_generation=?ownership_state.borrow().generation, movement_epoch=?ownership_state.borrow().movement_epoch, reason, "dropped unmatched or malformed near-teleport acknowledgement");
                         continue;
                     }
+                    if let (Ok((mover, _, client_time)), Some((expected_mover, position))) =
+                        (decoded_ack, pending_near_teleport_position.take())
+                        && mover == expected_mover
+                    {
+                        movement_clock.observe(client_time);
+                        if controlled_mover == Some(mover) {
+                            controlled_position = Some(position);
+                        } else {
+                            canonical_position = Some(position);
+                        }
+                        server_motion.reset_to(mover, position, client_time);
+                        projected_mover = Some(mover);
+                    }
                     let sequence = next_movement_sequence(&mut movement_mirror_sequence);
                     proxy_handoff_stamp = Some(MovementStamp::new(
                         MovementVisualSource::ProxyHandoff,
@@ -1186,18 +1662,32 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                     let packet_sequence = next_movement_sequence(&mut movement_mirror_sequence);
                     let now = std::time::Instant::now();
                     let decoded = decode_simple_movement(u32::from(frame.opcode), &frame.body);
+                    let bot_visual_age = last_bot_visual.map(|(_, _, _, at)| at.elapsed());
                     let bot_locomotion_recent = ownership_state
                         .borrow()
                         .permits(crate::ownership::ClientKind::Bot)
-                        || last_bot_visual
-                            .is_some_and(|(_, _, _, at)| at.elapsed() < Duration::from_millis(1250));
-                    let matching_bot_echo = match (last_bot_visual, decoded) {
-                        (Some((visual, visual_mover, bot_opcode, at)), Some((client_mover, _, _, point, orientation))) if at.elapsed() < Duration::from_millis(1250) => {
-                            movement_matches_bot_visual(visual, visual_mover, bot_opcode, client_mover, point, orientation, frame.opcode)
+                        || bot_visual_age.is_some_and(|age| age < BOT_VISUAL_ECHO_WINDOW);
+                    let matching_bot_echo = match (last_bot_visual, decoded, bot_visual_age) {
+                        (Some((visual, visual_mover, bot_opcode, _)), Some((client_mover, _, _, point, orientation)), Some(age)) if age < BOT_VISUAL_ECHO_WINDOW => {
+                            movement_matches_bot_visual(visual, visual_mover, bot_opcode, client_mover, point, orientation, frame.opcode, age)
                         }
                         _ => false,
                     };
-                    let explicit_player_intent = decoded.is_some_and(|(guid, flags, _, _, _)| {
+                    let mut invalid_player_position = false;
+                    if let Some((_, _, _, point, _)) = decoded
+                        && !matching_bot_echo
+                        && let Err(reason) = validate_movement_position(
+                            canonical_position,
+                            point,
+                            100,
+                            MovementSource::Player,
+                        )
+                    {
+                        invalid_player_position = true;
+                        suppress_client_movement_upstream = true;
+                        tracing::warn!(account=%account_name, source="player", opcode=frame.opcode, reason, "dropped player movement outside the accepted position bounds");
+                    }
+                    let mut explicit_player_intent = decoded.is_some_and(|(guid, flags, _, _, _)| {
                         match validate_player_takeover(frame.opcode, guid, flags, player_guid) {
                             Ok(()) => true,
                             Err(reason) if is_explicit_player_movement_intent(frame.opcode) => {
@@ -1207,14 +1697,18 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             Err(_) => false,
                         }
                     });
+                    explicit_player_intent &= !invalid_player_position;
                     let invalid_explicit_packet = is_explicit_player_movement_intent(frame.opcode)
                         && !explicit_player_intent
                         && !matching_bot_echo;
 
                     if invalid_explicit_packet {
                         suppress_client_movement_upstream = true;
+                    } else if should_suppress_bot_echo(matching_bot_echo) {
+                        suppress_client_movement_upstream = true;
+                        tracing::trace!(account=%account_name, source="bot", opcode=frame.opcode, sequence=movement_mirror_sequence, owner=?ownership_state.borrow().mode, session=movement_session_id, world_generation=movement_world_generation, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, reason="matched recent bot visual", "suppressed matching bot-authored movement/facing echo");
                     } else if explicit_player_intent {
-                        // Validated player intent takes control even if it resembles a recent bot visual.
+                        // Movement that does not match the bot's recent visual is player intent.
                         tracing::info!(account=%account_name, source="player", opcode=frame.opcode, sequence=movement_mirror_sequence, owner=?ownership_state.borrow().mode, session=movement_session_id, world_generation=movement_world_generation, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, reason="validated explicit player intent", "accepted player movement takeover");
                         last_bot_visual = None;
                         invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
@@ -1227,9 +1721,6 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             tracing::warn!(account=%account_name, opcode=frame.opcode, reason="ownership handoff did not commit", "dropped player movement because ownership handoff did not complete");
                             continue;
                         }
-                    } else if should_suppress_bot_echo(matching_bot_echo, explicit_player_intent) {
-                        suppress_client_movement_upstream = true;
-                        tracing::trace!(account=%account_name, source="bot", opcode=frame.opcode, sequence=movement_mirror_sequence, owner=?ownership_state.borrow().mode, session=movement_session_id, world_generation=movement_world_generation, movement_epoch=?ownership_state.borrow().movement_epoch, ownership_generation=?ownership_state.borrow().generation, reason="matched recent bot visual without validated player intent", "suppressed matching bot-authored movement/facing echo");
                     } else if bot_locomotion_recent {
                         // AzerothCore intentionally does not echo the mover's movement
                         // packet back to that same player. We mirror bot movement locally
@@ -1307,53 +1798,19 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         }
                         let mission_id = MissionId(account.mission_counter.fetch_add(1, Ordering::Relaxed));
                         match crate::commands::parse_local(text, family, true, mission_id) {
-                            Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::On))) => {
-                                invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
-                                let (committed, receiver) = oneshot::channel();
-                                match account.session_tx.send(SessionMessage::BotOn { committed: Some(committed) }).await {
-                                    Ok(()) if receiver.await == Ok(true) => {
-                                        tracing::info!(account=%account_name, command=".bot on", "bot automation enabled");
-                                        let _ = write_bot_notice(&mut dw, &mut down_enc, "[wow-bot] automation enabled").await;
+                            Ok(Some(crate::commands::LocalCommand::Bot(command))) => {
+                                match execute_bot_command(&account, command).await {
+                                    Ok(lines) => {
+                                        for line in lines {
+                                            let notice = format!("[wow-bot] {line}");
+                                            let _ = write_bot_notice(&mut dw, &mut down_enc, &notice).await;
+                                        }
                                     }
-                                    Ok(()) => tracing::warn!(account=%account_name, "bot ON ownership change did not commit"),
-                                    Err(error) => tracing::error!(account=%account_name, %error, "failed to enable bot automation"),
-                                }
-                                continue;
-                            }
-                            Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::Off))) => {
-                                invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
-                                let (committed, receiver) = oneshot::channel();
-                                match account.session_tx.send(SessionMessage::BotOff { committed: Some(committed) }).await {
-                                    Ok(()) if receiver.await == Ok(true) => {
-                                        tracing::info!(account=%account_name, command=".bot off", "bot automation disabled");
-                                        let _ = write_bot_notice(&mut dw, &mut down_enc, "[wow-bot] automation disabled").await;
-                                    }
-                                    Ok(()) => tracing::warn!(account=%account_name, "bot OFF ownership change did not commit"),
-                                    Err(error) => tracing::error!(account=%account_name, %error, "failed to disable bot automation"),
-                                }
-                                continue;
-                            }
-                            Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::Mission(mission)))) => {
-                                invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
-                                let description = format!("{:?}", mission.intent);
-                                match account.supervisor_tx.send(SupervisorCommand::ReplaceMission { lane: account.config.lane, mission }).await {
-                                    Ok(()) => {
-                                        tracing::info!(account=%account_name, mission=%description, "bot mission accepted");
-                                        let notice = format!("[wow-bot] mission set: {description}");
+                                    Err(error) => {
+                                        tracing::warn!(account=%account_name, %error, "local bot command failed");
+                                        let notice = format!("[wow-bot] {error}");
                                         let _ = write_bot_notice(&mut dw, &mut down_enc, &notice).await;
                                     }
-                                    Err(error) => tracing::error!(account=%account_name, %error, "failed to route bot mission"),
-                                }
-                                continue;
-                            }
-                            Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::Status))) => {
-                                tracing::info!(account=%account_name, "bot status requested from chat; use the ownership messages below to inspect current control state");
-                                continue;
-                            }
-                            Ok(Some(crate::commands::LocalCommand::Bot(crate::commands::bot::BotCommand::Help))) => {
-                                for line in crate::commands::bot::HELP_LINES {
-                                    let notice = format!("[wow-bot] {line}");
-                                    let _ = write_bot_notice(&mut dw, &mut down_enc, &notice).await;
                                 }
                                 continue;
                             }
@@ -1441,10 +1898,7 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         if let Some((spell, target)) = bot_cast {
                             last_bot_cast = Some((spell, target, std::time::Instant::now()));
                         }
-                        let gameobject_report_use = match &command {
-                            GameplayCommand::CastGameObject { target, report_use: true, .. } => Some(*target),
-                            _ => None,
-                        };
+                        let gameobject_report_use = gameobject_report_use_for_command(&command);
                         let publish_movement_prediction =
                             should_publish_movement_prediction(&command);
                         let movement_context = gameplay_movement_context(
@@ -1455,6 +1909,17 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             canonical_position,
                             canonical_flags,
                         );
+                        let bot_movement_elapsed_ms = last_bot_movement_at
+                            .map(|at| at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32)
+                            .unwrap_or_default();
+                        if let GameplayCommand::MoveTo(destination) = &command
+                            && let Err(reason) = validate_movement_position(movement_context.position, *destination, bot_movement_elapsed_ms, MovementSource::Bot)
+                        {
+                            tracing::warn!(account=%account_name, source="bot", destination=?destination, reason, "dropped bot movement outside the accepted position bounds");
+                            continue;
+                        }
+                        let command_is_stop = matches!(&command, GameplayCommand::StopMovement);
+                        let command_is_move = matches!(&command, GameplayCommand::MoveTo(_));
                         match encode_gameplay_command(
                             command,
                             movement_context.mover,
@@ -1482,11 +1947,11 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                     continue;
                                 }
                                 if let Err(e)=write_client_frame(&mut uw, &mut up_enc, &frame).await { break Err(e); }
+                                if command_is_move { last_bot_movement_at = Some(std::time::Instant::now()); }
                                 if let Some((spell, target)) = bot_cast {
                                     tracing::info!(account=%account_name, opcode=frame.opcode, spell, ?target, "bot cast request transmitted");
                                 }
-                                if let Some(target) = gameobject_report_use {
-                                    let report = ClientFrame { opcode: 0x0481, body: target.0.to_le_bytes().to_vec() };
+                                if let Some((target, report)) = gameobject_report_use {
                                     tracing::info!(account=%account_name, opcode=report.opcode, ?target, "bot game-object report-use packet transmitted");
                                     shared.action_logs.packet(
                                         &account_name,
@@ -1523,13 +1988,36 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                             let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::PlayerPosition { position, moving, flags, client_time })).await;
                                         }
                                     }
-                                    if let Some((generation, epoch, command_sequence, stamped_world_generation)) = bot_visual_stamp {
-                                        if dispatch.is_current(*ownership_state.borrow(), movement_world_generation) {
-                                            last_bot_visual = Some((position, movement_context.mover.unwrap_or(EntityId(0)), frame.opcode, std::time::Instant::now()));
-                                            if let Ok(opcode) = u16::try_from(frame.opcode) {
+                                    let visual_source = if let Some((_, _, _, world_generation)) = bot_visual_stamp
+                                        && dispatch.is_current(*ownership_state.borrow(), movement_world_generation)
+                                    {
+                                        Some((MovementVisualSource::Bot, world_generation))
+                                    } else if command_is_stop {
+                                        Some((MovementVisualSource::ProxyHandoff, movement_world_generation))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((source, stamped_world_generation)) = visual_source {
+                                        if movement_visual_source_is_owned(source, *ownership_state.borrow()) {
+                                            if source == MovementVisualSource::Bot {
+                                                last_bot_visual = Some((position, movement_context.mover.unwrap_or(EntityId(0)), frame.opcode, std::time::Instant::now()));
+                                            }
+                                            let mover = movement_context.mover.unwrap_or(EntityId(0));
+                                            if projected_mover != Some(mover) {
+                                                if let Some(start) = movement_context.position {
+                                                    server_motion.reset_to(mover, start, client_time.wrapping_sub(100));
+                                                }
+                                                projected_mover = Some(mover);
+                                            }
+                                            let visual = if command_is_stop {
+                                                server_motion.stop(mover, position)
+                                            } else {
+                                                server_motion.project(mover, position, client_time, command_is_move)
+                                            };
+                                            if let Some(visual) = visual {
                                                 let sequence = next_movement_sequence(&mut movement_mirror_sequence);
                                                 let stamp = MovementStamp::new(
-                                                    MovementVisualSource::Bot,
+                                                    source,
                                                     movement_session_id,
                                                     sequence,
                                                     *ownership_state.borrow(),
@@ -1538,14 +2026,10 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                                                 );
                                                 movement_mirror_tx.send_replace(Some(MovementMirror {
                                                     stamp,
-                                                    frame: crate::framing::ServerFrame { opcode, body: frame.body.clone() },
+                                                    frame: visual,
                                                 }));
-                                                tracing::debug!(account=%account_name, source=?stamp.source, sequence=stamp.sequence, command_sequence, session=stamp.session_id, ownership_generation=stamp.ownership_generation, movement_epoch=stamp.movement_epoch, world_generation=stamp.world_generation, reason="accepted", "stamped bot movement visual");
-                                            } else {
-                                                tracing::warn!(account=%account_name, opcode=frame.opcode, "bot movement opcode cannot be represented for the client mirror");
+                                                tracing::debug!(account=%account_name, source=?stamp.source, sequence=stamp.sequence, session=stamp.session_id, ownership_generation=stamp.ownership_generation, movement_epoch=stamp.movement_epoch, world_generation=stamp.world_generation, reason="accepted", "stamped movement visual");
                                             }
-                                        } else {
-                                            tracing::warn!(account=%account_name, source="bot", command_sequence, session=movement_session_id, ownership_generation=generation.get(), movement_epoch=epoch.get(), world_generation=stamped_world_generation, "dropped movement visual after ownership changed during upstream write");
                                         }
                                     }
                                 }
@@ -1566,8 +2050,9 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         let update = movement_mirror_rx.borrow_and_update().clone();
                         if let Some(update) = update {
                             let current_owner = *ownership_state.borrow();
-                            if !current_owner.permits(crate::ownership::ClientKind::Bot)
-                                || !movement_visual_is_current(update.stamp, MovementVisualSource::Bot, movement_session_id, current_owner.generation.get(), current_owner.movement_epoch.get(), movement_mirror_epoch, movement_world_generation, last_mirrored_sequence) {
+                            let source_owned = movement_visual_source_is_owned(update.stamp.source, current_owner);
+                            if !source_owned
+                                || !movement_visual_is_current(update.stamp, update.stamp.source, movement_session_id, current_owner.generation.get(), current_owner.movement_epoch.get(), movement_mirror_epoch, movement_world_generation, last_mirrored_sequence) {
                                 last_mirrored_sequence = last_mirrored_sequence.max(update.stamp.sequence);
                                 tracing::debug!(account=%account_name, source=?update.stamp.source, sequence=update.stamp.sequence, session=update.stamp.session_id, current_session=movement_session_id, update_generation=update.stamp.ownership_generation, current_generation=?current_owner.generation, update_epoch=update.stamp.movement_epoch, current_epoch=?current_owner.movement_epoch, world_generation=update.stamp.world_generation, reason="stale or mismatched movement visual", "dropped movement mirror");
                                 continue;
@@ -1584,10 +2069,11 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                             ).await;
                             let movement_guard = account.movement_gate.clone().lock_owned().await;
                             let owner_before_write = *ownership_state.borrow();
-                            if !owner_before_write.permits(crate::ownership::ClientKind::Bot)
+                            let source_owned = movement_visual_source_is_owned(update.stamp.source, owner_before_write);
+                            if !source_owned
                                 || !movement_visual_is_current(
                                     update.stamp,
-                                    MovementVisualSource::Bot,
+                                    update.stamp.source,
                                     movement_session_id,
                                     owner_before_write.generation.get(),
                                     owner_before_write.movement_epoch.get(),
@@ -1616,6 +2102,15 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                     }
                 }
             }
+            fence = visual_fence.recv() => {
+                match fence {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        last_bot_visual = None;
+                        invalidate_movement_mirror(&mut movement_mirror_epoch, &movement_mirror_tx);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
             server = read_server_frame(&mut ur, &mut up_dec) => {
                 let mut frame = match server { Ok(v)=>v, Err(e)=>break Err(e) };
                 if matches!(u32::from(frame.opcode), 0x003E | 0x0236) {
@@ -1629,7 +2124,44 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                     }
                     last_bot_visual = None;
                     pending_near_teleport_ack = None;
+                    pending_near_teleport_position = None;
                     pending_movement_corrections.clear();
+                }
+                if u32::from(frame.opcode) == 0x003E {
+                    match player_guid.and_then(|guid| {
+                        new_world(&frame.body, guid.0).map(|observation| (guid, observation))
+                    }) {
+                        Some((guid, observation)) => {
+                            let ProtocolObservation::WorldChanged { position, .. } = &observation else {
+                                unreachable!("new-world parser returns a world-change observation");
+                            };
+                            let position = *position;
+                            object_observer.change_world(position, Some(guid))?;
+                            canonical_position = Some(position);
+                            server_motion.reset_to(guid, position, movement_clock.current_timestamp());
+                            projected_mover = Some(guid);
+                            canonical_flags = 0;
+                            controlled_mover = None;
+                            controlled_position = None;
+                            controlled_flags = 0;
+                            let _ = account
+                                .session_tx
+                                .send(SessionMessage::WorldAuthoritative(false))
+                                .await;
+                            let _ = account
+                                .session_tx
+                                .send(SessionMessage::Observation(observation))
+                                .await;
+                            let _ = account
+                                .session_tx
+                                .send(SessionMessage::WorldAuthoritative(true))
+                                .await;
+                            tracing::info!(account=%account_name, map=position.map, "attended world transfer applied and new-world observation restored");
+                        }
+                        None => {
+                            tracing::error!(account=%account_name, body_len=frame.body.len(), has_player_guid=player_guid.is_some(), "failed to parse attended SMSG_NEW_WORLD; world state remains unchanged");
+                        }
+                    }
                 }
                 let mut server_movement_stamp = if is_server_movement_visual_opcode(u32::from(frame.opcode)) {
                     let sequence = next_movement_sequence(&mut movement_mirror_sequence);
@@ -1645,9 +2177,13 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                     None
                 };
                 if u32::from(frame.opcode) == 0x00C7 {
-                    pending_near_teleport_ack = parse_server_near_teleport(&frame.body)
-                        .map(|(mover, flags, _, _)| (mover, flags))
-                        .filter(|(mover, _)| player_guid == Some(*mover) || controlled_mover == Some(*mover));
+                    let parsed = parse_server_near_teleport(&frame.body)
+                        .filter(|(mover, _, _, _)| player_guid == Some(*mover) || controlled_mover == Some(*mover));
+                    pending_near_teleport_ack = parsed.map(|(mover, flags, _, _)| (mover, flags));
+                    pending_near_teleport_position = parsed.map(|(mover, _, point, orientation)| (
+                        mover,
+                        WorldPosition { map: canonical_position.map(|position| position.map).unwrap_or_default(), point, orientation },
+                    ));
                     if pending_near_teleport_ack.is_none() {
                         tracing::warn!(account=%account_name, opcode=frame.opcode, "server near-teleport request has an invalid or unexpected mover; client acknowledgement will be rejected");
                     }
@@ -1769,8 +2305,10 @@ async fn configured_world(shared: SharedRuntime, mut downstream: TcpStream) -> R
                         Some(guid) => match login_verify_world(&frame.body, guid.0) {
                             Some(observation) => {
                                 if let ProtocolObservation::EnteredWorld { position: Some(position), .. } = &observation {
-                                    object_observer.set_world(position.map, Some(guid));
+                                    object_observer.set_world(*position, Some(guid))?;
                                     canonical_position = Some(*position);
+                                    server_motion.reset_to(guid, *position, movement_clock.current_timestamp());
+                                    projected_mover = Some(guid);
                                     canonical_flags = 0;
                                     let _ = account.command_bus.send(crate::configured_session::GameplayDispatch::Unfenced(GameplayCommand::StopMovement));
                                 }
@@ -2091,6 +2629,8 @@ async fn run_headless_world_session(
                         ) {
                             Ok(Some((frame, movement))) => {
                                 let bot_cast = bot_targeted_cast(&command);
+                                let gameobject_report_use =
+                                    gameobject_report_use_for_command(&command);
                                 if let Some((spell, target)) = bot_cast {
                                     last_bot_cast = Some((spell, target, std::time::Instant::now()));
                                 }
@@ -2119,6 +2659,23 @@ async fn run_headless_world_session(
                                 tracing::info!(account=%account.config.account_name, opcode=frame.opcode, "headless bot gameplay packet transmitted");
                                 if let Some((spell, target)) = bot_cast {
                                     tracing::info!(account=%account.config.account_name, opcode=frame.opcode, spell, ?target, "headless bot cast request transmitted");
+                                }
+                                if let Some((target, report)) = gameobject_report_use {
+                                    shared.action_logs.packet(
+                                        &account.config.account_name,
+                                        "bot",
+                                        "C2S",
+                                        report.opcode,
+                                        &report.body,
+                                    ).await;
+                                    log_loot_wire_packet(
+                                        &account.config.account_name,
+                                        "bot_to_server",
+                                        report.opcode,
+                                        &report.body,
+                                    );
+                                    write_client_frame(&mut writer, &mut enc, &report).await?;
+                                    tracing::info!(account=%account.config.account_name, opcode=report.opcode, ?target, "headless bot game-object report-use packet transmitted");
                                 }
                                 if should_publish_movement_prediction(&command)
                                     && let Some((position, moving, flags, client_time)) = movement
@@ -2412,18 +2969,20 @@ async fn run_headless_world_session(
                 }
                 if opcode == 0x003E {
                     if let Some(guid) = player_guid
-                        && let Some(ProtocolObservation::EnteredWorld { position: Some(position), .. }) = login_verify_world(&frame.body, guid.0)
+                        && let Some(ProtocolObservation::WorldChanged { position, .. }) = new_world(&frame.body, guid.0)
                     {
                         canonical_position = Some(position);
                         canonical_flags = 0;
                         controlled_mover = None;
                         controlled_position = None;
                         controlled_flags = 0;
-                        object_observer.set_world(position.map, Some(guid));
-                        let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::EnteredWorld {
+                        object_observer.change_world(position, Some(guid))?;
+                        let _ = account.session_tx.send(SessionMessage::WorldAuthoritative(false)).await;
+                        let _ = account.session_tx.send(SessionMessage::Observation(ProtocolObservation::WorldChanged {
                             character_guid: guid.0,
-                            position: Some(position),
+                            position,
                         })).await;
+                        let _ = account.session_tx.send(SessionMessage::WorldAuthoritative(true)).await;
                     }
                     // Keep movement_clock alive across the transfer. The
                     // server's clockDelta still maps this client clock to its
@@ -2443,7 +3002,7 @@ async fn run_headless_world_session(
                     if let Some(guid) = player_guid {
                         if let Some(observation) = login_verify_world(&frame.body, guid.0) {
                             if let ProtocolObservation::EnteredWorld { position: Some(position), .. } = &observation {
-                                object_observer.set_world(position.map, Some(guid));
+                                object_observer.set_world(*position, Some(guid))?;
                                 canonical_position = Some(*position);
                                 canonical_flags = 0;
                             }
@@ -2523,7 +3082,9 @@ fn bot_targeted_cast(command: &GameplayCommand) -> Option<(u32, Option<EntityId>
     match command {
         GameplayCommand::Cast { spell, target }
         | GameplayCommand::VehicleCast { spell, target } => Some((*spell, *target)),
+        GameplayCommand::CastOnItem { spell, item_guid } => Some((*spell, Some(*item_guid))),
         GameplayCommand::MaintainBuff { spell, target } => Some((*spell, Some(*target))),
+        GameplayCommand::SummonPet { spell, player } => Some((*spell, Some(*player))),
         GameplayCommand::CastGameObject { spell, target, .. } => Some((*spell, Some(*target))),
         GameplayCommand::UseItemInstance { spell, target, .. } if *spell != 0 => {
             Some((*spell, *target))
@@ -2619,9 +3180,21 @@ mod action_log_position_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("wow-proxy-position-log-{unique}"));
+        let dir = PathBuf::from("/private/tmp").join(format!("wow-proxy-position-log-{unique}"));
         let logs = ActionLogManager::new(dir.clone());
-        let path = logs.start("TEST1").await.expect("log should start");
+        let path = logs.start("TEST1", None).await.expect("log should start");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         logs.position(
             "TEST1",
             "bot_prediction",
@@ -2655,6 +3228,24 @@ mod action_log_position_tests {
 }
 
 #[cfg(test)]
+mod action_log_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn action_logs_redact_chat_and_warden_bodies() {
+        assert_eq!(
+            action_log_redaction_reason("C2S", 0x0095),
+            Some("chat payload redacted")
+        );
+        assert_eq!(
+            action_log_redaction_reason("S2C", u32::from(SMSG_WARDEN_DATA::OPCODE)),
+            Some("Warden payload redacted")
+        );
+        assert_eq!(action_log_redaction_reason("C2S", 0x00B5), None);
+    }
+}
+
+#[cfg(test)]
 mod bot_loot_target_tests {
     use super::*;
 
@@ -2670,8 +3261,56 @@ mod bot_loot_target_tests {
             Some(target)
         );
         assert_eq!(
+            bot_loot_target_for_command(&GameplayCommand::CastGameObject {
+                spell: QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID,
+                target,
+                report_use: true,
+            }),
+            Some(target)
+        );
+        assert_eq!(
+            bot_loot_target_for_command(&GameplayCommand::CastGameObject {
+                spell: QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID,
+                target,
+                report_use: false,
+            }),
+            None
+        );
+        assert_eq!(
+            bot_loot_target_for_command(&GameplayCommand::CastGameObject {
+                spell: 6247,
+                target,
+                report_use: true,
+            }),
+            None
+        );
+        assert_eq!(
             bot_loot_target_for_command(&GameplayCommand::Interact(target)),
             None
+        );
+    }
+
+    #[test]
+    fn quest_item_open_emits_the_client_gameobject_report_use_packet() {
+        let target = EntityId(0xF110_0244_1300_0C92);
+        let (reported_target, frame) =
+            gameobject_report_use_for_command(&GameplayCommand::CastGameObject {
+                spell: QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID,
+                target,
+                report_use: true,
+            })
+            .expect("quest item chest cast must report its use");
+
+        assert_eq!(reported_target, target);
+        assert_eq!(frame.opcode, 0x0481);
+        assert_eq!(frame.body, target.0.to_le_bytes());
+        assert!(
+            gameobject_report_use_for_command(&GameplayCommand::CastGameObject {
+                spell: 6247,
+                target,
+                report_use: false,
+            })
+            .is_none()
         );
     }
 
@@ -2853,6 +3492,134 @@ fn is_afk_chat_request(frame: &ClientFrame) -> bool {
         && frame.body.get(..4) == Some(23_u32.to_le_bytes().as_slice())
 }
 
+async fn execute_terminal_bot_command(
+    account: &AccountRuntime,
+    text: &str,
+) -> Result<Vec<String>, String> {
+    let mission_id = MissionId(account.mission_counter.fetch_add(1, Ordering::Relaxed));
+    match crate::commands::parse_local(
+        text,
+        crate::commands::chat::ChatFamily::Say,
+        true,
+        mission_id,
+    )
+    .map_err(|error| format!("invalid bot command: {error}"))?
+    {
+        Some(crate::commands::LocalCommand::Bot(command)) => {
+            execute_bot_command(account, command).await
+        }
+        _ => Err("unknown .bot command".into()),
+    }
+}
+
+async fn execute_bot_command(
+    account: &AccountRuntime,
+    command: crate::commands::bot::BotCommand,
+) -> Result<Vec<String>, String> {
+    use crate::commands::bot::BotCommand;
+
+    if account.config.worker.is_none()
+        && matches!(&command, BotCommand::On | BotCommand::Mission(_))
+    {
+        return Err("this account has no enabled bot worker".into());
+    }
+
+    match command {
+        BotCommand::On => {
+            let _ = account.visual_fence.send(());
+            let (committed, receiver) = oneshot::channel();
+            account
+                .session_tx
+                .send(SessionMessage::BotOn {
+                    committed: Some(committed),
+                })
+                .await
+                .map_err(|error| format!("could not enable bot control: {error}"))?;
+            if !receiver
+                .await
+                .map_err(|error| format!("bot control result was lost: {error}"))?
+            {
+                return Err("bot control did not start; check the upstream connection".into());
+            }
+            tracing::info!(account=%account.config.account_name, command=".bot on", "bot automation enabled");
+            Ok(vec!["automation enabled".into()])
+        }
+        BotCommand::Off => {
+            let _ = account.visual_fence.send(());
+            let (committed, receiver) = oneshot::channel();
+            account
+                .session_tx
+                .send(SessionMessage::BotOff {
+                    committed: Some(committed),
+                })
+                .await
+                .map_err(|error| format!("could not disable bot control: {error}"))?;
+            if !receiver
+                .await
+                .map_err(|error| format!("bot control result was lost: {error}"))?
+            {
+                return Err("bot control did not stop".into());
+            }
+            tracing::info!(account=%account.config.account_name, command=".bot off", "bot automation disabled");
+            Ok(vec!["automation disabled".into()])
+        }
+        BotCommand::Mission(mission) => {
+            let _ = account.visual_fence.send(());
+            let description = format!("{:?}", mission.intent);
+            account
+                .supervisor_tx
+                .send(SupervisorCommand::ReplaceMission {
+                    lane: account.config.lane,
+                    mission,
+                })
+                .await
+                .map_err(|error| format!("failed to route bot mission: {error}"))?;
+            let (committed, receiver) = oneshot::channel();
+            account
+                .session_tx
+                .send(SessionMessage::BotOn {
+                    committed: Some(committed),
+                })
+                .await
+                .map_err(|error| {
+                    format!("mission was installed, but bot control could not start: {error}")
+                })?;
+            if !receiver.await.map_err(|error| {
+                format!("mission was installed, but bot control result was lost: {error}")
+            })? {
+                return Err("mission was installed, but bot control did not start; check the upstream connection".into());
+            }
+            tracing::info!(account=%account.config.account_name, mission=%description, "mission installed and bot automation enabled");
+            Ok(vec![format!(
+                "mission set: {description}; automation enabled"
+            )])
+        }
+        BotCommand::Status => {
+            let owner = *account.ownership_state.borrow();
+            let character = account
+                .config
+                .character
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&account.config.account_name);
+            let status = format!(
+                "{character}: mode={:?}, requested={:?}, phase={:?}, attendance={:?}, bot_allowed={}",
+                owner.mode,
+                owner.requested,
+                owner.phase,
+                owner.attendance,
+                owner.bot_allowed(),
+            );
+            tracing::info!(account=%account.config.account_name, %status, "bot status requested");
+            Ok(vec![status])
+        }
+        BotCommand::Help => Ok(crate::commands::bot::HELP_LINES
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect()),
+    }
+}
+
 async fn handle_log_command(
     logs: &ActionLogManager,
     account: &str,
@@ -2860,7 +3627,7 @@ async fn handle_log_command(
 ) -> String {
     use crate::commands::log::LogCommand;
     match command {
-        LogCommand::Start => match logs.start(account).await {
+        LogCommand::Start(label) => match logs.start(account, label.as_deref()).await {
             Ok(path) => {
                 tracing::info!(account=%account, path=%path.display(), "action logging started");
                 format!(
@@ -2874,9 +3641,15 @@ async fn handle_log_command(
             }
         },
         LogCommand::Stop => match logs.stop(account).await {
-            Ok(Some(path)) => {
+            Ok(Some((path, failure))) => {
                 tracing::info!(account=%account, path=%path.display(), "action logging stopped");
-                format!("[wow-bot] action logging stopped: {}", path.display())
+                match failure {
+                    Some(error) => format!(
+                        "[wow-bot] action logging stopped INCOMPLETE: {} ({error})",
+                        path.display()
+                    ),
+                    None => format!("[wow-bot] action logging stopped: {}", path.display()),
+                }
             }
             Ok(None) => {
                 tracing::info!(account=%account, "action logging is not active");
@@ -2888,7 +3661,14 @@ async fn handle_log_command(
             }
         },
         LogCommand::Status => match logs.status(account).await {
-            Some(path) => {
+            Some((path, Some(error))) => {
+                tracing::warn!(account=%account, path=%path.display(), %error, "action logging is incomplete");
+                format!(
+                    "[wow-bot] action logging is INCOMPLETE: {} ({error})",
+                    path.display()
+                )
+            }
+            Some((path, None)) => {
                 tracing::info!(account=%account, path=%path.display(), "action logging is active");
                 format!("[wow-bot] action logging is active: {}", path.display())
             }
@@ -2911,6 +3691,14 @@ async fn handle_log_command(
                 format!("[wow-bot] failed to write action log marker: {error}")
             }
         },
+        LogCommand::Help => crate::commands::bot::HELP_LINES
+            .iter()
+            .find(|line| line.starts_with(".log"))
+            .copied()
+            .unwrap_or(
+                ".log start [label] | .log mark [label] | .log status | .log stop | .log help",
+            )
+            .to_owned(),
     }
 }
 
@@ -3020,7 +3808,8 @@ mod runtime_chat_tests {
             EntityId(7),
             visual.point,
             1.25,
-            0x0DA
+            0x0DA,
+            Duration::ZERO,
         ));
         assert!(!movement_matches_bot_visual(
             visual,
@@ -3029,7 +3818,8 @@ mod runtime_chat_tests {
             EntityId(8),
             Vec3::new(4.0, 2.0, 3.0),
             1.25,
-            0x0DA
+            0x0DA,
+            Duration::ZERO,
         ));
     }
 
@@ -3045,18 +3835,20 @@ mod runtime_chat_tests {
             EntityId(7),
             0x0B5,
             EntityId(7),
-            Vec3::new(2.2, 2.0, 3.0),
-            1.25,
+            Vec3::new(8.5, 2.0, 3.0),
+            1.55,
             0x0BC,
+            Duration::from_secs(1),
         ));
         assert!(!movement_matches_bot_visual(
             visual,
             EntityId(7),
             0x0B5,
             EntityId(7),
-            Vec3::new(5.0, 2.0, 3.0),
+            Vec3::new(10.1, 2.0, 3.0),
             1.25,
             0x0BC,
+            Duration::from_millis(1250),
         ));
     }
 
@@ -3513,14 +4305,65 @@ mod quest_protocol_tests {
         push_packed_guid(&mut aura, EntityId(7));
         aura.push(3);
         aura.extend_from_slice(&1459_u32.to_le_bytes());
+        aura.extend_from_slice(&[0x20, 1, 1]); // caster and duration follow
+        push_packed_guid(&mut aura, EntityId(9));
+        aura.extend_from_slice(&30_000_u32.to_le_bytes());
+        aura.extend_from_slice(&12_000_u32.to_le_bytes());
         assert!(matches!(
             parse_aura_update(&aura),
             Some(ProtocolObservation::AuraSlot {
                 entity: EntityId(7),
                 slot: 3,
-                aura: Some(wow_state::auras::AuraInstance { spell: 1459, .. })
+                aura: Some(wow_state::auras::AuraInstance {
+                    spell: 1459,
+                    caster: Some(EntityId(9)),
+                    max_duration_ms: Some(30_000),
+                    remaining_ms: Some(12_000),
+                    observed_at_ms: Some(_),
+                    ..
+                })
             })
         ));
+
+        let mut ghost_aura = Vec::new();
+        push_packed_guid(&mut ghost_aura, EntityId(7));
+        ghost_aura.push(0);
+        ghost_aura.extend_from_slice(&wow_state::life::GHOST_AURA_SPELL_ID.to_le_bytes());
+        ghost_aura.extend_from_slice(&[0x08, 1, 0]); // caster omitted, level, stacks
+        assert!(matches!(
+            parse_aura_update(&ghost_aura),
+            Some(ProtocolObservation::AuraSlot {
+                entity: EntityId(7),
+                slot: 0,
+                aura: Some(wow_state::auras::AuraInstance {
+                    spell: wow_state::life::GHOST_AURA_SPELL_ID,
+                    ..
+                })
+            })
+        ));
+
+        let mut all_auras = Vec::new();
+        push_packed_guid(&mut all_auras, EntityId(7));
+        all_auras.push(3);
+        all_auras.extend_from_slice(&172_u32.to_le_bytes());
+        all_auras.extend_from_slice(&[0x20, 1, 2]);
+        push_packed_guid(&mut all_auras, EntityId(9));
+        all_auras.extend_from_slice(&18_000_u32.to_le_bytes());
+        all_auras.extend_from_slice(&8_000_u32.to_le_bytes());
+        assert!(matches!(
+            parse_aura_update_all(&all_auras),
+            Some(ProtocolObservation::AuraSnapshot { auras, .. })
+                if matches!(auras.as_slice(), [wow_state::auras::AuraInstance {
+                    slot: 3,
+                    spell: 172,
+                    positive: Some(false),
+                    caster: Some(EntityId(9)),
+                    max_duration_ms: Some(18_000),
+                    remaining_ms: Some(8_000),
+                    observed_at_ms: Some(_),
+                }])
+        ));
+
         let mut removed = Vec::new();
         push_packed_guid(&mut removed, EntityId(7));
         removed.push(3);
@@ -3824,17 +4667,26 @@ mod quest_protocol_tests {
         offer.extend_from_slice(&0_u32.to_le_bytes());
         offer.extend_from_slice(&0_u32.to_le_bytes());
         offer.extend_from_slice(&2_u32.to_le_bytes());
+        offer.extend_from_slice(&1001_u32.to_le_bytes());
+        offer.extend_from_slice(&1_u32.to_le_bytes());
+        offer.extend_from_slice(&501_u32.to_le_bytes());
+        offer.extend_from_slice(&1002_u32.to_le_bytes());
+        offer.extend_from_slice(&1_u32.to_le_bytes());
+        offer.extend_from_slice(&502_u32.to_le_bytes());
         let parsed = parse_quest_offer_reward(&offer).expect("offer-reward should parse");
-        assert!(matches!(
-            parsed,
-            ProtocolObservation::QuestTurnInDialog {
-                quest: 42,
-                dialog: wow_state::quests::QuestTurnInDialog {
-                    giver: EntityId(77),
-                    stage: wow_state::quests::QuestTurnInStage::OfferReward { reward_choices: 2 }
-                }
+        let ProtocolObservation::QuestTurnInDialog { quest, dialog } = parsed else {
+            panic!("expected quest turn-in offer")
+        };
+        assert_eq!(quest, 42);
+        assert_eq!(dialog.giver, EntityId(77));
+        assert_eq!(
+            dialog.stage,
+            wow_state::quests::QuestTurnInStage::OfferReward {
+                reward_items: vec![1001, 1002]
             }
-        ));
+        );
+        offer.pop();
+        assert!(parse_quest_offer_reward(&offer).is_none());
     }
 
     #[test]

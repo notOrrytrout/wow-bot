@@ -151,7 +151,7 @@ fn bot_movement_rejection_reason(
 pub struct ConfiguredSessionActor {
     pub state: ConfiguredSessionState,
     pub rx: mpsc::Receiver<SessionMessage>,
-    pub worker_tx: mpsc::Sender<ProxyToWorker>,
+    pub worker_tx: Option<mpsc::Sender<ProxyToWorker>>,
     pub upstream_tx: mpsc::Sender<GameplayDispatch>,
     pub supervisor_tx: mpsc::Sender<SupervisorCommand>,
     pub diagnostics: DiagnosticLogger,
@@ -272,6 +272,12 @@ impl ConfiguredSessionActor {
                 false
             }
             SessionMessage::BotOn { committed: reply } => {
+                if !self.state.worker_running {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(false);
+                    }
+                    return false;
+                }
                 let _movement_guard = self.lock_movement_gate().await;
                 self.state.player.bot_on();
                 let ticket = self.state.ownership.begin(ControlMode::Bot);
@@ -297,12 +303,16 @@ impl ConfiguredSessionActor {
                 let _ = self.update_player_pause(true).await;
                 let committed = self.state.ownership.commit(ticket);
                 let owner = self.state.ownership.snapshot();
+                let movement_stopped = committed && self.send_movement_stop().await;
                 tracing::info!(lane=?self.state.lane, committed, generation=?owner.generation, movement_epoch=?owner.movement_epoch, "bot ownership command applied: OFF");
+                if !movement_stopped {
+                    tracing::warn!(lane=?self.state.lane, "bot ownership is Manual, but the movement stop could not be queued");
+                }
                 if committed {
                     self.publish_ownership().await;
                 }
                 if let Some(reply) = reply {
-                    let _ = reply.send(committed);
+                    let _ = reply.send(committed && movement_stopped);
                 }
                 false
             }
@@ -392,9 +402,7 @@ impl ConfiguredSessionActor {
                 false
             }
             SessionMessage::Observation(observation) => {
-                let _ = self
-                    .worker_tx
-                    .send(ProxyToWorker::Observation(observation))
+                self.send_worker(ProxyToWorker::Observation(observation))
                     .await;
                 false
             }
@@ -406,59 +414,78 @@ impl ConfiguredSessionActor {
         let _movement_guard = self.lock_movement_gate().await;
         self.state.player.attach(connection);
         let paused = self.update_player_pause(true).await.is_ok();
-        self.diagnostics.record(
-            DiagnosticStream::ProxySession,
-            self.state.lane,
-            "player_attached",
-            serde_json::json!({"pause_committed": paused}),
-        );
+        let mut movement_stopped = false;
         if paused {
             self.state.player.bot_off();
             self.state.ownership.player_attached_manual_off();
             self.publish_ownership().await;
+            movement_stopped = self.send_movement_stop().await;
         } else {
             self.state.player.detach(connection);
         }
-        paused
+        self.diagnostics.record(
+            DiagnosticStream::ProxySession,
+            self.state.lane,
+            "player_attached",
+            serde_json::json!({
+                "pause_committed": paused,
+                "movement_stop_queued": movement_stopped,
+                "control_mode": "manual_off",
+            }),
+        );
+        if paused && !movement_stopped {
+            tracing::warn!(lane=?self.state.lane, "player login disabled the bot, but the movement stop could not be queued");
+        }
+        paused && movement_stopped
+    }
+
+    async fn send_movement_stop(&self) -> bool {
+        self.upstream_tx
+            .send(GameplayDispatch::Unfenced(GameplayCommand::StopMovement))
+            .await
+            .is_ok()
     }
 
     async fn handle_worker(&mut self, msg: WorkerToProxy) -> bool {
         match msg {
             WorkerToProxy::Action(action) => {
                 let id = action.id();
-                let result =
-                    match authorize(&action, self.state.worker, self.state.ownership.snapshot()) {
-                        Ok(()) => {
-                            let movement_epoch = action.stamp().movement;
-                            let command = action.into_command();
-                            let dispatch = if matches!(
-                                &command,
-                                GameplayCommand::MoveTo(_)
-                                    | GameplayCommand::FaceDirection { .. }
-                                    | GameplayCommand::StopMovement
-                            ) {
-                                let sequence = self.next_movement_sequence();
-                                GameplayDispatch::BotMovement {
-                                    command,
-                                    generation: self.state.ownership.snapshot().generation,
-                                    movement_epoch,
-                                    sequence,
-                                    world_generation: self.world_generation,
-                                }
-                            } else {
-                                GameplayDispatch::Unfenced(command)
-                            };
-                            match self.upstream_tx.send(dispatch).await {
-                                Ok(()) => ActionTransportResult::Accepted,
-                                Err(_) => ActionTransportResult::Rejected {
-                                    reason: "upstream closed".into(),
-                                },
+                let result = match self.state.worker.map_or_else(
+                    || Err("worker is disabled".to_owned()),
+                    |worker| {
+                        authorize(&action, worker, self.state.ownership.snapshot())
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                ) {
+                    Ok(()) => {
+                        let movement_epoch = action.stamp().movement;
+                        let command = action.into_command();
+                        let dispatch = if matches!(
+                            &command,
+                            GameplayCommand::MoveTo(_)
+                                | GameplayCommand::FaceDirection { .. }
+                                | GameplayCommand::StopMovement
+                        ) {
+                            let sequence = self.next_movement_sequence();
+                            GameplayDispatch::BotMovement {
+                                command,
+                                generation: self.state.ownership.snapshot().generation,
+                                movement_epoch,
+                                sequence,
+                                world_generation: self.world_generation,
                             }
+                        } else {
+                            GameplayDispatch::Unfenced(command)
+                        };
+                        match self.upstream_tx.send(dispatch).await {
+                            Ok(()) => ActionTransportResult::Accepted,
+                            Err(_) => ActionTransportResult::Rejected {
+                                reason: "upstream closed".into(),
+                            },
                         }
-                        Err(error) => ActionTransportResult::Rejected {
-                            reason: format!("{error:?}"),
-                        },
-                    };
+                    }
+                    Err(error) => ActionTransportResult::Rejected { reason: error },
+                };
                 self.diagnostics.record(
                     DiagnosticStream::ProxySession,
                     self.state.lane,
@@ -468,9 +495,7 @@ impl ConfiguredSessionActor {
                         "accepted": matches!(result, ActionTransportResult::Accepted),
                     }),
                 );
-                let _ = self
-                    .worker_tx
-                    .send(ProxyToWorker::ActionResult { action: id, result })
+                self.send_worker(ProxyToWorker::ActionResult { action: id, result })
                     .await;
                 false
             }
@@ -489,7 +514,7 @@ impl ConfiguredSessionActor {
                 let sequence_is_fresh =
                     self.last_worker_movement_sequence
                         .is_none_or(|(worker, previous)| {
-                            worker != self.state.worker || movement.get() > previous
+                            Some(worker) != self.state.worker || movement.get() > previous
                         });
                 let rejection_reason =
                     bot_movement_rejection_reason(owner, epoch, destination.is_finite()).or_else(
@@ -514,7 +539,9 @@ impl ConfiguredSessionActor {
                     }),
                 );
                 if accepted {
-                    self.last_worker_movement_sequence = Some((self.state.worker, movement.get()));
+                    if let Some(worker) = self.state.worker {
+                        self.last_worker_movement_sequence = Some((worker, movement.get()));
+                    }
                     let sequence = self.next_movement_sequence();
                     let _ = self
                         .upstream_tx
@@ -534,7 +561,7 @@ impl ConfiguredSessionActor {
                 let sequence_is_fresh =
                     self.last_worker_movement_sequence
                         .is_none_or(|(worker, previous)| {
-                            worker != self.state.worker || movement.get() > previous
+                            Some(worker) != self.state.worker || movement.get() > previous
                         });
                 let rejection_reason =
                     bot_movement_rejection_reason(owner, epoch, true).or_else(|| {
@@ -556,7 +583,9 @@ impl ConfiguredSessionActor {
                     }),
                 );
                 if accepted {
-                    self.last_worker_movement_sequence = Some((self.state.worker, movement.get()));
+                    if let Some(worker) = self.state.worker {
+                        self.last_worker_movement_sequence = Some((worker, movement.get()));
+                    }
                     let sequence = self.next_movement_sequence();
                     let _ = self
                         .upstream_tx
@@ -575,6 +604,9 @@ impl ConfiguredSessionActor {
     }
 
     async fn update_player_pause(&self, paused: bool) -> Result<(), String> {
+        if !self.state.worker_running {
+            return Ok(());
+        }
         self.supervisor_tx
             .send(SupervisorCommand::UpdatePause {
                 lane: self.state.lane,
@@ -603,13 +635,11 @@ impl ConfiguredSessionActor {
                 "in_world": self.state.world_authoritative,
             }),
         );
-        let _ = self
-            .worker_tx
-            .send(ProxyToWorker::SessionState {
-                connected: self.state.upstream_connected,
-                in_world: self.state.world_authoritative,
-            })
-            .await;
+        self.send_worker(ProxyToWorker::SessionState {
+            connected: self.state.upstream_connected,
+            in_world: self.state.world_authoritative,
+        })
+        .await;
     }
 
     async fn publish_ownership(&self) {
@@ -628,15 +658,19 @@ impl ConfiguredSessionActor {
                 "player_present": owner.player_present(),
             }),
         );
-        let _ = self
-            .worker_tx
-            .send(ProxyToWorker::OwnershipChanged(WireOwnership {
-                generation: owner.generation,
-                movement_epoch: owner.movement_epoch,
-                player_present: owner.player_present(),
-                bot_allowed: owner.bot_allowed(),
-            }))
-            .await;
+        self.send_worker(ProxyToWorker::OwnershipChanged(WireOwnership {
+            generation: owner.generation,
+            movement_epoch: owner.movement_epoch,
+            player_present: owner.player_present(),
+            bot_allowed: owner.bot_allowed(),
+        }))
+        .await;
+    }
+
+    async fn send_worker(&self, message: ProxyToWorker) {
+        if let Some(worker_tx) = &self.worker_tx {
+            let _ = worker_tx.send(message).await;
+        }
     }
 }
 
@@ -654,12 +688,16 @@ mod tests {
     async fn older_player_disconnect_preserves_newer_world_session() {
         let (_, rx) = mpsc::channel(8);
         let (worker_tx, _worker_rx) = mpsc::channel(32);
-        let (upstream_tx, _upstream_rx) = mpsc::channel(8);
+        let (upstream_tx, mut upstream_rx) = mpsc::channel(8);
         let (supervisor_tx, _supervisor_rx) = mpsc::channel(8);
         let mut actor = ConfiguredSessionActor {
-            state: ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO),
+            state: ConfiguredSessionState::new(
+                AccountId(1),
+                LaneId(1),
+                Some(WorkerGeneration::ZERO),
+            ),
             rx,
-            worker_tx,
+            worker_tx: Some(worker_tx),
             upstream_tx,
             supervisor_tx,
             diagnostics: test_diagnostics(),
@@ -676,9 +714,17 @@ mod tests {
         actor
             .handle(SessionMessage::PlayerAttached { connection: 1 })
             .await;
+        assert!(matches!(
+            upstream_rx.recv().await,
+            Some(GameplayDispatch::Unfenced(GameplayCommand::StopMovement))
+        ));
         actor
             .handle(SessionMessage::PlayerAttached { connection: 2 })
             .await;
+        assert!(matches!(
+            upstream_rx.recv().await,
+            Some(GameplayDispatch::Unfenced(GameplayCommand::StopMovement))
+        ));
         actor.handle(SessionMessage::UpstreamConnected(true)).await;
         actor.handle(SessionMessage::WorldAuthoritative(true)).await;
 
@@ -704,6 +750,10 @@ mod tests {
             })
             .await;
         assert_eq!(bot_off_rx.await, Ok(true));
+        assert!(matches!(
+            upstream_rx.recv().await,
+            Some(GameplayDispatch::Unfenced(GameplayCommand::StopMovement))
+        ));
         assert!(!actor.state.ownership.snapshot().bot_allowed());
 
         actor
@@ -715,6 +765,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn player_login_starts_manual_off_and_queues_a_movement_stop() {
+        let (_, rx) = mpsc::channel(8);
+        let (worker_tx, mut worker_rx) = mpsc::channel(8);
+        let (upstream_tx, mut upstream_rx) = mpsc::channel(8);
+        let (supervisor_tx, mut supervisor_rx) = mpsc::channel(8);
+        let mut state =
+            ConfiguredSessionState::new(AccountId(1), LaneId(1), Some(WorkerGeneration::ZERO));
+        state.upstream_connected = true;
+        state.ownership = crate::ownership::AccountOwnership::new(ControlMode::Bot);
+        let mut actor = ConfiguredSessionActor {
+            state,
+            rx,
+            worker_tx: Some(worker_tx),
+            upstream_tx,
+            supervisor_tx,
+            diagnostics: test_diagnostics(),
+            assistance_armed: tokio::sync::watch::channel(true).0,
+            ownership_state: tokio::sync::watch::channel(
+                crate::ownership::AccountOwnership::new(ControlMode::Bot).snapshot(),
+            )
+            .0,
+            movement_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            world_generation: 1,
+            movement_sequence: 0,
+            last_worker_movement_sequence: None,
+        };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        actor
+            .handle(SessionMessage::PreparePlayerLogin {
+                connection: 10,
+                ready: ready_tx,
+            })
+            .await;
+
+        assert_eq!(ready_rx.await, Ok(true));
+        assert!(matches!(
+            supervisor_rx.recv().await,
+            Some(SupervisorCommand::UpdatePause { set, .. }) if set.contains(PauseReasons::PLAYER_CONTROL)
+        ));
+        assert!(matches!(
+            upstream_rx.recv().await,
+            Some(GameplayDispatch::Unfenced(GameplayCommand::StopMovement))
+        ));
+        assert_eq!(actor.state.ownership.snapshot().mode, ControlMode::Manual);
+        assert!(!actor.state.ownership.snapshot().bot_allowed());
+        assert!(matches!(
+            worker_rx.recv().await,
+            Some(ProxyToWorker::OwnershipChanged(owner)) if !owner.bot_allowed
+        ));
+    }
+
+    #[tokio::test]
     async fn idle_resume_is_published_only_after_supervisor_accepts_resume() {
         let (_, rx) = mpsc::channel(8);
         let (worker_tx, mut worker_rx) = mpsc::channel(8);
@@ -722,9 +825,13 @@ mod tests {
         let (supervisor_tx, mut supervisor_rx) = mpsc::channel(8);
         let (assistance_armed, assistance_rx) = tokio::sync::watch::channel(false);
         let mut actor = ConfiguredSessionActor {
-            state: ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO),
+            state: ConfiguredSessionState::new(
+                AccountId(1),
+                LaneId(1),
+                Some(WorkerGeneration::ZERO),
+            ),
             rx,
-            worker_tx,
+            worker_tx: Some(worker_tx),
             upstream_tx,
             supervisor_tx,
             diagnostics: test_diagnostics(),
@@ -784,9 +891,13 @@ mod tests {
         let (supervisor_tx, supervisor_rx) = mpsc::channel(8);
         drop(supervisor_rx);
         let mut actor = ConfiguredSessionActor {
-            state: ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO),
+            state: ConfiguredSessionState::new(
+                AccountId(1),
+                LaneId(1),
+                Some(WorkerGeneration::ZERO),
+            ),
             rx,
-            worker_tx,
+            worker_tx: Some(worker_tx),
             upstream_tx,
             supervisor_tx,
             diagnostics: test_diagnostics(),
@@ -831,9 +942,13 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::channel(8);
         let (supervisor_tx, _supervisor_rx) = mpsc::channel(8);
         let mut actor = ConfiguredSessionActor {
-            state: ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO),
+            state: ConfiguredSessionState::new(
+                AccountId(1),
+                LaneId(1),
+                Some(WorkerGeneration::ZERO),
+            ),
             rx,
-            worker_tx,
+            worker_tx: Some(worker_tx),
             upstream_tx,
             supervisor_tx,
             diagnostics: test_diagnostics(),
@@ -916,13 +1031,13 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::channel(8);
         let (supervisor_tx, _supervisor_rx) = mpsc::channel(8);
         let mut state =
-            ConfiguredSessionState::new(AccountId(1), LaneId(1), WorkerGeneration::ZERO);
+            ConfiguredSessionState::new(AccountId(1), LaneId(1), Some(WorkerGeneration::ZERO));
         state.ownership.player_attached_bot_on();
         let movement_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
         let mut actor = ConfiguredSessionActor {
             state,
             rx,
-            worker_tx,
+            worker_tx: Some(worker_tx),
             upstream_tx,
             supervisor_tx,
             diagnostics: test_diagnostics(),
@@ -958,5 +1073,35 @@ mod tests {
             .expect("handoff commit should be sent");
         let owner = handoff.await.expect("session actor task should finish");
         assert!(!owner.bot_allowed());
+    }
+
+    #[tokio::test]
+    async fn bot_on_is_rejected_when_account_has_no_worker() {
+        let (_, rx) = mpsc::channel(8);
+        let (upstream_tx, _upstream_rx) = mpsc::channel(8);
+        let (supervisor_tx, _supervisor_rx) = mpsc::channel(8);
+        let (committed, result) = tokio::sync::oneshot::channel();
+        let initial_owner = crate::ownership::AccountOwnership::default().snapshot();
+        let mut actor = ConfiguredSessionActor {
+            state: ConfiguredSessionState::new(AccountId(1), LaneId(1), None),
+            rx,
+            worker_tx: None,
+            upstream_tx,
+            supervisor_tx,
+            diagnostics: test_diagnostics(),
+            assistance_armed: tokio::sync::watch::channel(false).0,
+            ownership_state: tokio::sync::watch::channel(initial_owner).0,
+            movement_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            world_generation: 1,
+            movement_sequence: 0,
+            last_worker_movement_sequence: None,
+        };
+        actor
+            .handle(SessionMessage::BotOn {
+                committed: Some(committed),
+            })
+            .await;
+        assert!(!result.await.unwrap());
+        assert_eq!(actor.state.ownership.snapshot(), initial_owner);
     }
 }

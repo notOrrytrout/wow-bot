@@ -11,6 +11,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn item_template_observation_keeps_fields_needed_for_gear_scoring() {
+        let mut packet = Vec::new();
+        for value in [100, 4, 1, 0] {
+            packet.extend_from_slice(&value_u32(value));
+        }
+        packet.extend_from_slice(b"Conjured Frostwater\0");
+        for _ in 0..3 {
+            packet.extend_from_slice(b"\0");
+        }
+        for value in [1, 2, 0, 0, 0, 10, 10, 0, 0, 70, 10] {
+            packet.extend_from_slice(&value_u32(value));
+        }
+        for value in [0; 9] {
+            packet.extend_from_slice(&value_u32(value));
+        }
+        packet.extend_from_slice(&value_u32(0)); // container slots
+        packet.extend_from_slice(&value_u32(1)); // one stat
+        packet.extend_from_slice(&value_u32(4));
+        packet.extend_from_slice(&value_u32(12));
+        packet.extend_from_slice(&[0; 8]); // scaling
+        for value in [1.0_f32, 2.0] {
+            packet.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        packet.extend_from_slice(&value_u32(0));
+        packet.extend_from_slice(&[0; 8]); // second damage range
+        packet.extend_from_slice(&value_u32(0));
+        packet.extend_from_slice(&value_u32(25)); // armor
+        packet.extend_from_slice(&[0; 24]);
+        packet.extend_from_slice(&value_u32(1800));
+        packet.extend_from_slice(&value_u32(1));
+        packet.extend_from_slice(&value_u32(0)); // ranged modifier
+        packet.extend_from_slice(&value_u32(1234)); // item use spell
+        packet.extend_from_slice(&value_u32(0)); // on use
+        packet.extend_from_slice(&[0; 16]);
+        for _ in 0..4 {
+            packet.extend_from_slice(&[0; 24]);
+        }
+
+        let Some(ProtocolObservation::ItemTemplate { item, metadata }) =
+            parse_item_template(&packet)
+        else {
+            panic!("item metadata expected")
+        };
+        assert_eq!(item, 100);
+        assert_eq!(metadata.inventory_type, 10);
+        assert_eq!(metadata.item_level, 70);
+        assert_eq!(metadata.required_level, 10);
+        assert_eq!(metadata.stats, vec![(4, 12)]);
+        assert_eq!(metadata.armor, 25);
+        assert_eq!(metadata.delay_ms, 1800);
+        assert_eq!(metadata.name, "Conjured Frostwater");
+        assert_eq!(metadata.use_spell_id, 1234);
+    }
+
+    fn value_u32(value: u32) -> [u8; 4] {
+        value.to_le_bytes()
+    }
+
+    #[test]
     fn rune_observation_requires_six_valid_runes() {
         let mut packet = 6u32.to_le_bytes().to_vec();
         packet.extend_from_slice(&[0, 255, 1, 0, 2, 255, 3, 0, 1, 255, 2, 0]);
@@ -266,22 +325,74 @@ fn parse_item_template(body: &[u8]) -> Option<ProtocolObservation> {
         return None;
     }
     let item_class = read_u32(body, &mut offset)?;
-    read_u32(body, &mut offset)?; // subclass
+    let subclass = read_u32(body, &mut offset)?;
     read_u32(body, &mut offset)?; // sound override subclass
+    let mut names = Vec::with_capacity(4);
     for _ in 0..4 {
-        let end = body.get(offset..)?.iter().position(|byte| *byte == 0)? + offset + 1;
-        offset = end;
+        let end = body.get(offset..)?.iter().position(|byte| *byte == 0)? + offset;
+        names.push(String::from_utf8_lossy(body.get(offset..end)?).into_owned());
+        offset = end.checked_add(1)?;
     }
     offset = offset.checked_add(4)?; // display id
     let quality = read_u32(body, &mut offset)?;
-    offset = offset.checked_add(12)?; // flags, flags2, buy price
+    offset = offset.checked_add(8)?; // flags, flags2
+    read_u32(body, &mut offset)?; // buy price
     let sell_price = read_u32(body, &mut offset)?;
+    let inventory_type = read_u32(body, &mut offset)?;
+    let allowable_class = read_u32(body, &mut offset)?;
+    read_u32(body, &mut offset)?; // allowable race
+    let item_level = read_u32(body, &mut offset)?;
+    let required_level = read_u32(body, &mut offset)?;
+    offset = offset.checked_add(4 * 9)?; // skill, spell, reputation and stack fields
+    let container_slots = read_u32(body, &mut offset)?;
+    let stat_count = read_u32(body, &mut offset)?.min(10) as usize;
+    let mut stats = Vec::with_capacity(stat_count);
+    for _ in 0..stat_count {
+        let stat = read_u32(body, &mut offset)? as i32;
+        let value = read_u32(body, &mut offset)? as i32;
+        stats.push((stat, value));
+    }
+    offset = offset.checked_add(8)?; // scaling distribution and value
+    let mut damage_min = f32::from_bits(read_u32(body, &mut offset)?);
+    let mut damage_max = f32::from_bits(read_u32(body, &mut offset)?);
+    read_u32(body, &mut offset)?; // damage type
+    damage_min += f32::from_bits(read_u32(body, &mut offset)?);
+    damage_max += f32::from_bits(read_u32(body, &mut offset)?);
+    read_u32(body, &mut offset)?; // second damage type
+    let armor = read_u32(body, &mut offset)?;
+    offset = offset.checked_add(4 * 6)?; // resistances
+    let delay_ms = read_u32(body, &mut offset)?;
+    let ammo_type = read_u32(body, &mut offset)?;
+    offset = offset.checked_add(4)?; // ranged modifier
+    let mut use_spell_id = 0;
+    for _ in 0..5 {
+        let spell = read_u32(body, &mut offset)?;
+        let trigger = read_u32(body, &mut offset)?;
+        offset = offset.checked_add(16)?; // charges, cooldown and category fields
+        if use_spell_id == 0 && spell != 0 && trigger == 0 {
+            use_spell_id = spell;
+        }
+    }
     Some(ProtocolObservation::ItemTemplate {
         item,
         metadata: wow_state::inventory::ItemTemplateMetadata {
+            name: names.into_iter().next().unwrap_or_default(),
             item_class,
+            subclass,
             quality,
             sell_price,
+            inventory_type,
+            allowable_class,
+            item_level,
+            required_level,
+            stats,
+            armor,
+            damage_min,
+            damage_max,
+            delay_ms,
+            container_slots,
+            ammo_type,
+            use_spell_id,
         },
     })
 }
@@ -467,15 +578,7 @@ pub(super) fn parse_aura_update(body: &[u8]) -> Option<ProtocolObservation> {
     let entity = EntityId(read_packed_guid(body, &mut offset)?);
     let slot = *body.get(offset)?;
     offset += 1;
-    let spell = u32_le_at(body, offset)?;
-    let aura = (spell != 0).then_some(wow_state::auras::AuraInstance {
-        slot,
-        spell,
-        positive: None,
-        caster: None,
-        max_duration_ms: None,
-        remaining_ms: None,
-    });
+    let aura = parse_aura_entry(body, &mut offset, slot)?;
     Some(ProtocolObservation::AuraSlot { entity, slot, aura })
 }
 
@@ -486,38 +589,62 @@ pub(super) fn parse_aura_update_all(body: &[u8]) -> Option<ProtocolObservation> 
     while offset < body.len() {
         let slot = *body.get(offset)?;
         offset += 1;
-        let spell = u32_le_at(body, offset)?;
-        offset += 4;
-        let flags = *body.get(offset)?;
-        offset += 1;
-        let _level = *body.get(offset)?;
-        offset += 1;
-        let caster = if flags & 0x08 == 0 {
-            Some(EntityId(read_packed_guid(body, &mut offset)?))
-        } else {
-            None
-        };
-        let (max_duration_ms, remaining_ms) = if flags & 0x20 != 0 {
-            let max = u32_le_at(body, offset)?;
-            offset += 4;
-            let remaining = u32_le_at(body, offset)?;
-            offset += 4;
-            (Some(max), Some(remaining))
-        } else {
-            (None, None)
-        };
-        if spell != 0 {
-            auras.push(wow_state::auras::AuraInstance {
-                slot,
-                spell,
-                positive: Some(flags & 0x10 != 0),
-                caster,
-                max_duration_ms,
-                remaining_ms,
-            });
+        if let Some(aura) = parse_aura_entry(body, &mut offset, slot)? {
+            auras.push(aura);
         }
     }
     Some(ProtocolObservation::AuraSnapshot { entity, auras })
+}
+
+fn parse_aura_entry(
+    body: &[u8],
+    offset: &mut usize,
+    slot: u8,
+) -> Option<Option<wow_state::auras::AuraInstance>> {
+    let spell = u32_le_at(body, *offset)?;
+    *offset += 4;
+    if spell == 0 {
+        return Some(None);
+    }
+    let flags = *body.get(*offset)?;
+    *offset += 1;
+    body.get(*offset..offset.checked_add(2)?)?;
+    *offset += 2; // aura level and applications/stacks
+    let caster = if flags & 0x08 == 0 {
+        Some(EntityId(read_packed_guid(body, offset)?))
+    } else {
+        None
+    };
+    let (max_duration_ms, remaining_ms, observed_at_ms) = if flags & 0x20 != 0 {
+        let max = u32_le_at(body, *offset)? as i32;
+        *offset += 4;
+        let remaining = u32_le_at(body, *offset)? as i32;
+        *offset += 4;
+        (
+            (max >= 0).then_some(max as u32),
+            (remaining >= 0).then_some(remaining as u32),
+            (remaining >= 0).then(|| wow_domain::time::Millis::wall_clock_now().0),
+        )
+    } else {
+        (None, None, None)
+    };
+    if flags & 0x40 != 0 {
+        for effect in 0..3 {
+            if flags & (1 << effect) != 0 {
+                body.get(*offset..offset.checked_add(4)?)?;
+                *offset += 4;
+            }
+        }
+    }
+    Some(Some(wow_state::auras::AuraInstance {
+        slot,
+        spell,
+        positive: Some(flags & 0x10 != 0),
+        caster,
+        max_duration_ms,
+        remaining_ms,
+        observed_at_ms,
+    }))
 }
 
 pub(super) fn controlled_abilities_observation(
@@ -717,13 +844,33 @@ pub(super) fn parse_quest_offer_reward(body: &[u8]) -> Option<ProtocolObservatio
     let _reward_text = read_cstring(body, &mut offset)?;
     offset = offset.checked_add(1 + 4 + 4)?;
     let emote_count = u32_le_at(body, offset)? as usize;
+    if emote_count > 64 {
+        return None;
+    }
     offset = offset.checked_add(4 + emote_count.checked_mul(8)?)?;
-    let reward_choices = u32_le_at(body, offset)?;
+    let choice_count = u32_le_at(body, offset)? as usize;
+    if choice_count > 6 {
+        return None;
+    }
+    offset = offset.checked_add(4)?;
+    let mut reward_items = Vec::with_capacity(choice_count);
+    for _ in 0..choice_count {
+        let item = u32_le_at(body, offset)?;
+        let count = u32_le_at(body, offset.checked_add(4)?)?;
+        // The final word is the client display id. It is not needed by policy,
+        // but its presence is part of each packet record.
+        u32_le_at(body, offset.checked_add(8)?)?;
+        if item == 0 || count == 0 {
+            return None;
+        }
+        reward_items.push(item);
+        offset = offset.checked_add(12)?;
+    }
     Some(ProtocolObservation::QuestTurnInDialog {
         quest,
         dialog: QuestTurnInDialog {
             giver,
-            stage: QuestTurnInStage::OfferReward { reward_choices },
+            stage: QuestTurnInStage::OfferReward { reward_items },
         },
     })
 }

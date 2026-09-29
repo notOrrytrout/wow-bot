@@ -15,12 +15,221 @@ const CMSG_FORCE_RUN_SPEED_CHANGE_ACK_OPCODE: u32 = 0x00E3;
 
 pub(super) const SMSG_TIME_SYNC_REQ_OPCODE: u16 = 0x0390;
 const CMSG_TIME_SYNC_RESP_OPCODE: u32 = 0x0391;
+pub(super) const BOT_VISUAL_ECHO_WINDOW: Duration = Duration::from_millis(1250);
+const ECHO_POSITION_DRIFT_YARDS: f32 = 2.0;
+const ECHO_DRIFT_SPEED_YARDS_PER_SECOND: f32 = 7.0;
+const MAX_ECHO_POSITION_DRIFT_YARDS: f32 = 9.0;
+const MAX_ECHO_ORIENTATION_DRIFT_RADIANS: f32 = 0.35;
 
 #[derive(Debug)]
 pub(super) struct MovementClock {
     client_time_ms: u32,
     anchored_at: Instant,
     last_generated: Option<u32>,
+}
+
+const MAX_ABS_COORDINATE: f32 = 200_000.0;
+const MAX_BOT_PACKET_DELTA_YARDS: f32 = 40.0;
+const MAX_PLAYER_PACKET_DELTA_YARDS: f32 = 250.0;
+const BOT_DELTA_ALLOWANCE_YARDS: f32 = 2.0;
+const BOT_DELTA_ALLOWANCE_PER_MS: f32 = 0.01;
+const MIN_VISUAL_MOVE_MS: u32 = 40;
+const MAX_VISUAL_MOVE_MS: u32 = 10_000;
+
+pub(super) fn validate_movement_position(
+    from: Option<WorldPosition>,
+    to: Vec3,
+    elapsed_ms: u32,
+    source: MovementSource,
+) -> Result<(), &'static str> {
+    if !to.is_finite()
+        || [to.x, to.y, to.z]
+            .into_iter()
+            .any(|v| v.abs() > MAX_ABS_COORDINATE)
+    {
+        return Err("position is non-finite or outside world coordinate bounds");
+    }
+    let Some(from) = from else {
+        return Ok(());
+    };
+    if !from.point.is_finite()
+        || [from.point.x, from.point.y, from.point.z]
+            .into_iter()
+            .any(|v| v.abs() > MAX_ABS_COORDINATE)
+    {
+        return Err("canonical position is invalid");
+    }
+    let max_delta = match source {
+        MovementSource::Bot => {
+            if elapsed_ms == 0 {
+                12.0
+            } else {
+                (BOT_DELTA_ALLOWANCE_YARDS + BOT_DELTA_ALLOWANCE_PER_MS * elapsed_ms as f32)
+                    .min(MAX_BOT_PACKET_DELTA_YARDS)
+            }
+        }
+        MovementSource::Player => MAX_PLAYER_PACKET_DELTA_YARDS,
+    };
+    if from.point.distance(to) > max_delta {
+        return Err("movement exceeds the allowed packet displacement");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum MovementSource {
+    Bot,
+    Player,
+}
+
+#[derive(Clone, Copy)]
+struct VisualSegment {
+    start: WorldPosition,
+    destination: WorldPosition,
+    started_at: u32,
+    duration_ms: u32,
+}
+
+#[derive(Default)]
+pub(super) struct ServerMotionProjection {
+    next_spline_id: u32,
+    last: Option<(EntityId, WorldPosition, u32)>,
+    visual: Option<VisualSegment>,
+}
+
+impl ServerMotionProjection {
+    pub(super) fn reset_to(&mut self, mover: EntityId, position: WorldPosition, client_time: u32) {
+        self.last = Some((mover, position, client_time));
+        self.visual = None;
+    }
+
+    pub(super) fn project(
+        &mut self,
+        mover: EntityId,
+        position: WorldPosition,
+        client_time: u32,
+        moving: bool,
+    ) -> Option<ServerFrame> {
+        let (last_mover, previous, previous_time) = self.last?;
+        if last_mover != mover || !position.point.is_finite() || !position.orientation.is_finite() {
+            self.reset_to(mover, position, client_time);
+            return None;
+        }
+        let elapsed = client_time.wrapping_sub(previous_time);
+        let distance = previous.point.distance(position.point);
+        let facing_delta = signed_angle_delta(previous.orientation, position.orientation);
+        if !moving {
+            self.last = Some((mover, position, client_time));
+            self.visual = None;
+            if distance <= 0.001 && facing_delta.abs() <= 0.01 {
+                return None;
+            }
+            return Some(self.move_frame(previous, position, 1));
+        }
+        if elapsed < MIN_VISUAL_MOVE_MS {
+            return None;
+        }
+        if distance <= 0.001 && facing_delta.abs() <= 0.01 {
+            self.last = Some((mover, position, client_time));
+            return None;
+        }
+        let start = self
+            .visual
+            .and_then(|segment| project_segment(segment, client_time))
+            .unwrap_or(previous);
+        self.last = Some((mover, position, client_time));
+        let duration = elapsed
+            .clamp(MIN_VISUAL_MOVE_MS, MAX_VISUAL_MOVE_MS)
+            .saturating_add(50)
+            .min(MAX_VISUAL_MOVE_MS);
+        self.visual = Some(VisualSegment {
+            start,
+            destination: position,
+            started_at: client_time,
+            duration_ms: duration,
+        });
+        Some(self.move_frame(start, position, duration))
+    }
+
+    fn move_frame(
+        &mut self,
+        start: WorldPosition,
+        destination: WorldPosition,
+        duration_ms: u32,
+    ) -> ServerFrame {
+        self.next_spline_id = self.next_spline_id.wrapping_add(1).max(1);
+        let mut body = Vec::with_capacity(48);
+        push_packed_guid(
+            &mut body,
+            self.last.map(|(mover, _, _)| mover).unwrap_or(EntityId(0)),
+        );
+        body.push(0);
+        push_position(&mut body, start.point);
+        body.extend_from_slice(&self.next_spline_id.to_le_bytes());
+        if signed_angle_delta(start.orientation, destination.orientation).abs() > 0.01 {
+            body.push(4);
+            body.extend_from_slice(&destination.orientation.to_le_bytes());
+        } else {
+            body.push(0);
+        }
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&duration_ms.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        push_position(&mut body, destination.point);
+        ServerFrame {
+            opcode: 0x00DD,
+            body,
+        }
+    }
+
+    pub(super) fn stop(&mut self, mover: EntityId, position: WorldPosition) -> Option<ServerFrame> {
+        self.visual = None;
+        self.last = Some((
+            mover,
+            position,
+            self.last.map(|(_, _, time)| time).unwrap_or_default(),
+        ));
+        self.next_spline_id = self.next_spline_id.wrapping_add(1).max(1);
+        let mut body = Vec::with_capacity(32);
+        push_packed_guid(&mut body, mover);
+        body.push(0);
+        push_position(&mut body, position.point);
+        body.extend_from_slice(&self.next_spline_id.to_le_bytes());
+        body.push(1);
+        Some(ServerFrame {
+            opcode: 0x00DD,
+            body,
+        })
+    }
+}
+
+fn project_segment(segment: VisualSegment, client_time: u32) -> Option<WorldPosition> {
+    let elapsed = client_time.wrapping_sub(segment.started_at);
+    if elapsed > i32::MAX as u32 {
+        return Some(segment.destination);
+    }
+    let t = (elapsed as f32 / segment.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+    let start = segment.start;
+    let end = segment.destination;
+    let delta = signed_angle_delta(start.orientation, end.orientation);
+    Some(WorldPosition {
+        map: end.map,
+        point: Vec3::new(
+            start.point.x + (end.point.x - start.point.x) * t,
+            start.point.y + (end.point.y - start.point.y) * t,
+            start.point.z + (end.point.z - start.point.z) * t,
+        ),
+        orientation: (start.orientation + delta * t).rem_euclid(std::f32::consts::TAU),
+    })
+}
+
+fn signed_angle_delta(from: f32, to: f32) -> f32 {
+    (to - from + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+fn push_position(body: &mut Vec<u8>, point: Vec3) {
+    body.extend_from_slice(&point.x.to_le_bytes());
+    body.extend_from_slice(&point.y.to_le_bytes());
+    body.extend_from_slice(&point.z.to_le_bytes());
 }
 
 impl Default for MovementClock {
@@ -238,12 +447,16 @@ pub(super) fn encode_gameplay_command(
     movement_clock: &mut MovementClock,
 ) -> std::result::Result<Option<(ClientFrame, Option<(WorldPosition, bool, u32, u32)>)>, String> {
     const CMSG_USE_ITEM: u32 = 0x00AB;
+    const CMSG_CAST_SPELL: u32 = 0x012F;
     const CMSG_GAMEOBJ_USE: u32 = 0x00B1;
     const MSG_MOVE_STOP: u32 = 0x00B7;
     const MSG_MOVE_START_FORWARD: u32 = 0x00B5;
     const MSG_MOVE_SET_FACING: u32 = 0x00DA;
     const MSG_MOVE_HEARTBEAT: u32 = 0x00EE;
     const CMSG_ATTACKSWING: u32 = 0x0141;
+    const CMSG_AUTOEQUIP_ITEM_SLOT: u32 = 0x010F;
+    const CMSG_PET_ACTION: u32 = 0x0175;
+    const CMSG_PET_SPELL_AUTOCAST: u32 = 0x02F3;
     const CMSG_LOOT: u32 = 0x015D;
     const CMSG_QUESTGIVER_HELLO: u32 = 0x0184;
     const CMSG_QUESTGIVER_ACCEPT_QUEST: u32 = 0x0189;
@@ -255,6 +468,7 @@ pub(super) fn encode_gameplay_command(
     const CMSG_ITEM_QUERY_SINGLE: u32 = 0x0056;
     const CMSG_LIST_INVENTORY: u32 = 0x019E;
     const CMSG_SELL_ITEM: u32 = 0x01A0;
+    const CMSG_REPAIR_ITEM: u32 = 0x02A8;
     match command {
         GameplayCommand::Raw { opcode, body } => Ok(Some((ClientFrame { opcode, body }, None))),
         GameplayCommand::QueryQuestGivers => Ok(Some((
@@ -306,6 +520,18 @@ pub(super) fn encode_gameplay_command(
                 None,
             )))
         }
+        GameplayCommand::RepairEquipment { vendor } => {
+            let mut body = raw_guid_body(vendor);
+            body.extend_from_slice(&0_u64.to_le_bytes());
+            body.push(0);
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_REPAIR_ITEM,
+                    body,
+                },
+                None,
+            )))
+        }
         GameplayCommand::Interact(entity) => Ok(Some((
             ClientFrame {
                 opcode: CMSG_QUESTGIVER_HELLO,
@@ -327,6 +553,21 @@ pub(super) fn encode_gameplay_command(
             },
             None,
         ))),
+        GameplayCommand::CastOnItem { spell, item_guid } => {
+            let mut body = Vec::with_capacity(20);
+            body.push(0); // client cast sequence
+            body.extend_from_slice(&spell.to_le_bytes());
+            body.push(0); // cast flags
+            body.extend_from_slice(&0x0000_0010_u32.to_le_bytes()); // TARGET_FLAG_ITEM
+            push_packed_guid(&mut body, item_guid);
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_CAST_SPELL,
+                    body,
+                },
+                None,
+            )))
+        }
         GameplayCommand::UseItemInstance {
             item: _,
             item_guid,
@@ -350,6 +591,29 @@ pub(super) fn encode_gameplay_command(
                 }
                 None => body.extend_from_slice(&0_u32.to_le_bytes()),
             }
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_USE_ITEM,
+                    body,
+                },
+                None,
+            )))
+        }
+        GameplayCommand::UseItemOnItem {
+            item: _,
+            item_guid,
+            backpack_slot,
+            spell,
+            target_item_guid,
+        } => {
+            let mut body = Vec::with_capacity(32);
+            body.extend_from_slice(&[0xff, backpack_slot, 0]);
+            body.extend_from_slice(&spell.to_le_bytes());
+            append_raw_guid(&mut body, item_guid);
+            body.extend_from_slice(&0_u32.to_le_bytes()); // glyph index
+            body.push(0); // cast flags
+            body.extend_from_slice(&0x0000_0010_u32.to_le_bytes()); // TARGET_FLAG_ITEM
+            push_packed_guid(&mut body, target_item_guid);
             Ok(Some((
                 ClientFrame {
                     opcode: CMSG_USE_ITEM,
@@ -411,6 +675,63 @@ pub(super) fn encode_gameplay_command(
             },
             None,
         ))),
+        GameplayCommand::SummonPet { spell, .. } => Ok(Some((
+            ClientFrame {
+                opcode: 0x012E,
+                body: encode_cast_spell(spell, None, 0x0000_0002),
+            },
+            None,
+        ))),
+        GameplayCommand::EquipItem {
+            item_guid,
+            destination_slot,
+        } => {
+            let mut body = item_guid.0.to_le_bytes().to_vec();
+            body.push(destination_slot);
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_AUTOEQUIP_ITEM_SLOT,
+                    body,
+                },
+                None,
+            )))
+        }
+        GameplayCommand::PetSetReaction { pet, reaction } => {
+            let body = encode_pet_action(pet, u32::from(reaction), 0x06, EntityId(0));
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_PET_ACTION,
+                    body,
+                },
+                None,
+            )))
+        }
+        GameplayCommand::PetAttack { pet, target } => {
+            let body = encode_pet_action(pet, 2, 0x07, target);
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_PET_ACTION,
+                    body,
+                },
+                None,
+            )))
+        }
+        GameplayCommand::PetSetAutocast {
+            pet,
+            spell,
+            enabled,
+        } => {
+            let mut body = pet.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&spell.to_le_bytes());
+            body.push(u8::from(enabled));
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_PET_SPELL_AUTOCAST,
+                    body,
+                },
+                None,
+            )))
+        }
         GameplayCommand::Cast { spell, target }
         | GameplayCommand::VehicleCast { spell, target } => Ok(Some((
             ClientFrame {
@@ -576,6 +897,14 @@ fn raw_guid_body(guid: EntityId) -> Vec<u8> {
 
 fn append_raw_guid(body: &mut Vec<u8>, guid: EntityId) {
     body.extend_from_slice(&guid.0.to_le_bytes());
+}
+
+fn encode_pet_action(pet: EntityId, action: u32, action_type: u32, target: EntityId) -> Vec<u8> {
+    let mut body = Vec::with_capacity(20);
+    append_raw_guid(&mut body, pet);
+    body.extend_from_slice(&((action & 0x00ff_ffff) | ((action_type & 0xff) << 24)).to_le_bytes());
+    append_raw_guid(&mut body, target);
+    body
 }
 
 pub(super) fn push_packed_guid(body: &mut Vec<u8>, guid: EntityId) {
@@ -980,7 +1309,13 @@ pub(super) fn movement_matches_bot_visual(
     point: Vec3,
     orientation: f32,
     client_opcode: u32,
+    visual_age: Duration,
 ) -> bool {
+    // Increase the position allowance as the client trails the bot visual.
+    // The cap covers 7 yards per second during the 1.25-second echo window.
+    let max_position_drift = (ECHO_POSITION_DRIFT_YARDS
+        + ECHO_DRIFT_SPEED_YARDS_PER_SECOND * visual_age.as_secs_f32())
+    .min(MAX_ECHO_POSITION_DRIFT_YARDS);
     if visual_mover == EntityId(0)
         || visual_mover != client_mover
         || !point.is_finite()
@@ -993,16 +1328,16 @@ pub(super) fn movement_matches_bot_visual(
         return false;
     };
     let angular = delta.min(std::f32::consts::TAU - delta);
-    point.distance(visual.point) <= 2.0
-        && angular <= 0.12
+    point.distance(visual.point) <= max_position_drift
+        && angular <= MAX_ECHO_ORIENTATION_DRIFT_RADIANS
         && (client_opcode == bot_opcode
             || client_opcode == 0x00EE
             || (is_explicit_player_movement_intent(client_opcode)
                 && is_explicit_player_movement_intent(bot_opcode)))
 }
 
-pub(super) fn should_suppress_bot_echo(matching_echo: bool, validated_player_intent: bool) -> bool {
-    matching_echo && !validated_player_intent
+pub(super) fn should_suppress_bot_echo(matching_echo: bool) -> bool {
+    matching_echo
 }
 
 /// Check whether a client movement packet is valid physical takeover input.
@@ -1061,6 +1396,194 @@ pub(super) fn validate_player_takeover(
 #[cfg(test)]
 mod movement_clock_tests {
     use super::*;
+
+    #[test]
+    fn repair_all_uses_the_observed_vendor_and_never_uses_guild_funds() {
+        let mut clock = MovementClock::default();
+        let vendor = EntityId(0x1122334455667788);
+        let (packet, _) = encode_gameplay_command(
+            GameplayCommand::RepairEquipment { vendor },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(packet.opcode, 0x02A8);
+        assert_eq!(packet.body.len(), 17);
+        assert_eq!(&packet.body[..8], &vendor.0.to_le_bytes());
+        assert_eq!(&packet.body[8..16], &0_u64.to_le_bytes());
+        assert_eq!(packet.body[16], 0);
+    }
+
+    #[test]
+    fn item_targeted_imbues_and_consumables_use_wrath_item_target_masks() {
+        let mut clock = MovementClock::default();
+        let weapon = EntityId(0x1122334455667788);
+        let (cast, _) = encode_gameplay_command(
+            GameplayCommand::CastOnItem {
+                spell: 8232,
+                item_guid: weapon,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cast.opcode, 0x012f);
+        assert_eq!(&cast.body[..6], &[0, 0x28, 0x20, 0, 0, 0]);
+        assert_eq!(&cast.body[6..10], &0x10_u32.to_le_bytes());
+        assert_eq!(cast.body.len(), 19);
+
+        let poison = EntityId(0x0102030405060708);
+        let (use_item, _) = encode_gameplay_command(
+            GameplayCommand::UseItemOnItem {
+                item: poison.0 as u32,
+                item_guid: poison,
+                backpack_slot: 23,
+                spell: 11343,
+                target_item_guid: weapon,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(use_item.opcode, 0x00ab);
+        assert_eq!(&use_item.body[..3], &[0xff, 23, 0]);
+        assert_eq!(&use_item.body[3..7], &11343_u32.to_le_bytes());
+        assert_eq!(&use_item.body[20..24], &0x10_u32.to_le_bytes());
+        assert_eq!(use_item.body.len(), 33);
+    }
+
+    #[test]
+    fn equipment_and_pet_maintenance_use_wrath_wire_layouts() {
+        let mut clock = MovementClock::default();
+        let (equip, _) = encode_gameplay_command(
+            GameplayCommand::EquipItem {
+                item_guid: EntityId(0x1122334455667788),
+                destination_slot: 10,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(equip.opcode, 0x010f);
+        assert_eq!(
+            equip.body,
+            [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 10]
+        );
+
+        let (stance, _) = encode_gameplay_command(
+            GameplayCommand::PetSetReaction {
+                pet: EntityId(9),
+                reaction: 1,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(stance.opcode, 0x0175);
+        assert_eq!(&stance.body[8..12], &0x0600_0001_u32.to_le_bytes());
+
+        let (attack, _) = encode_gameplay_command(
+            GameplayCommand::PetAttack {
+                pet: EntityId(9),
+                target: EntityId(10),
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(attack.opcode, 0x0175);
+        assert_eq!(&attack.body[8..12], &0x0700_0002_u32.to_le_bytes());
+        assert_eq!(&attack.body[12..20], &10_u64.to_le_bytes());
+
+        let (autocast, _) = encode_gameplay_command(
+            GameplayCommand::PetSetAutocast {
+                pet: EntityId(9),
+                spell: 133,
+                enabled: true,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(autocast.opcode, 0x02f3);
+        assert_eq!(autocast.body, [9, 0, 0, 0, 0, 0, 0, 0, 133, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn warlock_pet_summon_uses_implicit_self_target_encoding() {
+        let mut clock = MovementClock::default();
+        let (frame, movement) = encode_gameplay_command(
+            GameplayCommand::SummonPet {
+                spell: 688,
+                player: EntityId(7),
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(frame.opcode, 0x012E);
+        assert_eq!(frame.body, encode_cast_spell(688, None, 0x0000_0002));
+        assert_eq!(frame.body.len(), 10);
+        assert!(movement.is_none());
+    }
+
+    #[test]
+    fn quest_item_gameobject_open_matches_the_captured_client_cast() {
+        let target = EntityId(0xF110_0244_1300_0C92);
+        let mut clock = MovementClock::default();
+        let (frame, movement) = encode_gameplay_command(
+            GameplayCommand::CastGameObject {
+                spell: wow_domain::QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID,
+                target,
+                report_use: true,
+            },
+            None,
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(frame.opcode, 0x012E);
+        assert_eq!(
+            frame.body,
+            [
+                0x00, // cast count
+                0x4E, 0x19, 0x00, 0x00, // Spell 6478 from the captured client packet
+                0x00, // cast flags
+                0x00, 0x08, 0x00, 0x00, // game-object target mask
+                0xFB, 0x92, 0x0C, 0x13, 0x44, 0x02, 0x10, 0xF1, // packed GUID
+            ]
+        );
+        assert!(movement.is_none());
+    }
 
     #[test]
     fn facing_command_normalizes_negative_orientation() {
@@ -1205,10 +1728,9 @@ mod movement_clock_tests {
     }
 
     #[test]
-    fn validated_player_intent_has_precedence_over_echo_match() {
-        assert!(!should_suppress_bot_echo(true, true));
-        assert!(should_suppress_bot_echo(true, false));
-        assert!(!should_suppress_bot_echo(false, false));
+    fn recent_bot_echo_match_takes_precedence_over_takeover_classification() {
+        assert!(should_suppress_bot_echo(true));
+        assert!(!should_suppress_bot_echo(false));
     }
 
     #[test]
@@ -1251,6 +1773,71 @@ mod movement_clock_tests {
         let mut malformed_tail = ack;
         malformed_tail.pop();
         assert!(validate_movement_correction_ack(0x00E3, &malformed_tail, expected).is_err());
+    }
+
+    #[test]
+    fn bot_destination_limits_follow_elapsed_time_and_world_bounds() {
+        let origin = WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        assert!(
+            validate_movement_position(
+                Some(origin),
+                Vec3::new(3.0, 0.0, 0.0),
+                100,
+                MovementSource::Bot
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_movement_position(
+                Some(origin),
+                Vec3::new(4.0, 0.0, 0.0),
+                100,
+                MovementSource::Bot
+            )
+            .is_err()
+        );
+        assert!(
+            validate_movement_position(
+                None,
+                Vec3::new(200_001.0, 0.0, 0.0),
+                0,
+                MovementSource::Bot
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn server_motion_projection_emits_monster_move_and_terminal_stop() {
+        let origin = WorldPosition {
+            map: 0,
+            point: Vec3::new(1.0, 2.0, 3.0),
+            orientation: 0.0,
+        };
+        let destination = WorldPosition {
+            map: 0,
+            point: Vec3::new(2.0, 2.0, 3.0),
+            orientation: 0.2,
+        };
+        let mut projection = ServerMotionProjection::default();
+        projection.reset_to(EntityId(7), origin, 10);
+        assert!(
+            projection
+                .project(EntityId(7), destination, 30, true)
+                .is_none()
+        );
+        let movement = projection
+            .project(EntityId(7), destination, 110, true)
+            .unwrap();
+        assert_eq!(movement.opcode, 0x00DD);
+        assert!(movement.body.len() > 30);
+        let stop = projection.stop(EntityId(7), destination).unwrap();
+        assert_eq!(stop.opcode, 0x00DD);
+        assert_eq!(stop.body.last(), Some(&1));
     }
 }
 

@@ -9,14 +9,17 @@ use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::{TcpListener, TcpStream},
     process::{Child, Command},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, oneshot},
 };
 use tracing_subscriber::EnvFilter;
 use wow_control_proto::{
@@ -32,7 +35,10 @@ use wow_infra::config::{
     data_dir::AppPaths,
 };
 use wow_infra::logging::structured::{DiagnosticStream, diagnostic_path};
-use wow_proxy::runtime::{ManagedLane, ProxyAccountConfig, ProxyRuntimeConfig};
+use wow_proxy::{
+    commands::bot::{self, TerminalBotInput},
+    runtime::{ManagedLane, ProxyAccountConfig, ProxyRuntimeConfig, TerminalBotCommand},
+};
 
 #[derive(Clone)]
 struct TeeMakeWriter {
@@ -103,6 +109,13 @@ struct LaneIo {
     commands: Mutex<Option<mpsc::Receiver<SupervisorCommand>>>,
     command_tx: mpsc::Sender<SupervisorCommand>,
     generation: WorkerGeneration,
+}
+
+#[derive(Clone)]
+struct TerminalRoute {
+    character: String,
+    lane: LaneId,
+    sender: mpsc::Sender<TerminalBotCommand>,
 }
 
 #[derive(Clone)]
@@ -213,47 +226,76 @@ async fn main() -> Result<()> {
         mpsc::channel::<SupervisorCommand>(config.runtime.worker_queue);
     let mut managed = Vec::new();
     let mut lane_io = HashMap::<LaneId, Arc<LaneIo>>::new();
-    for account in config.accounts.iter().filter(|a| a.enabled) {
+    let mut terminal_routes = HashMap::<String, Vec<TerminalRoute>>::new();
+    for account in &config.accounts {
         let generation = WorkerGeneration(1);
-        let (w2p_tx, w2p_rx) = mpsc::channel(config.runtime.worker_queue);
-        let (p2w_tx, p2w_rx) = mpsc::channel(config.runtime.worker_queue);
-        let (cmd_tx, cmd_rx) = mpsc::channel(config.runtime.worker_queue);
-        lane_io.insert(
-            account.lane,
-            Arc::new(LaneIo {
-                worker_to_proxy: w2p_tx,
-                proxy_to_worker: Mutex::new(Some(p2w_rx)),
-                commands: Mutex::new(Some(cmd_rx)),
-                command_tx: cmd_tx,
-                generation,
-            }),
-        );
+        let worker_channels = account.enabled.then(|| {
+            let (w2p_tx, w2p_rx) = mpsc::channel(config.runtime.worker_queue);
+            let (p2w_tx, p2w_rx) = mpsc::channel(config.runtime.worker_queue);
+            let (cmd_tx, cmd_rx) = mpsc::channel(config.runtime.worker_queue);
+            (w2p_tx, w2p_rx, p2w_tx, p2w_rx, cmd_tx, cmd_rx)
+        });
+        let (terminal_tx, terminal_rx) = mpsc::channel(16);
+        if account.enabled && !account.character.trim().is_empty() {
+            terminal_routes
+                .entry(account.character.to_ascii_lowercase())
+                .or_default()
+                .push(TerminalRoute {
+                    character: account.character.clone(),
+                    lane: account.lane,
+                    sender: terminal_tx,
+                });
+        }
+        let (worker_rx, worker_tx) =
+            if let Some((w2p_tx, w2p_rx, p2w_tx, p2w_rx, cmd_tx, cmd_rx)) = worker_channels {
+                lane_io.insert(
+                    account.lane,
+                    Arc::new(LaneIo {
+                        worker_to_proxy: w2p_tx,
+                        proxy_to_worker: Mutex::new(Some(p2w_rx)),
+                        commands: Mutex::new(Some(cmd_rx)),
+                        command_tx: cmd_tx,
+                        generation,
+                    }),
+                );
+                (Some(w2p_rx), Some(p2w_tx))
+            } else {
+                (None, None)
+            };
         managed.push(ManagedLane {
             config: ProxyAccountConfig {
                 account: account.account,
                 lane: account.lane,
-                worker: generation,
+                worker: account.enabled.then_some(generation),
                 account_name: account.account_name.clone(),
                 password: account.password.clone(),
                 character: (!account.character.trim().is_empty())
                     .then(|| account.character.clone()),
             },
-            worker_rx: w2p_rx,
-            worker_tx: p2w_tx,
+            worker_rx,
+            worker_tx,
             supervisor_tx: supervisor_tx.clone(),
+            terminal_commands: terminal_rx,
         });
     }
     if managed.is_empty() {
-        bail!("no enabled accounts are configured");
+        bail!("no accounts are configured");
     }
 
     let routes = Arc::new(lane_io);
     let accept_routes = routes.clone();
+    let worker_shutdown = Arc::new(AtomicBool::new(false));
+    let accept_worker_shutdown = worker_shutdown.clone();
     let (worker_disconnect_tx, mut worker_disconnect_rx) = mpsc::unbounded_channel();
-    let mut accept_task =
-        tokio::spawn(
-            async move { accept_workers(listener, accept_routes, worker_disconnect_tx).await },
-        );
+    let mut accept_task = tokio::spawn(async move {
+        accept_workers(
+            listener,
+            accept_routes,
+            worker_disconnect_tx,
+            accept_worker_shutdown,
+        )
+        .await
+    });
 
     let runtime_paths = config.runtime.runtime_data.resolved();
     let mut children = Vec::new();
@@ -325,6 +367,11 @@ async fn main() -> Result<()> {
             .ok();
     }
     tracing::info!(accounts = routes.len(), "wow-bot runtime started");
+    let terminal_task = if io::stdin().is_terminal() {
+        Some(tokio::spawn(run_terminal_commands(terminal_routes)))
+    } else {
+        None
+    };
 
     enum StopReason {
         Proxy(std::result::Result<Result<()>, tokio::task::JoinError>),
@@ -359,7 +406,11 @@ async fn main() -> Result<()> {
         }
     };
 
+    worker_shutdown.store(true, Ordering::Release);
     let _ = supervisor_tx.send(SupervisorCommand::Shutdown).await;
+    if let Some(task) = terminal_task {
+        task.abort();
+    }
     dispatcher.abort();
     proxy_task.abort();
     accept_task.abort();
@@ -379,6 +430,82 @@ async fn main() -> Result<()> {
         }
         StopReason::WorkerMonitorFailed(error) => {
             return Err(error).context("monitor worker process status");
+        }
+    }
+    Ok(())
+}
+
+async fn run_terminal_commands(routes: HashMap<String, Vec<TerminalRoute>>) -> Result<()> {
+    let stdin = tokio::io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+    println!("Terminal bot commands ready. Type .bot help for commands.");
+
+    loop {
+        print!("wow-bot> ");
+        io::stdout().flush()?;
+        let Some(line) = lines.next_line().await? else {
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let input = match bot::parse_terminal_input(&line) {
+            Ok(Some(input)) => input,
+            Ok(None) => {
+                println!("Unknown terminal command. Type .bot help for commands.");
+                continue;
+            }
+            Err(error) => {
+                println!("{error}");
+                continue;
+            }
+        };
+
+        match input {
+            TerminalBotInput::Help => {
+                println!("Terminal syntax: .bot <command> <character> [arguments]");
+                for line in bot::BOT_HELP_LINES {
+                    println!("{line}");
+                }
+                println!("Example: .bot on Twarlock");
+            }
+            TerminalBotInput::Command { character, text } => {
+                let key = character.to_ascii_lowercase();
+                let Some(matches) = routes.get(&key) else {
+                    println!("No enabled bot character named {character:?} is configured.");
+                    continue;
+                };
+                if matches.len() != 1 {
+                    let lanes = matches
+                        .iter()
+                        .map(|route| route.lane.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("Character name {character:?} is ambiguous across lanes {lanes}.");
+                    continue;
+                }
+                let route = &matches[0];
+                let (reply, response) = oneshot::channel();
+                if route
+                    .sender
+                    .send(TerminalBotCommand { text, reply })
+                    .await
+                    .is_err()
+                {
+                    println!("Bot command route for {} is unavailable.", route.character);
+                    continue;
+                }
+                match response.await {
+                    Ok(Ok(lines)) => {
+                        for line in lines {
+                            println!("{line}");
+                        }
+                    }
+                    Ok(Err(error)) => println!("{error}"),
+                    Err(error) => println!("Bot command result was lost: {error}"),
+                }
+            }
         }
     }
     Ok(())
@@ -838,17 +965,33 @@ async fn accept_workers(
     listener: TcpListener,
     routes: Arc<HashMap<LaneId, Arc<LaneIo>>>,
     disconnect_tx: mpsc::UnboundedSender<String>,
+    shutting_down: Arc<AtomicBool>,
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let routes = routes.clone();
         let disconnect_tx = disconnect_tx.clone();
+        let shutting_down = shutting_down.clone();
         tokio::spawn(async move {
             if let Err(e) = attach_worker(stream, routes, disconnect_tx).await {
-                tracing::warn!(%peer, error=%format_args!("{e:#}"), "worker control connection ended");
+                if should_log_worker_disconnect(shutting_down.load(Ordering::Acquire), &e) {
+                    tracing::warn!(%peer, error=%format_args!("{e:#}"), "worker control connection ended");
+                }
             }
         });
     }
+}
+
+fn should_log_worker_disconnect(shutting_down: bool, error: &anyhow::Error) -> bool {
+    !shutting_down && !is_worker_eof(error)
+}
+
+fn is_worker_eof(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::UnexpectedEof)
+    })
 }
 
 async fn attach_worker(
@@ -1157,5 +1300,20 @@ mod tests {
             worker_disconnect_message(LaneId(4), WorkerGeneration(2), "unexpected end of file"),
             "lane 4 generation 2: unexpected end of file"
         );
+    }
+
+    #[test]
+    fn worker_disconnect_is_not_logged_as_a_warning_during_shutdown() {
+        let other_error = anyhow::anyhow!("connection reset");
+        assert!(!should_log_worker_disconnect(true, &other_error));
+        assert!(should_log_worker_disconnect(false, &other_error));
+    }
+
+    #[test]
+    fn worker_eof_is_not_logged_as_a_warning() {
+        let error = anyhow::Error::new(io::Error::from(io::ErrorKind::UnexpectedEof));
+
+        assert!(is_worker_eof(&error));
+        assert!(!should_log_worker_disconnect(false, &error));
     }
 }

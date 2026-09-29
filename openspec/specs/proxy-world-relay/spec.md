@@ -51,6 +51,14 @@ When bot assistance is active on a player-owned session, normal supported player
 - **THEN** the proxy forwards it according to the shared-session rules
 - **AND** bot assistance is not disabled solely because the player performed that non-movement action
 
+### Requirement: Player world transfers refresh authoritative world state
+On `SMSG_NEW_WORLD`, the proxy SHALL update the player map and position, reset old-world object observations, and restore world authority from the new-world packet in both attended and headless sessions.
+
+#### Scenario: Attended player enters a new area
+- **WHEN** the configured stock client session receives `SMSG_NEW_WORLD`
+- **THEN** the proxy clears old-area NPCs and refreshes the object observer
+- **AND** bot world authority reflects the new map and position
+
 ### Requirement: Warden exchange remains continuous
 The configured player relay SHALL preserve the required Warden exchange during world authentication and live play.
 

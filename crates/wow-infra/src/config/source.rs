@@ -243,15 +243,24 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
 
     let proxy_password = string(&values, &["proxy", "account", "password"]);
     let proxy_password_env = string(&values, &["proxy", "account", "password_env"]);
-    let mut accounts = HashSet::new();
+    let mut active_accounts = HashSet::new();
     let mut names = HashSet::new();
+    let mut configured_accounts = Vec::<(&RosterAccount, Option<&RosterBot>)>::new();
     for bot in roster.bots.iter().filter(|bot| bot.enabled) {
         let _ = (&bot.creation, &bot.realm_name);
-        if !accounts.insert(bot.account.clone()) {
+        if !active_accounts.insert(bot.account.clone()) {
             bail!(
                 "enabled bots use account {:?} more than once; this supervisor starts one session per account",
                 bot.account
             );
+        }
+    }
+    for bot in &roster.bots {
+        if configured_accounts
+            .iter()
+            .any(|(account, _)| account.id == bot.account)
+        {
+            continue;
         }
         let account = roster
             .accounts
@@ -263,6 +272,20 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
                     bot.id, bot.account
                 )
             })?;
+        let representative = roster
+            .bots
+            .iter()
+            .find(|candidate| candidate.account == bot.account && candidate.enabled)
+            .unwrap_or(bot);
+        configured_accounts.push((account, Some(representative)));
+    }
+    if configured_accounts.is_empty() {
+        bail!(
+            "bot roster {} has no [[bots]] entries",
+            roster_path.display()
+        );
+    }
+    for (account, bot) in configured_accounts {
         let password = account
             .password
             .clone()
@@ -300,22 +323,15 @@ pub fn load_toml(path: impl AsRef<Path>) -> Result<AppConfig> {
                 account.username
             );
         }
-        let index =
-            u64::try_from(config.accounts.len() + 1).context("too many enabled bot accounts")?;
+        let index = u64::try_from(config.accounts.len() + 1).context("too many routed accounts")?;
         config.accounts.push(AccountConfig {
             lane: LaneId::new(index),
             account: AccountId::new(index),
             account_name: account.username.clone(),
             password,
-            character: bot.character.clone(),
-            enabled: true,
+            character: bot.map(|entry| entry.character.clone()).unwrap_or_default(),
+            enabled: active_accounts.contains(&account.id),
         });
-    }
-    if config.accounts.is_empty() {
-        bail!(
-            "bot roster {} has no enabled [[bots]] entries",
-            roster_path.display()
-        );
     }
     config.validate().map_err(anyhow::Error::msg)?;
     tracing::info!(config=%path.display(), roster=%roster_path.display(), accounts=config.accounts.len(), "loaded user TOML configuration and bot roster");

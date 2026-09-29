@@ -4,7 +4,7 @@ use wow_domain::{AccountId, LaneId, WorkerGeneration};
 pub struct ConfiguredSessionState {
     pub account: AccountId,
     pub lane: LaneId,
-    pub worker: WorkerGeneration,
+    pub worker: Option<WorkerGeneration>,
     pub ownership: AccountOwnership,
     pub player: PlayerPresence,
     pub upstream_connected: bool,
@@ -12,7 +12,7 @@ pub struct ConfiguredSessionState {
     pub worker_running: bool,
 }
 impl ConfiguredSessionState {
-    pub fn new(account: AccountId, lane: LaneId, worker: WorkerGeneration) -> Self {
+    pub fn new(account: AccountId, lane: LaneId, worker: Option<WorkerGeneration>) -> Self {
         Self {
             account,
             lane,
@@ -21,7 +21,7 @@ impl ConfiguredSessionState {
             player: PlayerPresence::new(Duration::from_secs(2)),
             upstream_connected: false,
             world_authoritative: false,
-            worker_running: true,
+            worker_running: worker.is_some(),
         }
     }
 }

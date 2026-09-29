@@ -272,7 +272,7 @@ impl AppConfig {
         }
         let mut lanes = std::collections::BTreeSet::new();
         let mut names = std::collections::BTreeSet::new();
-        for account in self.accounts.iter().filter(|a| a.enabled) {
+        for account in &self.accounts {
             if !lanes.insert(account.lane) {
                 return Err(format!("duplicate lane {}", account.lane));
             }

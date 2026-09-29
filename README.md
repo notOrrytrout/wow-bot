@@ -59,6 +59,8 @@ In a configured account's chat session through the proxy, use:
 | `.log status` | Show trace status and its path. |
 | `.log stop` | Stop the trace. |
 
+When the supervisor runs in an interactive terminal, type `.bot help` to see bot commands. Add the character name after the command to select the configured character, for example `.bot on Twarlock`, `.bot status Twarlock`, or `.bot gather Twarlock "Copper Vein"`. Terminal commands use the same parser and proxy command handling as in-game bot commands.
+
 For the initial quest smoke test, put the character near an available quest giver, then use `.bot on` and `.bot quest`. See [Testing](docs/TESTING.md) for expected events and live test procedures.
 
 ## Runtime files

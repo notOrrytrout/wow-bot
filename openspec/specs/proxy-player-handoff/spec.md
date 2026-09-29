@@ -12,6 +12,8 @@ For a configured running bot account, the proxy SHALL pause that account's bot e
 #### Scenario: Player logs into a running bot account
 - **WHEN** the configured player world connection is preparing to authenticate upstream
 - **THEN** only that account's worker execution is paused before the player session becomes authoritative
+- **AND** the session starts in Manual mode, as if `.bot off` was active
+- **AND** the proxy queues an authoritative movement stop after any accepted bot movement
 - **AND** the old bot WorldSession may then be replaced normally by AzerothCore
 
 ### Requirement: Player takeover does not disconnect the worker
@@ -64,9 +66,15 @@ When bot assistance is enabled and the player supplies physical movement, the pr
 - **AND** it SHALL NOT be forwarded upstream in a way that overwrites the bot-owned movement stream
 - **AND** the proxy SHALL continue to treat the current bot movement generation as authoritative
 
+#### Scenario: Client echoes recent bot movement with an explicit opcode
+- **GIVEN** bot locomotion is active and the proxy recently sent a bot movement visual for the same mover
+- **WHEN** the client returns a movement packet that matches that recent visual in position and orientation
+- **THEN** the proxy SHALL treat the packet as a bot echo even when its opcode can represent explicit player intent
+- **AND** it SHALL NOT advance the movement handoff generation
+
 #### Scenario: Explicit physical movement preempts bot locomotion
 - **GIVEN** bot locomotion is active
-- **WHEN** the client emits an explicit movement-intent opcode such as movement start, strafe start, turn/pitch start, jump, ascend/descend start, or facing/pitch change
+- **WHEN** the client emits an explicit movement-intent opcode such as movement start, strafe start, turn/pitch start, jump, ascend/descend start, or facing/pitch change that does not match a recent bot movement visual
 - **THEN** the proxy SHALL classify that packet through the canonical player-intent classifier
 - **AND** the player SHALL take locomotion immediately
 - **AND** the qualifying opcode or equivalent typed reason SHALL be observable in diagnostics
