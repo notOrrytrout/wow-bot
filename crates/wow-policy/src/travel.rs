@@ -263,6 +263,7 @@ mod tests {
             maintenance: wow_infra::config::runtime_data::MaintenanceTuning {
                 auto_mount_enabled: true,
                 mount_min_travel_yards: 80,
+                auto_bank_deposit_enabled: true,
             },
             ..RuntimeTuning::default()
         };

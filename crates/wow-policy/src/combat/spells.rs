@@ -175,6 +175,31 @@ pub fn metadata(spell: u32) -> Option<&'static SpellMetadata> {
     catalog().spells.get(&spell)
 }
 
+/// Return the maximum known cast requirement for each reagent item.
+/// Callers share this projection so maintenance and inventory protection use
+/// the same authoritative spell metadata and aggregation rules.
+pub fn reagent_item_counts(spells: impl IntoIterator<Item = u32>) -> BTreeMap<u32, u32> {
+    let mut result = BTreeMap::new();
+    for spell_id in spells {
+        let Some(spell) = metadata(spell_id) else {
+            continue;
+        };
+        for reagent in &spell.reagents {
+            let Ok(item) = u32::try_from(reagent.item) else {
+                continue;
+            };
+            if item == 0 || reagent.count == 0 {
+                continue;
+            }
+            result
+                .entry(item)
+                .and_modify(|count: &mut u32| *count = (*count).max(reagent.count))
+                .or_insert(reagent.count);
+        }
+    }
+    result
+}
+
 pub fn family_spells(family_id: u32) -> Option<&'static [u32]> {
     catalog().families.get(&family_id).map(Vec::as_slice)
 }

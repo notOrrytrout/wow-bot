@@ -11,6 +11,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn show_bank_observation_keeps_the_authoritative_banker_guid() {
+        let banker = 0x1122_3344_5566_7788_u64;
+        let body = banker.to_le_bytes();
+        assert!(matches!(
+            maintenance_observations(0x01B8, &body).as_slice(),
+            [ProtocolObservation::BankOpened { banker: EntityId(guid) }] if *guid == banker
+        ));
+        assert!(maintenance_observations(0x01B8, &body[..7]).is_empty());
+        assert!(maintenance_observations(0x01B8, &[0; 8]).is_empty());
+    }
+
+    #[test]
     fn item_template_observation_keeps_fields_needed_for_gear_scoring() {
         let mut packet = Vec::new();
         for value in [100, 4, 1, 0] {
@@ -423,12 +435,14 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
     const SMSG_BUY_ITEM: u32 = 0x01A4;
     const SMSG_TRAINER_LIST: u32 = 0x01B1;
     const SMSG_MAIL_LIST_RESULT: u32 = 0x023B;
+    const SMSG_SHOW_BANK: u32 = 0x01B8;
     match opcode {
         SMSG_ITEM_QUERY_SINGLE_RESPONSE => parse_item_template(body).into_iter().collect(),
         SMSG_LIST_INVENTORY => parse_vendor_list(body).into_iter().collect(),
         SMSG_BUY_ITEM => parse_vendor_buy_response(body).into_iter().collect(),
         SMSG_TRAINER_LIST => parse_trainer_list(body).into_iter().collect(),
         SMSG_MAIL_LIST_RESULT => parse_mail_list(body).into_iter().collect(),
+        SMSG_SHOW_BANK => parse_bank_opened(body).into_iter().collect(),
         SMSG_INITIAL_SPELLS => parse_initial_spells(body),
         SMSG_LEARNED_SPELL => body
             .get(0..4)
@@ -454,6 +468,14 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_PARTYKILLLOG => parse_creature_killed(body).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn parse_bank_opened(body: &[u8]) -> Option<ProtocolObservation> {
+    if body.len() != 8 {
+        return None;
+    }
+    let banker = EntityId(u64_le_at(body, 0)?);
+    (banker.0 != 0).then_some(ProtocolObservation::BankOpened { banker })
 }
 
 fn parse_mail_list(body: &[u8]) -> Option<ProtocolObservation> {

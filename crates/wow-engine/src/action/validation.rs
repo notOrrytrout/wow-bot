@@ -773,6 +773,59 @@ fn validate_economy_command(
                 ));
             }
         }
+        GameplayCommand::BankActivate { banker } => {
+            if !wow_policy::economy::bank::bag_pressure_requires_bank(snapshot)
+                || wow_policy::economy::bank::profession_material_deposit_candidates(
+                    snapshot,
+                    *banker,
+                    &Default::default(),
+                )
+                .is_empty()
+                || !wow_policy::economy::bank::trusted_nearby_bankers(snapshot).contains(banker)
+            {
+                return Err(reject(
+                    "bank_not_available",
+                    "severe bag pressure, a safe deposit item, and a nearby observed banker are required",
+                    true,
+                ));
+            }
+        }
+        GameplayCommand::BankDeposit {
+            banker,
+            item,
+            item_guid,
+            backpack_slot,
+        } => {
+            if !snapshot.state.inventory.bank.authoritative
+                || snapshot.state.inventory.bank.banker != Some(*banker)
+                || !wow_policy::economy::bank::bag_pressure_requires_bank(snapshot)
+                || !wow_policy::economy::bank::trusted_nearby_bankers(snapshot).contains(banker)
+            {
+                return Err(reject(
+                    "stale_bank",
+                    "the same banker must remain open and in interaction range under severe bag pressure",
+                    true,
+                ));
+            }
+            let candidate = wow_policy::economy::bank::profession_material_deposit_candidates(
+                snapshot,
+                *banker,
+                &Default::default(),
+            )
+            .into_iter()
+            .any(|candidate| {
+                candidate.item == *item
+                    && candidate.item_guid == *item_guid
+                    && candidate.backpack_slot == *backpack_slot
+            });
+            if !candidate {
+                return Err(reject(
+                    "unsafe_bank_item",
+                    "item is not a current unprotected backpack profession material",
+                    true,
+                ));
+            }
+        }
         GameplayCommand::TradeAccept { generation, .. }
             if snapshot.state.inventory.trade.generation != *generation
                 || !snapshot.state.inventory.trade.open =>
@@ -987,6 +1040,8 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
             PermissionSet::ECONOMY | PermissionSet::ASSET_TRANSFER
         }
         GameplayCommand::MailboxList { .. } => PermissionSet::ECONOMY,
+        GameplayCommand::BankActivate { .. } => PermissionSet::MAINTENANCE,
+        GameplayCommand::BankDeposit { .. } => PermissionSet::MAINTENANCE,
         GameplayCommand::Chat { .. } => PermissionSet::CHAT,
         GameplayCommand::Raw { .. } => PermissionSet::SERVER_COMMAND,
         GameplayCommand::Interact(_)
@@ -1013,6 +1068,8 @@ fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
             | GameplayCommand::TrainerBuy { .. }
             | GameplayCommand::MailboxList { .. }
             | GameplayCommand::MailTake { .. }
+            | GameplayCommand::BankActivate { .. }
+            | GameplayCommand::BankDeposit { .. }
             | GameplayCommand::PetAttack { .. }
     ) && !matches!(origin, PlanOrigin::SystemPolicy | PlanOrigin::Operator)
     {
@@ -1033,6 +1090,8 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::SummonPet { .. }
                 | GameplayCommand::EquipItem { .. }
                 | GameplayCommand::RepairEquipment { .. }
+                | GameplayCommand::BankActivate { .. }
+                | GameplayCommand::BankDeposit { .. }
                 | GameplayCommand::SetAmmo { .. }
                 | GameplayCommand::PetSetReaction { .. }
                 | GameplayCommand::PetSetAutocast { .. }
@@ -1054,6 +1113,8 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::SummonPet { .. }
                 | GameplayCommand::EquipItem { .. }
                 | GameplayCommand::RepairEquipment { .. }
+                | GameplayCommand::BankActivate { .. }
+                | GameplayCommand::BankDeposit { .. }
                 | GameplayCommand::SetAmmo { .. }
                 | GameplayCommand::PetSetReaction { .. }
                 | GameplayCommand::PetSetAutocast { .. }
@@ -1200,6 +1261,67 @@ mod tests {
             },
         );
         Snapshot::from_state(&state)
+    }
+
+    fn bank_snapshot(open: bool, free_slots: u16) -> (Snapshot, EntityId, EntityId) {
+        use wow_state::inventory::{InventoryItemInstance, ItemTemplateMetadata};
+
+        let banker = EntityId(44);
+        let item_guid = EntityId(90);
+        let position = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut state = AuthoritativeState::default();
+        state.revision = StateRevision(7);
+        state.session.in_world = true;
+        state.session.character_guid = Some(1);
+        state.position.player = Some(position);
+        state.inventory.instances_authoritative = true;
+        state.inventory.free_slots = free_slots;
+        state.inventory.bank = wow_state::inventory::BankState {
+            authoritative: open,
+            banker: open.then_some(banker),
+        };
+        state.inventory.instances.insert(
+            item_guid,
+            InventoryItemInstance {
+                item: 2589,
+                guid: item_guid,
+                backpack_slot: 23,
+                count: 4,
+            },
+        );
+        state.inventory.item_metadata.insert(
+            2589,
+            ItemTemplateMetadata {
+                item_class: 7,
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            EntityId(1),
+            EntityState {
+                id: EntityId(1),
+                kind: EntityKind::Player,
+                health: Some((100, 100)),
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            banker,
+            EntityState {
+                id: banker,
+                kind: EntityKind::Unit,
+                npc_flags: Some(0x8),
+                interactable: true,
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        (Snapshot::from_state(&state), banker, item_guid)
     }
 
     #[test]
@@ -1350,6 +1472,54 @@ mod tests {
             Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
                 if code == "mailbox_not_available"
         ));
+    }
+
+    #[test]
+    fn bank_actions_require_bag_pressure_live_banker_and_matching_open_state() {
+        let (closed, banker, item_guid) = bank_snapshot(false, 2);
+        assert!(validate_command(&closed, &GameplayCommand::BankActivate { banker }).is_ok());
+        let open_action = GameplayCommand::BankDeposit {
+            banker,
+            item: 2589,
+            item_guid,
+            backpack_slot: 23,
+        };
+        assert!(validate_command(&closed, &open_action).is_err());
+
+        let (open, _, _) = bank_snapshot(true, 2);
+        assert!(validate_command(&open, &open_action).is_ok());
+        let (wrong_banker, _, _) = bank_snapshot(true, 2);
+        let stale = GameplayCommand::BankDeposit {
+            banker: EntityId(45),
+            item: 2589,
+            item_guid,
+            backpack_slot: 23,
+        };
+        assert!(validate_command(&wrong_banker, &stale).is_err());
+        let (no_pressure, _, _) = bank_snapshot(true, 3);
+        assert!(validate_command(&no_pressure, &open_action).is_err());
+        let mut combat_state = open.state.clone();
+        combat_state
+            .entities
+            .0
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .unit_flags = Some(0x0008_0000);
+        assert!(validate_command(&Snapshot::from_state(&combat_state), &open_action).is_err());
+        combat_state
+            .entities
+            .0
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .unit_flags = Some(0);
+        combat_state.position.moving = true;
+        assert!(validate_command(&Snapshot::from_state(&combat_state), &open_action).is_err());
+        let mut far_state = open.state.clone();
+        far_state.entities.0.get_mut(&banker).unwrap().position = Some(WorldPosition {
+            point: Vec3::new(6.0, 0.0, 0.0),
+            ..far_state.position.player.unwrap()
+        });
+        assert!(validate_command(&Snapshot::from_state(&far_state), &open_action).is_err());
     }
 
     #[test]

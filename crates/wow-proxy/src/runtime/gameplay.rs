@@ -476,6 +476,8 @@ pub(super) fn encode_gameplay_command(
     const CMSG_MAIL_TAKE_MONEY: u32 = 0x0245;
     const CMSG_MAIL_TAKE_ITEM: u32 = 0x0246;
     const CMSG_SET_AMMO: u32 = 0x0268;
+    const CMSG_BANKER_ACTIVATE: u32 = 0x01B7;
+    const CMSG_AUTOBANK_ITEM: u32 = 0x0283;
     match command {
         GameplayCommand::Raw { opcode, body } => Ok(Some((ClientFrame { opcode, body }, None))),
         GameplayCommand::QueryQuestGivers => Ok(Some((
@@ -583,6 +585,20 @@ pub(super) fn encode_gameplay_command(
                 None,
             )))
         }
+        GameplayCommand::BankActivate { banker } => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_BANKER_ACTIVATE,
+                body: banker.0.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
+        GameplayCommand::BankDeposit { backpack_slot, .. } => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_AUTOBANK_ITEM,
+                body: vec![0xff, backpack_slot], // backpack bag sentinel, then absolute slot
+            },
+            None,
+        ))),
         GameplayCommand::MailboxList { mailbox } => Ok(Some((
             ClientFrame {
                 opcode: CMSG_GET_MAIL_LIST,
@@ -1492,6 +1508,40 @@ mod movement_clock_tests {
         assert_eq!(&packet.body[..8], &vendor.0.to_le_bytes());
         assert_eq!(&packet.body[8..16], &0_u64.to_le_bytes());
         assert_eq!(packet.body[16], 0);
+    }
+
+    #[test]
+    fn bank_actions_use_wrath_banker_and_backpack_slot_layouts() {
+        let mut clock = MovementClock::default();
+        let banker = EntityId(0x1122_3344_5566_7788);
+        let (open, _) = encode_gameplay_command(
+            GameplayCommand::BankActivate { banker },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(open.opcode, 0x01B7);
+        assert_eq!(open.body, banker.0.to_le_bytes());
+
+        let (deposit, _) = encode_gameplay_command(
+            GameplayCommand::BankDeposit {
+                banker,
+                item: 2589,
+                item_guid: EntityId(99),
+                backpack_slot: 23,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(deposit.opcode, 0x0283);
+        assert_eq!(deposit.body, [0xff, 23]);
     }
 
     #[test]

@@ -136,6 +136,14 @@ pub struct MailboxState {
     pub mails: BTreeMap<u32, MailEntry>,
 }
 
+/// Server-confirmed banker context. Deposits must match this banker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BankState {
+    #[serde(default)]
+    pub authoritative: bool,
+    pub banker: Option<EntityId>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InventoryState {
     pub items: BTreeMap<u32, u32>,
@@ -164,6 +172,8 @@ pub struct InventoryState {
     pub trade: TradeState,
     pub auction: AuctionState,
     pub mailbox: MailboxState,
+    #[serde(default)]
+    pub bank: BankState,
 }
 
 impl InventoryState {

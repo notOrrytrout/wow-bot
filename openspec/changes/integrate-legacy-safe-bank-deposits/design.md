@@ -1,0 +1,11 @@
+# Design
+
+The lane enables automatic deposits through its existing maintenance tuning. The default is enabled, as in the old bot. A shared policy gate blocks bank work outside the world, when player life state is unknown/dead/ghost, during observed combat or active casts, during movement, with a controlled mover, or while attached to a transport. Maintenance then acts only with authoritative inventory instances and two or fewer free slots, and only when a safe profession material exists in the base backpack and a live banker service flag is observed within five yards.
+
+Maintenance opens the bank with a typed action and waits for `SMSG_SHOW_BANK`. The observation stores the server-reported banker ID. A deposit command carries that same banker ID plus the selected item ID, instance GUID, and backpack slot. Final validation requires the bank-open observation to match the banker, the banker to remain observed/interactable/in range with its banker service flag, severe bag pressure to remain, and the exact item instance and safe classification to remain current. The encoder emits one autobank packet for the backpack slot.
+
+The item policy accepts only known item-class 7 profession materials with authoritative inventory instances and metadata. It excludes active quest objective items, known spell reagents, and any caller-supplied protected IDs. The current runtime has no configured keep-item list or additional protected-item registry; these remain a future configuration adaptation. Known spell reagent IDs use the same metadata projection as reagent restocking. Item classes other than profession materials, including reagent class 5 and unknown classes, remain protected.
+
+The lane sends one deposit per attempt and waits for an authoritative item-instance count decrease or removal. Open and deposit waits have bounded timeouts. A missing confirmation delays retry. Bank-open state is reset on world changes and when the banker entity is removed. Since the protocol has no bank-close observation, every action also requires current live banker range evidence.
+
+Remembered-bank travel, withdrawals, value-based selection, and an explicit configurable keep-item list are outside this increment.

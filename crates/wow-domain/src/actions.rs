@@ -146,6 +146,15 @@ pub enum GameplayCommand {
     RepairEquipment {
         vendor: EntityId,
     },
+    BankActivate {
+        banker: EntityId,
+    },
+    BankDeposit {
+        banker: EntityId,
+        item: u32,
+        item_guid: EntityId,
+        backpack_slot: u8,
+    },
     TradeAccept {
         generation: u64,
         gift_only: bool,
@@ -197,6 +206,7 @@ impl PlanOrigin {
                     | GameplayCommand::TradeAccept { .. }
                     | GameplayCommand::AuctionBuy { .. }
                     | GameplayCommand::MailTake { .. }
+                    | GameplayCommand::BankDeposit { .. }
             ),
             Self::Recovery => !matches!(
                 command,

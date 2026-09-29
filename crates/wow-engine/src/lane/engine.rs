@@ -232,6 +232,8 @@ const TURN_IN_SEARCH_RETRY_DISTANCE: f32 = 50.0;
 const QUEST_START_ARRIVAL_RANGE: f32 = 5.0;
 const QUEST_START_EMPTY_LOG_RADIUS_YARDS: f32 = 200.0;
 const QUEST_START_HUB_SWEEP_RADIUS_YARDS: f32 = 40.0;
+const BANK_ACTION_TIMEOUT: Duration = Duration::from_secs(8);
+const BANK_RETRY_DELAY: Duration = Duration::from_secs(30);
 const QUEST_SEARCH_ARRIVAL_RANGE: f32 = 18.0;
 const QUEST_ITEM_SOURCE_SEARCH_RADIUS: f32 = 5_000.0;
 const QUEST_SEARCH_ROAM_RADIUS: f32 = 25.0;
@@ -447,6 +449,9 @@ pub struct LaneEngine {
     mailbox_source: Option<EntityId>,
     mail_action_pending: Option<(u64, Instant)>,
     mail_retry_after: Option<Instant>,
+    bank_open_pending: Option<(EntityId, Instant)>,
+    bank_deposit_pending: Option<(EntityId, EntityId, u32, Instant)>,
+    bank_retry_after: Option<Instant>,
     last_maintenance_tick: Option<Instant>,
     last_maintenance_status: Option<String>,
     post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
@@ -533,6 +538,9 @@ impl LaneEngine {
             mailbox_source: None,
             mail_action_pending: None,
             mail_retry_after: None,
+            bank_open_pending: None,
+            bank_deposit_pending: None,
+            bank_retry_after: None,
             last_maintenance_tick: None,
             last_maintenance_status: None,
             post_combat_loot: None,
@@ -2245,6 +2253,108 @@ impl LaneEngine {
         None
     }
 
+    async fn tick_bank_deposit(&mut self, snapshot: &Snapshot, now: Instant) -> Option<bool> {
+        if let Some((banker, item_guid, baseline_count, deadline)) = self.bank_deposit_pending {
+            let current_count = snapshot
+                .state
+                .inventory
+                .instances
+                .get(&item_guid)
+                .map_or(0, |instance| instance.count);
+            if current_count < baseline_count {
+                self.bank_deposit_pending = None;
+                self.bank_retry_after = None;
+                self.last_maintenance_status =
+                    Some(format!("bank_deposit_confirmed:{}", item_guid.0));
+            } else if now < deadline {
+                self.waiting("waiting for authoritative backpack state after bank deposit".into());
+                return Some(true);
+            } else {
+                self.bank_deposit_pending = None;
+                self.bank_retry_after = Some(now + BANK_RETRY_DELAY);
+                self.waiting("bank deposit has no inventory confirmation; retry is delayed".into());
+                return Some(true);
+            }
+            let _ = banker;
+        }
+        if let Some((banker, deadline)) = self.bank_open_pending {
+            if snapshot.state.inventory.bank.authoritative
+                && snapshot.state.inventory.bank.banker == Some(banker)
+            {
+                self.bank_open_pending = None;
+            } else if now < deadline {
+                self.waiting("waiting for authoritative bank-open observation".into());
+                return Some(true);
+            } else {
+                self.bank_open_pending = None;
+                self.bank_retry_after = Some(now + BANK_RETRY_DELAY);
+                self.waiting("bank did not open; retry is delayed".into());
+                return Some(true);
+            }
+        }
+        if !self.runtime_tuning.maintenance.auto_bank_deposit_enabled
+            || !wow_policy::economy::bank::bag_pressure_requires_bank(snapshot)
+            || self.bank_retry_after.is_some_and(|deadline| deadline > now)
+        {
+            return None;
+        }
+        let banker = wow_policy::economy::bank::trusted_nearby_bankers(snapshot)
+            .into_iter()
+            .next()?;
+        let Some(candidate) = wow_policy::economy::bank::profession_material_deposit_candidates(
+            snapshot,
+            banker,
+            &BTreeSet::new(),
+        )
+        .into_iter()
+        .next() else {
+            return None;
+        };
+
+        if !snapshot.state.inventory.bank.authoritative
+            || snapshot.state.inventory.bank.banker != Some(banker)
+        {
+            self.bank_open_pending = Some((banker, now + BANK_ACTION_TIMEOUT));
+            let sent = self
+                .propose_command(GameplayCommand::BankActivate { banker }, false)
+                .await;
+            if !sent {
+                self.bank_open_pending = None;
+                self.bank_retry_after = Some(now + BANK_RETRY_DELAY);
+            }
+            return Some(sent);
+        }
+
+        let baseline_count = snapshot
+            .state
+            .inventory
+            .instances
+            .get(&candidate.item_guid)
+            .map_or(0, |instance| instance.count);
+        self.bank_deposit_pending = Some((
+            banker,
+            candidate.item_guid,
+            baseline_count,
+            now + BANK_ACTION_TIMEOUT,
+        ));
+        let sent = self
+            .propose_command(
+                GameplayCommand::BankDeposit {
+                    banker,
+                    item: candidate.item,
+                    item_guid: candidate.item_guid,
+                    backpack_slot: candidate.backpack_slot,
+                },
+                false,
+            )
+            .await;
+        if !sent {
+            self.bank_deposit_pending = None;
+            self.bank_retry_after = Some(now + BANK_RETRY_DELAY);
+        }
+        Some(sent)
+    }
+
     async fn tick_maintenance(&mut self) -> Option<bool> {
         self.last_maintenance_tick = Some(Instant::now());
         let now = Instant::now();
@@ -2264,6 +2374,9 @@ impl LaneEngine {
         self.maintenance_retry_after
             .retain(|_, deadline| *deadline > now);
         let snapshot = Snapshot::from_state(&self.state.authoritative);
+        if let Some(result) = self.tick_bank_deposit(&snapshot, now).await {
+            return Some(result);
+        }
         let nearby_sell_vendor = nearby_sell_vendor(&snapshot);
         match wow_policy::maintenance::decide_next_with_nearby_services(
             &snapshot,
@@ -6704,6 +6817,133 @@ mod tests {
         assert_eq!(engine.last_player_level, None);
         assert!(!engine.class_training_due);
         assert!(engine.remembered_class_trainers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nearby_banker_opens_authoritatively_then_receives_one_safe_deposit() {
+        let player = EntityId(1);
+        let banker = EntityId(2);
+        let item_guid = EntityId(3);
+        let position = WorldPosition {
+            map: 1,
+            point: Vec3::new(10.0, 10.0, 5.0),
+            orientation: 0.0,
+        };
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(position);
+        authoritative.inventory.instances_authoritative = true;
+        authoritative.inventory.free_slots = 2;
+        authoritative.inventory.instances.insert(
+            item_guid,
+            wow_state::inventory::InventoryItemInstance {
+                item: 2589,
+                guid: item_guid,
+                backpack_slot: 23,
+                count: 4,
+            },
+        );
+        authoritative.inventory.item_metadata.insert(
+            2589,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 7,
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                id: player,
+                kind: wow_state::entities::EntityKind::Player,
+                health: Some((100, 100)),
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            banker,
+            wow_state::entities::EntityState {
+                id: banker,
+                kind: wow_state::entities::EntityKind::Unit,
+                npc_flags: Some(0x8),
+                interactable: true,
+                position: Some(WorldPosition {
+                    point: Vec3::new(11.0, 10.0, 5.0),
+                    ..position
+                }),
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        let now = Instant::now();
+
+        assert_eq!(
+            engine
+                .tick_bank_deposit(&Snapshot::from_state(&engine.state.authoritative), now)
+                .await,
+            Some(true)
+        );
+        let WorkerToProxy::Action(open) = proxy.try_recv().expect("bank-open action") else {
+            panic!("expected bank-open action");
+        };
+        assert_eq!(open.command(), &GameplayCommand::BankActivate { banker });
+        assert!(engine.bank_open_pending.is_some());
+
+        assert_eq!(
+            engine
+                .tick_bank_deposit(
+                    &Snapshot::from_state(&engine.state.authoritative),
+                    now + Duration::from_secs(2),
+                )
+                .await,
+            Some(true)
+        );
+        assert!(
+            proxy.try_recv().is_err(),
+            "do not repeat the bank-open action while waiting"
+        );
+
+        engine
+            .handle(LaneMessage::Observation(ProtocolObservation::BankOpened {
+                banker,
+            }))
+            .await;
+        assert_eq!(
+            engine
+                .tick_bank_deposit(
+                    &Snapshot::from_state(&engine.state.authoritative),
+                    now + Duration::from_secs(3)
+                )
+                .await,
+            Some(true)
+        );
+        let WorkerToProxy::Action(deposit) = proxy.try_recv().expect("bank-deposit action") else {
+            panic!("expected bank-deposit action");
+        };
+        assert_eq!(
+            deposit.command(),
+            &GameplayCommand::BankDeposit {
+                banker,
+                item: 2589,
+                item_guid,
+                backpack_slot: 23,
+            }
+        );
+        assert!(engine.bank_deposit_pending.is_some());
+        assert_eq!(
+            engine
+                .tick_bank_deposit(
+                    &Snapshot::from_state(&engine.state.authoritative),
+                    now + Duration::from_secs(5),
+                )
+                .await,
+            Some(true)
+        );
+        assert!(
+            proxy.try_recv().is_err(),
+            "do not repeat a deposit before inventory confirmation"
+        );
     }
 
     #[tokio::test]

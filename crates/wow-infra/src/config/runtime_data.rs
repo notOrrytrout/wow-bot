@@ -70,6 +70,8 @@ pub struct MaintenanceTuning {
     /// Disabled by default to preserve the behavior of existing JSON configs.
     pub auto_mount_enabled: bool,
     pub mount_min_travel_yards: u32,
+    /// Deposit safe profession materials when backpack space is critically low.
+    pub auto_bank_deposit_enabled: bool,
 }
 
 impl Default for RuntimeTuning {
@@ -95,6 +97,7 @@ impl Default for MaintenanceTuning {
         Self {
             auto_mount_enabled: false,
             mount_min_travel_yards: 80,
+            auto_bank_deposit_enabled: true,
         }
     }
 }
@@ -141,5 +144,6 @@ mod tests {
         assert_eq!(config.runtime_tuning.movement.path_straightness, 1.0);
         assert!(!config.runtime_tuning.maintenance.auto_mount_enabled);
         assert_eq!(config.runtime_tuning.maintenance.mount_min_travel_yards, 80);
+        assert!(config.runtime_tuning.maintenance.auto_bank_deposit_enabled);
     }
 }

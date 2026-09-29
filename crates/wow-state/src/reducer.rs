@@ -54,6 +54,7 @@ fn clear_world_transients(state: &mut AuthoritativeState) {
     state.inventory.trade = Default::default();
     state.inventory.auction = Default::default();
     state.inventory.mailbox = Default::default();
+    state.inventory.bank = Default::default();
 }
 
 pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) -> StateDelta {
@@ -97,6 +98,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.session.in_world = true;
             state.session.character_guid = Some(character_guid);
             state.position.player = Some(position);
+            state.inventory.bank = Default::default();
             state.position.moving = false;
             state.position.flags = 0;
             state.position.client_time = 0;
@@ -266,6 +268,9 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 state.inventory.vendor = None;
                 state.inventory.vendor_inventory = None;
             }
+            if state.inventory.bank.banker == Some(entity) {
+                state.inventory.bank = Default::default();
+            }
             if state.inventory.current_loot == Some(entity) {
                 state.inventory.current_loot = None;
                 state.inventory.current_loot_owner = None;
@@ -407,6 +412,13 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.inventory.mailbox = mailbox;
             state.inventory.mailbox.generation = generation;
             state.inventory.mailbox.authoritative = true;
+            delta.changed.push("inventory".into());
+        }
+        ProtocolObservation::BankOpened { banker } => {
+            state.inventory.bank = crate::inventory::BankState {
+                authoritative: true,
+                banker: Some(banker),
+            };
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::QuestGiverStatus { giver, status } => {
@@ -1106,6 +1118,33 @@ mod tests {
             ProtocolObservation::EntityRemoved { entity: trainer },
         );
         assert_eq!(state.trainer, crate::trainer::TrainerState::default());
+    }
+
+    #[test]
+    fn bank_open_observation_is_bound_to_the_banker_and_clears_when_it_is_removed() {
+        let mut state = AuthoritativeState::default();
+        let banker = EntityId(88);
+        reduce(&mut state, ProtocolObservation::BankOpened { banker });
+        assert!(state.inventory.bank.authoritative);
+        assert_eq!(state.inventory.bank.banker, Some(banker));
+        reduce(
+            &mut state,
+            ProtocolObservation::WorldChanged {
+                character_guid: 1,
+                position: wow_domain::WorldPosition {
+                    map: 1,
+                    point: wow_domain::Vec3::default(),
+                    orientation: 0.0,
+                },
+            },
+        );
+        assert_eq!(state.inventory.bank, crate::inventory::BankState::default());
+        reduce(&mut state, ProtocolObservation::BankOpened { banker });
+        reduce(
+            &mut state,
+            ProtocolObservation::EntityRemoved { entity: banker },
+        );
+        assert_eq!(state.inventory.bank, crate::inventory::BankState::default());
     }
 
     #[test]

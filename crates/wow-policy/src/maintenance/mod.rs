@@ -984,17 +984,14 @@ fn spell_reagent_restock(
         if !automated_utility {
             continue;
         }
-        for reagent in &spell.reagents {
-            let Ok(item) = u32::try_from(reagent.item) else {
-                continue;
-            };
-            if item == 0 || reagent.count == 0 || item == SOUL_SHARD {
+        for (item, count) in crate::combat::spells::reagent_item_counts([*spell_id]) {
+            if item == SOUL_SHARD {
                 continue;
             }
             per_item
                 .entry(item)
-                .and_modify(|count| *count = (*count).max(reagent.count))
-                .or_insert(reagent.count);
+                .and_modify(|existing| *existing = (*existing).max(count))
+                .or_insert(count);
         }
     }
     if per_item.is_empty() {

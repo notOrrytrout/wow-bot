@@ -139,6 +139,14 @@ pub fn profile(command: &GameplayCommand) -> Option<SpatialProfile> {
             Some(INTERACTION_FACING_TOLERANCE),
             true,
         ),
+        GameplayCommand::BankActivate { banker } => (
+            *banker,
+            0.0,
+            INTERACTION_MAX_RANGE,
+            INTERACTION_APPROACH_RANGE,
+            Some(INTERACTION_FACING_TOLERANCE),
+            true,
+        ),
         GameplayCommand::RepairEquipment { vendor } => (
             *vendor,
             0.0,

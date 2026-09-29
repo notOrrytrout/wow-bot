@@ -198,6 +198,8 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         }
         | GameplayCommand::VendorSell { vendor: target, .. }
         | GameplayCommand::RepairEquipment { vendor: target } => Some(*target),
+        GameplayCommand::BankActivate { banker: target }
+        | GameplayCommand::BankDeposit { banker: target, .. } => Some(*target),
         GameplayCommand::MailboxList { mailbox: target }
         | GameplayCommand::MailTake {
             mailbox: target, ..

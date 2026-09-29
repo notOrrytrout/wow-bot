@@ -1,4 +1,5 @@
 pub mod auction;
+pub mod bank;
 pub mod inventory;
 pub mod loot;
 pub mod mail;

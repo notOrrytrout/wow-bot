@@ -144,6 +144,9 @@ pub enum ProtocolObservation {
     Trade(crate::inventory::TradeState),
     Auction(crate::inventory::AuctionState),
     Mailbox(crate::inventory::MailboxState),
+    BankOpened {
+        banker: EntityId,
+    },
     QuestGiverStatus {
         giver: EntityId,
         status: u8,
