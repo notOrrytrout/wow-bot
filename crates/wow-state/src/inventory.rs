@@ -116,12 +116,23 @@ pub struct AuctionState {
 pub struct MailEntry {
     pub mail_id: u32,
     pub money: u64,
-    pub attachments: BTreeMap<u32, u32>,
+    /// `None` means the protocol observation did not prove that this mail is non-COD.
+    #[serde(default)]
+    pub cod_copper: Option<u64>,
+    pub attachments: BTreeMap<u32, MailAttachment>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MailAttachment {
+    pub item_id: u32,
+    pub count: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MailboxState {
     pub generation: u64,
+    #[serde(default)]
+    pub authoritative: bool,
     pub mails: BTreeMap<u32, MailEntry>,
 }
 

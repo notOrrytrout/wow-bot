@@ -198,6 +198,10 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         }
         | GameplayCommand::VendorSell { vendor: target, .. }
         | GameplayCommand::RepairEquipment { vendor: target } => Some(*target),
+        GameplayCommand::MailboxList { mailbox: target }
+        | GameplayCommand::MailTake {
+            mailbox: target, ..
+        } => Some(*target),
         GameplayCommand::Cast {
             target: Some(target),
             ..
@@ -226,7 +230,6 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::QueryCorpse
         | GameplayCommand::TradeAccept { .. }
         | GameplayCommand::AuctionBuy { .. }
-        | GameplayCommand::MailTake { .. }
         | GameplayCommand::QueryQuestGivers
         | GameplayCommand::QueryQuest { .. }
         | GameplayCommand::QueryItem { .. }

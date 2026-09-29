@@ -66,6 +66,62 @@ mod tests {
     }
 
     #[test]
+    fn mail_list_parser_preserves_cod_money_and_attachment_identity() {
+        let mut mail = Vec::new();
+        mail.extend_from_slice(&77_u32.to_le_bytes());
+        mail.push(0); // normal mail
+        mail.extend_from_slice(&0x1122_3344_5566_7788_u64.to_le_bytes());
+        mail.extend_from_slice(&0_u32.to_le_bytes()); // COD
+        mail.extend_from_slice(&0_u32.to_le_bytes()); // compatibility field
+        mail.extend_from_slice(&41_u32.to_le_bytes()); // stationery
+        mail.extend_from_slice(&12_345_u32.to_le_bytes()); // attached money
+        mail.extend_from_slice(&0_u32.to_le_bytes()); // checked flags
+        mail.extend_from_slice(&1.0_f32.to_le_bytes()); // expiry
+        mail.extend_from_slice(&0_u32.to_le_bytes()); // template
+        mail.extend_from_slice(b"subject\0body\0");
+        mail.push(1); // attachment count
+        mail.push(0); // attachment slot
+        mail.extend_from_slice(&9001_u32.to_le_bytes()); // low GUID
+        mail.extend_from_slice(&4306_u32.to_le_bytes()); // item ID
+        mail.extend_from_slice(&[0; 84]); // enchantments
+        mail.extend_from_slice(&0_i32.to_le_bytes()); // random property
+        mail.extend_from_slice(&0_u32.to_le_bytes()); // suffix factor
+        mail.push(4); // stack count
+        mail.extend_from_slice(&0_u32.to_le_bytes()); // spell charges
+        mail.extend_from_slice(&0_u32.to_le_bytes()); // max durability
+        mail.extend_from_slice(&0_u32.to_le_bytes()); // durability
+        mail.push(0); // WotLK unknown
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&1_u32.to_le_bytes()); // server total
+        body.push(1); // visible count
+        body.extend_from_slice(&(mail.len() as u16).to_le_bytes());
+        body.extend_from_slice(&mail);
+        let Some(ProtocolObservation::Mailbox(mailbox)) = parse_mail_list(&body) else {
+            panic!("expected authoritative mailbox observation");
+        };
+        assert!(mailbox.authoritative);
+        let mail = mailbox.mails.get(&77).expect("mail entry");
+        assert_eq!(mail.cod_copper, Some(0));
+        assert_eq!(mail.money, 12_345);
+        assert_eq!(mail.attachments.get(&9001).unwrap().item_id, 4306);
+        assert_eq!(mail.attachments.get(&9001).unwrap().count, 4);
+        assert!(matches!(
+            maintenance_observations(0x023B, &body).as_slice(),
+            [ProtocolObservation::Mailbox(_)]
+        ));
+
+        let mut cod_mail = body.clone();
+        let cod_offset = 5 + 2 + 4 + 1 + 8;
+        cod_mail[cod_offset..cod_offset + 4].copy_from_slice(&100_u32.to_le_bytes());
+        let Some(ProtocolObservation::Mailbox(cod_box)) = parse_mail_list(&cod_mail) else {
+            panic!("nonzero COD must remain represented");
+        };
+        assert_eq!(cod_box.mails[&77].cod_copper, Some(100));
+        assert!(parse_mail_list(&body[..body.len() - 1]).is_none());
+    }
+
+    #[test]
     fn vendor_list_and_buy_packets_preserve_observed_offer_fields() {
         let vendor = 0x1122_3344_5566_7788_u64;
         let mut packet = vendor.to_le_bytes().to_vec();
@@ -366,11 +422,13 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
     const SMSG_LIST_INVENTORY: u32 = 0x019F;
     const SMSG_BUY_ITEM: u32 = 0x01A4;
     const SMSG_TRAINER_LIST: u32 = 0x01B1;
+    const SMSG_MAIL_LIST_RESULT: u32 = 0x023B;
     match opcode {
         SMSG_ITEM_QUERY_SINGLE_RESPONSE => parse_item_template(body).into_iter().collect(),
         SMSG_LIST_INVENTORY => parse_vendor_list(body).into_iter().collect(),
         SMSG_BUY_ITEM => parse_vendor_buy_response(body).into_iter().collect(),
         SMSG_TRAINER_LIST => parse_trainer_list(body).into_iter().collect(),
+        SMSG_MAIL_LIST_RESULT => parse_mail_list(body).into_iter().collect(),
         SMSG_INITIAL_SPELLS => parse_initial_spells(body),
         SMSG_LEARNED_SPELL => body
             .get(0..4)
@@ -396,6 +454,92 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_PARTYKILLLOG => parse_creature_killed(body).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn parse_mail_list(body: &[u8]) -> Option<ProtocolObservation> {
+    const MAX_MAILS: usize = 50;
+    const MAX_ATTACHMENTS: usize = 12;
+    const ATTACHMENT_ENCHANT_BYTES: usize = 7 * 3 * 4;
+    let mut header_cursor = 0;
+    let total = read_u32(body, &mut header_cursor)?;
+    let count = usize::from(*body.get(4)?);
+    if count > MAX_MAILS || total > 10_000 {
+        return None;
+    }
+    let mut cursor = 5usize;
+    let mut mails = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let size = usize::from(u16::from_le_bytes(
+            body.get(cursor..cursor.checked_add(2)?)?.try_into().ok()?,
+        ));
+        cursor = cursor.checked_add(2)?;
+        if size == 0 || size > body.len().saturating_sub(cursor) {
+            return None;
+        }
+        let end = cursor.checked_add(size)?;
+        let mail = body.get(cursor..end)?;
+        cursor = end;
+        let mut offset = 0usize;
+        let mail_id = read_u32(mail, &mut offset)?;
+        let message_type = *mail.get(offset)?;
+        offset += 1;
+        match message_type {
+            0 => offset = offset.checked_add(8)?,
+            2..=5 => offset = offset.checked_add(4)?,
+            _ => return None,
+        }
+        let cod = read_u32(mail, &mut offset)?;
+        offset = offset.checked_add(4 + 4)?; // compatibility field and stationery
+        let money = read_u32(mail, &mut offset)?;
+        offset = offset.checked_add(4 + 4 + 4)?; // checked flags, expiry, template
+        for _ in 0..2 {
+            let terminator = mail.get(offset..)?.iter().position(|byte| *byte == 0)?;
+            offset = offset.checked_add(terminator + 1)?;
+        }
+        let attachment_count = usize::from(*mail.get(offset)?);
+        offset += 1;
+        if attachment_count > MAX_ATTACHMENTS {
+            return None;
+        }
+        let mut attachments = std::collections::BTreeMap::new();
+        for _ in 0..attachment_count {
+            offset = offset.checked_add(1)?; // attachment slot
+            let low_guid = read_u32(mail, &mut offset)?;
+            let item_id = read_u32(mail, &mut offset)?;
+            offset = offset.checked_add(ATTACHMENT_ENCHANT_BYTES + 4 + 4)?;
+            let item_count = u32::from(*mail.get(offset)?);
+            offset += 1;
+            offset = offset.checked_add(4 + 4 + 4 + 1)?;
+            if low_guid != 0 && item_id != 0 && item_count != 0 {
+                attachments.insert(
+                    low_guid,
+                    wow_state::inventory::MailAttachment {
+                        item_id,
+                        count: item_count,
+                    },
+                );
+            }
+        }
+        if offset > mail.len() || mail_id == 0 {
+            return None;
+        }
+        mails.insert(
+            mail_id,
+            wow_state::inventory::MailEntry {
+                mail_id,
+                money: u64::from(money),
+                cod_copper: Some(u64::from(cod)),
+                attachments,
+            },
+        );
+    }
+    Some(ProtocolObservation::Mailbox(
+        wow_state::inventory::MailboxState {
+            generation: 0,
+            authoritative: true,
+            mails,
+        },
+    ))
 }
 
 fn parse_trainer_list(body: &[u8]) -> Option<ProtocolObservation> {

@@ -88,6 +88,28 @@ fn validate_command(
     validate_economy_command(snapshot, command)
 }
 
+fn has_unique_nearby_trusted_mailbox(snapshot: &Snapshot, mailbox: EntityId) -> bool {
+    let Some(player) = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player)
+    else {
+        return false;
+    };
+    let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+    let mut matches = snapshot.state.entities.0.values().filter(|entity| {
+        entity.kind == wow_state::entities::EntityKind::GameObject
+            && entity.interactable
+            && catalog
+                .gameobject_name(entity.entry)
+                .is_some_and(|name| name.to_ascii_lowercase().contains("mailbox"))
+            && entity.position.is_some_and(|position| {
+                position.map == player.map && position.point.distance(player.point) <= 5.0
+            })
+    });
+    matches.next().is_some_and(|entity| entity.id == mailbox) && matches.next().is_none()
+}
+
 fn validate_spatial_command(
     snapshot: &Snapshot,
     command: &GameplayCommand,
@@ -763,14 +785,64 @@ fn validate_economy_command(
                 ));
             }
         }
+        GameplayCommand::MailboxList { mailbox } => {
+            if !has_unique_nearby_trusted_mailbox(snapshot, *mailbox) {
+                return Err(reject(
+                    "mailbox_not_available",
+                    "mailbox is not a trusted observed object in interaction range",
+                    true,
+                ));
+            }
+        }
         GameplayCommand::MailTake {
             mailbox_generation,
+            mailbox,
             mail_id,
+            target,
         } => {
             if snapshot.state.inventory.mailbox.generation != *mailbox_generation
-                || !snapshot.state.inventory.mailbox.mails.contains_key(mail_id)
+                || !snapshot.state.inventory.mailbox.authoritative
             {
                 return Err(reject("stale_mail", "mailbox contents changed", true));
+            }
+            if !has_unique_nearby_trusted_mailbox(snapshot, *mailbox) {
+                return Err(reject(
+                    "mailbox_not_available",
+                    "mailbox is not a trusted observed object in interaction range",
+                    true,
+                ));
+            }
+            let Some(mail) = snapshot.state.inventory.mailbox.mails.get(mail_id) else {
+                return Err(reject("stale_mail", "mail is no longer present", true));
+            };
+            if mail.cod_copper != Some(0) {
+                return Err(reject(
+                    "mail_cod_unknown_or_present",
+                    "mail COD status is not authoritatively zero",
+                    false,
+                ));
+            }
+            match target {
+                MailTakeTarget::Money if mail.money == 0 => {
+                    return Err(reject(
+                        "mail_money_missing",
+                        "mail has no attached money",
+                        true,
+                    ));
+                }
+                MailTakeTarget::Attachment { low_guid } => {
+                    if snapshot.state.inventory.free_slots == 0 {
+                        return Err(reject("mail_no_bag_space", "no free backpack slot", true));
+                    }
+                    if !mail.attachments.contains_key(low_guid) {
+                        return Err(reject(
+                            "mail_attachment_missing",
+                            "mail attachment is no longer present",
+                            true,
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
         _ => {}
@@ -880,6 +952,7 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
         | GameplayCommand::MailTake { .. } => {
             PermissionSet::ECONOMY | PermissionSet::ASSET_TRANSFER
         }
+        GameplayCommand::MailboxList { .. } => PermissionSet::ECONOMY,
         GameplayCommand::Chat { .. } => PermissionSet::CHAT,
         GameplayCommand::Raw { .. } => PermissionSet::SERVER_COMMAND,
         GameplayCommand::Interact(_)
@@ -903,6 +976,8 @@ fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
             | GameplayCommand::VendorBuy { .. }
             | GameplayCommand::TrainerList { .. }
             | GameplayCommand::TrainerBuy { .. }
+            | GameplayCommand::MailboxList { .. }
+            | GameplayCommand::MailTake { .. }
             | GameplayCommand::PetAttack { .. }
     ) && !matches!(origin, PlanOrigin::SystemPolicy | PlanOrigin::Operator)
     {
@@ -931,6 +1006,7 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::VendorBuy { .. }
                 | GameplayCommand::TrainerList { .. }
                 | GameplayCommand::TrainerBuy { .. }
+                | GameplayCommand::MailboxList { .. }
                 | GameplayCommand::QueryItem { .. }
         ),
         ActivationStage::Move => matches!(
@@ -950,6 +1026,7 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::VendorBuy { .. }
                 | GameplayCommand::TrainerList { .. }
                 | GameplayCommand::TrainerBuy { .. }
+                | GameplayCommand::MailboxList { .. }
                 | GameplayCommand::QueryItem { .. }
                 | GameplayCommand::MoveTo(_)
                 | GameplayCommand::FaceDirection { .. }
@@ -1043,6 +1120,51 @@ mod tests {
         Snapshot::from_state(&state)
     }
 
+    fn mailbox_snapshot(cod: Option<u64>, free_slots: u16) -> Snapshot {
+        use wow_state::inventory::{MailAttachment, MailEntry};
+
+        let mut state = AuthoritativeState::default();
+        state.revision = StateRevision(7);
+        state.session.in_world = true;
+        state.position.player = Some(WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.inventory.free_slots = free_slots;
+        state.inventory.mailbox.generation = 8;
+        state.inventory.mailbox.authoritative = true;
+        state.inventory.mailbox.mails.insert(
+            77,
+            MailEntry {
+                mail_id: 77,
+                money: 12_345,
+                cod_copper: cod,
+                attachments: [(
+                    9001,
+                    MailAttachment {
+                        item_id: 4306,
+                        count: 4,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        state.entities.0.insert(
+            EntityId(99),
+            EntityState {
+                id: EntityId(99),
+                entry: 32349,
+                kind: EntityKind::GameObject,
+                position: state.position.player,
+                interactable: true,
+                ..EntityState::default()
+            },
+        );
+        Snapshot::from_state(&state)
+    }
+
     #[test]
     fn stale_state_is_rejected_before_sendable_creation() {
         let mut stamp = base_stamp();
@@ -1092,6 +1214,146 @@ mod tests {
         assert!(
             matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "unknown_spell")
         );
+    }
+
+    #[test]
+    fn mail_collection_requires_known_non_cod_and_current_contents() {
+        let mailbox = EntityId(99);
+        let money_action = GameplayCommand::MailTake {
+            mailbox_generation: 8,
+            mailbox,
+            mail_id: 77,
+            target: MailTakeTarget::Money,
+        };
+        let safe = mailbox_snapshot(Some(0), 1);
+        assert!(validate_command(&safe, &money_action).is_ok());
+
+        for cod in [None, Some(1)] {
+            assert!(matches!(
+                validate_command(&mailbox_snapshot(cod, 1), &money_action),
+                Err(ValidationOutcome::Rejected(ActionFailure {
+                    code,
+                    ..
+                })) if code == "mail_cod_unknown_or_present"
+            ));
+        }
+
+        let attachment_action = GameplayCommand::MailTake {
+            mailbox_generation: 8,
+            mailbox,
+            mail_id: 77,
+            target: MailTakeTarget::Attachment { low_guid: 9001 },
+        };
+        assert!(validate_command(&safe, &attachment_action).is_ok());
+        assert!(matches!(
+            validate_command(&mailbox_snapshot(Some(0), 0), &attachment_action),
+            Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
+                if code == "mail_no_bag_space"
+        ));
+
+        let stale = GameplayCommand::MailTake {
+            mailbox_generation: 7,
+            mailbox,
+            mail_id: 77,
+            target: MailTakeTarget::Money,
+        };
+        assert!(matches!(
+            validate_command(&safe, &stale),
+            Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
+                if code == "stale_mail"
+        ));
+    }
+
+    #[test]
+    fn mail_collection_requires_the_unique_trusted_mailbox_in_range() {
+        let mailbox = EntityId(99);
+        let action = GameplayCommand::MailTake {
+            mailbox_generation: 8,
+            mailbox,
+            mail_id: 77,
+            target: MailTakeTarget::Money,
+        };
+        let mut far = mailbox_snapshot(Some(0), 1);
+        far.state
+            .entities
+            .0
+            .get_mut(&mailbox)
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap()
+            .point
+            .x = 6.0;
+        assert!(matches!(
+            validate_command(&far, &action),
+            Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
+                if code == "mailbox_not_available"
+        ));
+        let mut untrusted = mailbox_snapshot(Some(0), 1);
+        untrusted.state.entities.0.get_mut(&mailbox).unwrap().entry = 123;
+        assert!(matches!(
+            validate_command(&untrusted, &action),
+            Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
+                if code == "mailbox_not_available"
+        ));
+        let mut ambiguous = mailbox_snapshot(Some(0), 1);
+        ambiguous.state.entities.0.insert(
+            EntityId(100),
+            EntityState {
+                id: EntityId(100),
+                entry: 32349,
+                kind: EntityKind::GameObject,
+                position: ambiguous.state.position.player,
+                interactable: true,
+                ..EntityState::default()
+            },
+        );
+        assert!(matches!(
+            validate_command(&ambiguous, &action),
+            Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
+                if code == "mailbox_not_available"
+        ));
+    }
+
+    #[test]
+    fn mail_take_requires_the_asset_transfer_permission() {
+        let snapshot = mailbox_snapshot(Some(0), 1);
+        let action = ProposedAction {
+            id: ActionId(30),
+            task: TaskId(30),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: base_stamp(),
+            command: GameplayCommand::MailTake {
+                mailbox_generation: 8,
+                mailbox: EntityId(99),
+                mail_id: 77,
+                target: MailTakeTarget::Money,
+            },
+        };
+        let restricted = ActionValidator::validate(
+            &snapshot,
+            ValidationContext {
+                current: base_stamp(),
+                stage: ActivationStage::Act,
+                permissions: PermissionSet::ECONOMY,
+            },
+            action.clone(),
+        );
+        assert!(matches!(
+            restricted,
+            ValidationOutcome::Rejected(ActionFailure { code, .. })
+                if code == "permission_denied"
+        ));
+        let allowed = ActionValidator::validate(
+            &snapshot,
+            ValidationContext {
+                current: base_stamp(),
+                stage: ActivationStage::Act,
+                permissions: PermissionSet::ECONOMY | PermissionSet::ASSET_TRANSFER,
+            },
+            action,
+        );
+        assert!(matches!(allowed, ValidationOutcome::Sendable(_)));
     }
 
     #[test]

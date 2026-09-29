@@ -9,7 +9,7 @@ pub fn current<'a>(
     intent: MailIntent,
 ) -> Option<&'a wow_state::inventory::MailEntry> {
     let m = &state.state.inventory.mailbox;
-    (m.generation == intent.mailbox_generation)
+    (m.authoritative && m.generation == intent.mailbox_generation)
         .then(|| m.mails.get(&intent.mail_id))
         .flatten()
 }

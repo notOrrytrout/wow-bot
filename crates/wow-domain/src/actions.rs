@@ -152,9 +152,14 @@ pub enum GameplayCommand {
         listing_id: u64,
         max_buyout: u64,
     },
+    MailboxList {
+        mailbox: EntityId,
+    },
     MailTake {
         mailbox_generation: u64,
+        mailbox: EntityId,
         mail_id: u32,
+        target: MailTakeTarget,
     },
     EnterVehicle(EntityId),
     VehicleCast {
@@ -169,6 +174,12 @@ pub enum GameplayCommand {
         opcode: u32,
         body: Vec<u8>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MailTakeTarget {
+    Money,
+    Attachment { low_guid: u32 },
 }
 
 impl PlanOrigin {

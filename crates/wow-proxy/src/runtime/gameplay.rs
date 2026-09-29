@@ -472,6 +472,9 @@ pub(super) fn encode_gameplay_command(
     const CMSG_REPAIR_ITEM: u32 = 0x02A8;
     const CMSG_TRAINER_LIST: u32 = 0x01B0;
     const CMSG_TRAINER_BUY_SPELL: u32 = 0x01B2;
+    const CMSG_GET_MAIL_LIST: u32 = 0x023A;
+    const CMSG_MAIL_TAKE_MONEY: u32 = 0x0245;
+    const CMSG_MAIL_TAKE_ITEM: u32 = 0x0246;
     match command {
         GameplayCommand::Raw { opcode, body } => Ok(Some((ClientFrame { opcode, body }, None))),
         GameplayCommand::QueryQuestGivers => Ok(Some((
@@ -571,6 +574,31 @@ pub(super) fn encode_gameplay_command(
                 },
                 None,
             )))
+        }
+        GameplayCommand::MailboxList { mailbox } => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_GET_MAIL_LIST,
+                body: mailbox.0.to_le_bytes().to_vec(),
+            },
+            None,
+        ))),
+        GameplayCommand::MailTake {
+            mailbox,
+            mail_id,
+            target,
+            ..
+        } => {
+            let mut body = Vec::with_capacity(16);
+            body.extend_from_slice(&mailbox.0.to_le_bytes());
+            body.extend_from_slice(&mail_id.to_le_bytes());
+            let opcode = match target {
+                wow_domain::MailTakeTarget::Money => CMSG_MAIL_TAKE_MONEY,
+                wow_domain::MailTakeTarget::Attachment { low_guid } => {
+                    body.extend_from_slice(&low_guid.to_le_bytes());
+                    CMSG_MAIL_TAKE_ITEM
+                }
+            };
+            Ok(Some((ClientFrame { opcode, body }, None)))
         }
         GameplayCommand::Interact(entity) => Ok(Some((
             ClientFrame {
@@ -1456,6 +1484,60 @@ mod movement_clock_tests {
         assert_eq!(&packet.body[..8], &vendor.0.to_le_bytes());
         assert_eq!(&packet.body[8..16], &0_u64.to_le_bytes());
         assert_eq!(packet.body[16], 0);
+    }
+
+    #[test]
+    fn mailbox_actions_match_wrath_packet_layouts() {
+        let mailbox = EntityId(0x1122_3344_5566_7788);
+        let mut clock = MovementClock::default();
+        let (list, _) = encode_gameplay_command(
+            GameplayCommand::MailboxList { mailbox },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(list.opcode, 0x023A);
+        assert_eq!(list.body, mailbox.0.to_le_bytes());
+
+        let (money, _) = encode_gameplay_command(
+            GameplayCommand::MailTake {
+                mailbox_generation: 4,
+                mailbox,
+                mail_id: 77,
+                target: wow_domain::MailTakeTarget::Money,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(money.opcode, 0x0245);
+        assert_eq!(&money.body[..8], &mailbox.0.to_le_bytes());
+        assert_eq!(&money.body[8..], &77_u32.to_le_bytes());
+
+        let (item, _) = encode_gameplay_command(
+            GameplayCommand::MailTake {
+                mailbox_generation: 4,
+                mailbox,
+                mail_id: 77,
+                target: wow_domain::MailTakeTarget::Attachment { low_guid: 9001 },
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(item.opcode, 0x0246);
+        assert_eq!(&item.body[..8], &mailbox.0.to_le_bytes());
+        assert_eq!(&item.body[8..12], &77_u32.to_le_bytes());
+        assert_eq!(&item.body[12..], &9001_u32.to_le_bytes());
     }
 
     #[test]

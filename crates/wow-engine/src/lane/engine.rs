@@ -82,6 +82,26 @@ fn repair_detour_should_continue(
         && wow_policy::maintenance::equipment_needs_repair(condition)
 }
 
+fn trusted_mailbox(snapshot: &Snapshot) -> Option<EntityId> {
+    let position = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player)?;
+    let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+    let mut matches = snapshot.state.entities.0.values().filter(|entity| {
+        entity.kind == wow_state::entities::EntityKind::GameObject
+            && entity.interactable
+            && catalog
+                .gameobject_name(entity.entry)
+                .is_some_and(|name| name.to_ascii_lowercase().contains("mailbox"))
+            && entity.position.is_some_and(|target| {
+                target.map == position.map && target.point.distance(position.point) <= 5.0
+            })
+    });
+    let mailbox = matches.next()?.id;
+    matches.next().is_none().then_some(mailbox)
+}
+
 fn nearby_sell_vendor(snapshot: &Snapshot) -> Option<EntityId> {
     let position = snapshot
         .state
@@ -249,6 +269,8 @@ const CLASS_TRAINER_DETOUR_RADIUS_YARDS: f32 = 30.0;
 const CLASS_TRAINER_MEMORY_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const CLASS_TRAINER_TRAVEL_RETRY: Duration = Duration::from_secs(5 * 60);
 const CLASS_TRAINER_MONEY_RESERVE_COPPER: u64 = 1_000;
+const MAILBOX_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
+const MAILBOX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const QUEST_OFFER_PRIORITY_RADIUS_YARDS: f32 = 40.0;
 
 fn recovery_vendor_buy_pending_done(
@@ -262,6 +284,15 @@ fn recovery_vendor_buy_pending_done(
 
 fn combat_potion_lockout_ready(lockout_until: Option<Instant>, now: Instant) -> bool {
     lockout_until.is_none_or(|deadline| deadline <= now)
+}
+
+fn waiting_for_mail_observation(
+    pending_generation: u64,
+    current_generation: u64,
+    deadline: Instant,
+    now: Instant,
+) -> bool {
+    pending_generation == current_generation && deadline > now
 }
 
 #[derive(Clone, Debug)]
@@ -385,6 +416,10 @@ pub struct LaneEngine {
     last_player_level: Option<u32>,
     class_training_due: bool,
     class_trainer_travel_retry_after: Option<Instant>,
+    mailbox_list_pending: Option<(EntityId, u64, Instant)>,
+    mailbox_source: Option<EntityId>,
+    mail_action_pending: Option<(u64, Instant)>,
+    mail_retry_after: Option<Instant>,
     last_maintenance_tick: Option<Instant>,
     last_maintenance_status: Option<String>,
     post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
@@ -465,6 +500,10 @@ impl LaneEngine {
             last_player_level: None,
             class_training_due: false,
             class_trainer_travel_retry_after: None,
+            mailbox_list_pending: None,
+            mailbox_source: None,
+            mail_action_pending: None,
+            mail_retry_after: None,
             last_maintenance_tick: None,
             last_maintenance_status: None,
             post_combat_loot: None,
@@ -1342,6 +1381,9 @@ impl LaneEngine {
             if let Some(result) = self.tick_maintenance().await {
                 return result;
             }
+            if let Some(result) = self.tick_mailbox(&snapshot).await {
+                return result;
+            }
             if let Some(result) = self.tick_class_trainer_travel(&snapshot) {
                 return result;
             }
@@ -2104,6 +2146,86 @@ impl LaneEngine {
             "class training selected a recent observed trainer for a short same-map detour"
         );
         Some(true)
+    }
+
+    async fn tick_mailbox(&mut self, snapshot: &Snapshot) -> Option<bool> {
+        let now = Instant::now();
+        let generation = snapshot.state.inventory.mailbox.generation;
+        if let Some((pending_generation, deadline)) = self.mail_action_pending {
+            if !waiting_for_mail_observation(pending_generation, generation, deadline, now) {
+                if generation == pending_generation {
+                    self.mail_action_pending = None;
+                    self.mail_retry_after = Some(now + MAILBOX_RETRY_DELAY);
+                    return None;
+                }
+                self.mail_action_pending = None;
+                self.mail_retry_after = None;
+            } else {
+                self.waiting(
+                    "waiting for authoritative mailbox update after mail collection".into(),
+                );
+                return Some(true);
+            }
+        }
+        if self.mail_retry_after.is_some_and(|deadline| deadline > now) {
+            return None;
+        }
+        let mailbox = trusted_mailbox(snapshot)?;
+        if let Some((requested_mailbox, request_generation, deadline)) = self.mailbox_list_pending {
+            if !waiting_for_mail_observation(request_generation, generation, deadline, now) {
+                if generation == request_generation {
+                    self.mailbox_list_pending = None;
+                    self.mail_retry_after = Some(now + MAILBOX_RETRY_DELAY);
+                    return None;
+                }
+                self.mailbox_source = Some(requested_mailbox);
+                self.mailbox_list_pending = None;
+            } else {
+                self.waiting("waiting for authoritative mailbox contents".into());
+                return Some(true);
+            }
+        }
+        if !snapshot.state.inventory.mailbox.authoritative || self.mailbox_source != Some(mailbox) {
+            self.mailbox_list_pending = Some((mailbox, generation, now + MAILBOX_ACTION_TIMEOUT));
+            return Some(
+                self.propose_command(GameplayCommand::MailboxList { mailbox }, false)
+                    .await,
+            );
+        }
+        for mail in snapshot.state.inventory.mailbox.mails.values() {
+            if mail.cod_copper != Some(0) {
+                continue;
+            }
+            let target = if mail.money > 0 {
+                Some(MailTakeTarget::Money)
+            } else {
+                mail.attachments
+                    .keys()
+                    .next()
+                    .copied()
+                    .map(|low_guid| MailTakeTarget::Attachment { low_guid })
+            };
+            let Some(target) = target else { continue };
+            if matches!(target, MailTakeTarget::Attachment { .. })
+                && snapshot.state.inventory.free_slots == 0
+            {
+                continue;
+            }
+            self.mail_action_pending = Some((generation, now + MAILBOX_ACTION_TIMEOUT));
+            return Some(
+                self.propose_command(
+                    GameplayCommand::MailTake {
+                        mailbox,
+                        mailbox_generation: generation,
+                        mail_id: mail.mail_id,
+                        target,
+                    },
+                    false,
+                )
+                .await,
+            );
+        }
+        None
     }
 
     async fn tick_maintenance(&mut self) -> Option<bool> {
@@ -6068,6 +6190,15 @@ mod tests {
         assert!(combat_potion_lockout_ready(Some(lockout), lockout));
         assert!(combat_potion_lockout_ready(None, now));
         assert_eq!(COMBAT_POTION_FALLBACK_LOCKOUT, Duration::from_secs(3_600));
+    }
+
+    #[test]
+    fn mail_action_wait_suppresses_duplicates_until_state_changes_or_timeout() {
+        let now = Instant::now();
+        let deadline = now + MAILBOX_ACTION_TIMEOUT;
+        assert!(waiting_for_mail_observation(9, 9, deadline, now));
+        assert!(!waiting_for_mail_observation(9, 10, deadline, now));
+        assert!(!waiting_for_mail_observation(9, 9, deadline, deadline));
     }
     use crate::activity::ActivityArbiter;
 

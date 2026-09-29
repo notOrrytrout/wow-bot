@@ -400,7 +400,10 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::Mailbox(mailbox) => {
+            let generation = state.inventory.mailbox.generation.saturating_add(1);
             state.inventory.mailbox = mailbox;
+            state.inventory.mailbox.generation = generation;
+            state.inventory.mailbox.authoritative = true;
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::QuestGiverStatus { giver, status } => {
@@ -784,6 +787,35 @@ mod tests {
             state.quests.offers.get(&43).map(|offer| offer.giver),
             Some(EntityId(7))
         );
+    }
+
+    #[test]
+    fn mailbox_observations_advance_generation_and_keep_cod_evidence() {
+        let mut state = AuthoritativeState::default();
+        let mut mails = BTreeMap::new();
+        mails.insert(
+            77,
+            crate::inventory::MailEntry {
+                mail_id: 77,
+                money: 123,
+                cod_copper: Some(0),
+                attachments: BTreeMap::new(),
+            },
+        );
+        let observed = || {
+            ProtocolObservation::Mailbox(crate::inventory::MailboxState {
+                generation: 0,
+                authoritative: true,
+                mails: mails.clone(),
+            })
+        };
+        reduce(&mut state, observed());
+        assert_eq!(state.inventory.mailbox.generation, 1);
+        assert!(state.inventory.mailbox.authoritative);
+        assert_eq!(state.inventory.mailbox.mails[&77].cod_copper, Some(0));
+
+        reduce(&mut state, observed());
+        assert_eq!(state.inventory.mailbox.generation, 2);
     }
 
     #[test]
