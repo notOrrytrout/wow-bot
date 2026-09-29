@@ -41,6 +41,107 @@ pub const REPAIR_DURABILITY_THRESHOLD_PERCENT: u8 = 25;
 pub const QUEST_OFFER_PRIORITY_RADIUS_YARDS: f32 = 40.0;
 const ETERNAL_WATER_GLYPH_SPELL: u32 = 70_937;
 const MAGE_WATER_ELEMENTAL_SPELL: u32 = 31_687;
+const PLAYER_RECOVERY_HEALTH_TRIGGER_PERCENT: u32 = 55;
+const PLAYER_RECOVERY_MANA_TRIGGER_PERCENT: u32 = 35;
+const PLAYER_RECOVERY_HEALTH_TARGET_PERCENT: u32 = 90;
+const PLAYER_RECOVERY_MANA_TARGET_PERCENT: u32 = 85;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlayerRecoveryKind {
+    Food,
+    Drink,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerRecoveryItem {
+    pub kind: PlayerRecoveryKind,
+    pub item: u32,
+    pub item_guid: EntityId,
+    pub backpack_slot: u8,
+    pub spell: u32,
+    pub player: EntityId,
+}
+
+/// Select food or drink only when authoritative player and inventory state prove a need.
+/// Food has priority when both resources are low, matching the old recovery policy.
+pub fn select_player_recovery_item(snapshot: &Snapshot) -> Option<PlayerRecoveryItem> {
+    let player = EntityId(snapshot.state.session.character_guid?);
+    if !snapshot.state.session.in_world
+        || !snapshot.state.inventory.instances_authoritative
+        || !snapshot.state.auras.by_entity.contains_key(&player)
+        || snapshot.state.control.mover.is_some()
+        || snapshot.state.position.moving
+        || snapshot.state.transport.attached == Some(true)
+    {
+        return None;
+    }
+    let player_entity = snapshot.state.entities.0.get(&player)?;
+    if player_entity.is_dead() || player_entity.in_combat() != Some(false) {
+        return None;
+    }
+    let (health, max_health) = player_entity.health.filter(|(_, maximum)| *maximum > 0)?;
+    let health_low = u64::from(health).saturating_mul(100) / u64::from(max_health)
+        <= u64::from(PLAYER_RECOVERY_HEALTH_TRIGGER_PERCENT);
+    let mana = if player_entity.power_type == Some(0) {
+        player_entity.power.filter(|(_, maximum)| *maximum > 0)
+    } else {
+        None
+    };
+    let mana_low = mana.is_some_and(|(current, maximum)| {
+        u64::from(current).saturating_mul(100) / u64::from(maximum)
+            <= u64::from(PLAYER_RECOVERY_MANA_TRIGGER_PERCENT)
+    });
+    if !health_low && !mana_low {
+        return None;
+    }
+    let class_id = snapshot.state.capabilities.class_id?;
+    let level = player_entity.level?;
+    let wanted = if health_low {
+        PlayerRecoveryKind::Food
+    } else {
+        PlayerRecoveryKind::Drink
+    };
+    snapshot
+        .state
+        .inventory
+        .instances
+        .values()
+        .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+        .filter_map(|instance| {
+            let metadata = snapshot.state.inventory.item_metadata.get(&instance.item)?;
+            if !recovery_supply_item_is_eligible(metadata, class_id, level) {
+                return None;
+            }
+            let kinds = recovery_kinds(metadata);
+            let matches = match wanted {
+                PlayerRecoveryKind::Food => kinds.food,
+                PlayerRecoveryKind::Drink => kinds.drink,
+            };
+            (matches && metadata.use_spell_id != 0).then_some(PlayerRecoveryItem {
+                kind: wanted,
+                item: instance.item,
+                item_guid: instance.guid,
+                backpack_slot: instance.backpack_slot,
+                spell: metadata.use_spell_id,
+                player,
+            })
+        })
+        .min_by_key(|item| (item.backpack_slot, item.item_guid))
+}
+
+/// Return the old recovery completion threshold for this resource.
+pub fn player_recovery_target_reached(
+    kind: PlayerRecoveryKind,
+    current: u32,
+    maximum: u32,
+) -> bool {
+    maximum > 0
+        && u64::from(current).saturating_mul(100) / u64::from(maximum)
+            >= u64::from(match kind {
+                PlayerRecoveryKind::Food => PLAYER_RECOVERY_HEALTH_TARGET_PERCENT,
+                PlayerRecoveryKind::Drink => PLAYER_RECOVERY_MANA_TARGET_PERCENT,
+            })
+}
 
 pub fn equipment_needs_repair(condition: wow_state::inventory::EquipmentCondition) -> bool {
     condition.observed
@@ -2164,6 +2265,135 @@ fn party_member_nearby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn player_recovery_state(health: (u32, u32), mana: Option<(u32, u32)>) -> AuthoritativeState {
+        let player = EntityId(7);
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(player.0);
+        state.capabilities.class_id = Some(1);
+        state.auras.by_entity.insert(player, BTreeMap::new());
+        state.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                health: Some(health),
+                power: mana,
+                power_type: mana.map(|_| 0),
+                level: Some(10),
+                unit_flags: Some(0),
+                ..Default::default()
+            },
+        );
+        state.inventory.instances_authoritative = true;
+        for (item, name, spell, slot) in [
+            (201, "Conjured Food", 301, 24),
+            (202, "Conjured Water", 302, 25),
+        ] {
+            state.inventory.instances.insert(
+                EntityId(item.into()),
+                wow_state::inventory::InventoryItemInstance {
+                    item,
+                    guid: EntityId(item.into()),
+                    backpack_slot: slot,
+                    count: 1,
+                },
+            );
+            state.inventory.item_metadata.insert(
+                item,
+                wow_state::inventory::ItemTemplateMetadata {
+                    name: name.into(),
+                    item_class: 0,
+                    subclass: 5,
+                    allowable_class: 0,
+                    required_level: 1,
+                    use_spell_id: spell,
+                    ..Default::default()
+                },
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn player_recovery_uses_low_health_food_before_low_mana_drink() {
+        let state = player_recovery_state((50, 100), Some((20, 100)));
+        let selected = select_player_recovery_item(&Snapshot::from_state(&state)).unwrap();
+        assert_eq!(selected.kind, PlayerRecoveryKind::Food);
+        assert_eq!((selected.item, selected.spell), (201, 301));
+    }
+
+    #[test]
+    fn player_recovery_selects_drink_only_for_authoritative_low_mana() {
+        let state = player_recovery_state((100, 100), Some((30, 100)));
+        let selected = select_player_recovery_item(&Snapshot::from_state(&state)).unwrap();
+        assert_eq!(selected.kind, PlayerRecoveryKind::Drink);
+        assert_eq!((selected.item, selected.spell), (202, 302));
+    }
+
+    #[test]
+    fn player_recovery_requires_authoritative_safe_state_and_usable_item_data() {
+        let mut state = player_recovery_state((50, 100), Some((20, 100)));
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(select_player_recovery_item(&snapshot).unwrap().item, 201);
+
+        state.position.moving = true;
+        assert!(select_player_recovery_item(&Snapshot::from_state(&state)).is_none());
+        state.position.moving = false;
+        state.control.mover = Some(EntityId(9));
+        assert!(select_player_recovery_item(&Snapshot::from_state(&state)).is_none());
+        state.control.mover = None;
+        state.transport.attached = Some(true);
+        assert!(select_player_recovery_item(&Snapshot::from_state(&state)).is_none());
+        state.transport.attached = Some(false);
+        state.entities.0.get_mut(&EntityId(7)).unwrap().unit_flags = None;
+        assert!(select_player_recovery_item(&Snapshot::from_state(&state)).is_none());
+        state.entities.0.get_mut(&EntityId(7)).unwrap().unit_flags = Some(0);
+        state
+            .inventory
+            .item_metadata
+            .get_mut(&201)
+            .unwrap()
+            .allowable_class = 1 << 1;
+        assert!(select_player_recovery_item(&Snapshot::from_state(&state)).is_none());
+        let food = state.inventory.item_metadata.get_mut(&201).unwrap();
+        food.allowable_class = 0;
+        food.required_level = 11;
+        assert!(select_player_recovery_item(&Snapshot::from_state(&state)).is_none());
+        state
+            .inventory
+            .item_metadata
+            .get_mut(&201)
+            .unwrap()
+            .required_level = 1;
+        state.inventory.item_metadata.remove(&201);
+        assert!(select_player_recovery_item(&Snapshot::from_state(&state)).is_none());
+        state.inventory.instances_authoritative = false;
+        assert!(select_player_recovery_item(&Snapshot::from_state(&state)).is_none());
+    }
+
+    #[test]
+    fn player_recovery_target_uses_old_food_and_drink_completion_gates() {
+        assert!(!player_recovery_target_reached(
+            PlayerRecoveryKind::Food,
+            89,
+            100
+        ));
+        assert!(player_recovery_target_reached(
+            PlayerRecoveryKind::Food,
+            90,
+            100
+        ));
+        assert!(!player_recovery_target_reached(
+            PlayerRecoveryKind::Drink,
+            84,
+            100
+        ));
+        assert!(player_recovery_target_reached(
+            PlayerRecoveryKind::Drink,
+            85,
+            100
+        ));
+    }
 
     #[test]
     fn profession_trainer_flag_requires_both_trainer_and_profession_bits() {

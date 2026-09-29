@@ -452,6 +452,20 @@ const TRAVEL_FORM_SPELL_IDS: [u32; 2] = [783, 2645];
 const DISMOUNT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const DISMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DISMOUNT_ATTEMPTS: u8 = 5;
+const PLAYER_RECOVERY_MAX: Duration = Duration::from_secs(32);
+const PLAYER_RECOVERY_STALL: Duration = Duration::from_secs(6);
+const PLAYER_RECOVERY_START_GRACE: Duration = Duration::from_secs(2);
+const PLAYER_RECOVERY_RETRY: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug)]
+struct ActivePlayerRecovery {
+    selection: wow_policy::maintenance::PlayerRecoveryItem,
+    started_at: Instant,
+    deadline: Instant,
+    last_progress_at: Instant,
+    last_resource: u32,
+    aura_seen: bool,
+}
 
 pub struct LaneEngine {
     pub state: LaneState,
@@ -506,6 +520,7 @@ pub struct LaneEngine {
     behind_retry_after: BTreeMap<(u32, EntityId), Instant>,
     behind_retry_cast_allowed: BTreeSet<(u32, EntityId)>,
     maintenance_retry_after: BTreeMap<(u32, EntityId), Instant>,
+    active_player_recovery: Option<ActivePlayerRecovery>,
     combat_potion_lockout_until: Option<Instant>,
     combat_healthstone_retry_until: Option<Instant>,
     combat_emergency_health_item_retry_until: Option<Instant>,
@@ -600,6 +615,7 @@ impl LaneEngine {
             behind_retry_after: BTreeMap::new(),
             behind_retry_cast_allowed: BTreeSet::new(),
             maintenance_retry_after: BTreeMap::new(),
+            active_player_recovery: None,
             combat_potion_lockout_until: None,
             combat_healthstone_retry_until: None,
             combat_emergency_health_item_retry_until: None,
@@ -1614,10 +1630,14 @@ impl LaneEngine {
         }
         if life_status.requires_recovery() {
             self.pending_dismount = None;
+            self.active_player_recovery = None;
             return self.tick_death_recovery().await;
         }
         self.corpse_reclaim_attempts = 0;
         let snapshot = Snapshot::from_state(&self.state.authoritative);
+        if self.tick_active_player_recovery(&snapshot, Instant::now()) {
+            return true;
+        }
         if let Some(attacker) = wow_policy::combat::engagement::survival_attacker(&snapshot) {
             if self
                 .pending_dismount
@@ -2462,6 +2482,95 @@ impl LaneEngine {
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
     }
 
+    fn tick_active_player_recovery(&mut self, snapshot: &Snapshot, now: Instant) -> bool {
+        let Some(mut active) = self.active_player_recovery.take() else {
+            return false;
+        };
+        let player_state = snapshot.state.entities.0.get(&active.selection.player);
+        let current_resource = player_state.and_then(|player| match active.selection.kind {
+            wow_policy::maintenance::PlayerRecoveryKind::Food => {
+                player.health.map(|(current, _)| current)
+            }
+            wow_policy::maintenance::PlayerRecoveryKind::Drink => {
+                player.power.map(|(current, _)| current)
+            }
+        });
+        let unsafe_state = !snapshot.state.session.in_world
+            || snapshot.state.control.mover.is_some()
+            || snapshot.state.position.moving
+            || snapshot.state.transport.attached == Some(true)
+            || self.pending_movement.is_some()
+            || player_state
+                .is_none_or(|player| player.is_dead() || player.in_combat() != Some(false));
+        if unsafe_state {
+            self.maintenance_retry_after.insert(
+                (active.selection.spell, active.selection.player),
+                now + PLAYER_RECOVERY_RETRY,
+            );
+            self.last_maintenance_status = Some("player_recovery_preempted".into());
+            tracing::info!(lane=?self.state.lane, kind=?active.selection.kind, reason="combat, control, or movement", "player food or drink recovery released its lane lease");
+            return false;
+        }
+
+        let Some(current_resource) = current_resource else {
+            self.maintenance_retry_after.insert(
+                (active.selection.spell, active.selection.player),
+                now + PLAYER_RECOVERY_RETRY,
+            );
+            return false;
+        };
+        let maximum = player_state
+            .and_then(|player| match active.selection.kind {
+                wow_policy::maintenance::PlayerRecoveryKind::Food => player.health,
+                wow_policy::maintenance::PlayerRecoveryKind::Drink => player.power,
+            })
+            .map(|(_, maximum)| maximum)
+            .unwrap_or_default();
+        let aura_present = snapshot
+            .state
+            .auras
+            .by_entity
+            .get(&active.selection.player)
+            .is_some_and(|auras| {
+                auras
+                    .values()
+                    .any(|aura| aura.spell == active.selection.spell)
+            });
+        active.aura_seen |= aura_present;
+        if wow_policy::maintenance::player_recovery_target_reached(
+            active.selection.kind,
+            current_resource,
+            maximum,
+        ) {
+            self.maintenance_retry_after
+                .remove(&(active.selection.spell, active.selection.player));
+            self.last_maintenance_status = Some("player_recovery_complete".into());
+            tracing::info!(lane=?self.state.lane, kind=?active.selection.kind, "authoritative health or mana reached the player recovery target");
+            return false;
+        }
+
+        if current_resource > active.last_resource {
+            active.last_resource = current_resource;
+            active.last_progress_at = now;
+        }
+        let aura_stopped = active.aura_seen && !aura_present;
+        let stalled = now.saturating_duration_since(active.started_at)
+            >= PLAYER_RECOVERY_START_GRACE
+            && now.saturating_duration_since(active.last_progress_at) >= PLAYER_RECOVERY_STALL;
+        if aura_stopped || now >= active.deadline || stalled {
+            self.maintenance_retry_after.insert(
+                (active.selection.spell, active.selection.player),
+                now + PLAYER_RECOVERY_RETRY,
+            );
+            self.last_maintenance_status = Some("player_recovery_retry_wait".into());
+            tracing::info!(lane=?self.state.lane, kind=?active.selection.kind, aura_stopped, stalled, timed_out=now >= active.deadline, "player food or drink recovery stopped before its target; retry delayed");
+            return false;
+        }
+
+        self.active_player_recovery = Some(active);
+        true
+    }
+
     fn class_trainer_travel_allowed(&self, snapshot: &Snapshot) -> bool {
         if !self.class_training_due
             || self.state.authoritative.group.lifecycle != wow_state::group::GroupLifecycle::Solo
@@ -2975,6 +3084,59 @@ impl LaneEngine {
         self.maintenance_retry_after
             .retain(|_, deadline| *deadline > now);
         let snapshot = Snapshot::from_state(&self.state.authoritative);
+        if let Some(selection) = wow_policy::maintenance::select_player_recovery_item(&snapshot)
+            && !self
+                .maintenance_retry_after
+                .get(&(selection.spell, selection.player))
+                .is_some_and(|deadline| *deadline > now)
+        {
+            let resource = snapshot
+                .state
+                .entities
+                .0
+                .get(&selection.player)
+                .and_then(|player| match selection.kind {
+                    wow_policy::maintenance::PlayerRecoveryKind::Food => player.health,
+                    wow_policy::maintenance::PlayerRecoveryKind::Drink => player.power,
+                });
+            if let Some((current, maximum)) = resource {
+                let status = format!(
+                    "player_recovery:{:?}:{}:{}",
+                    selection.kind, selection.item, selection.spell
+                );
+                self.last_maintenance_status = Some(status);
+                let started_at = now;
+                let sent = self
+                    .propose_command(
+                        GameplayCommand::UseItemInstance {
+                            item: selection.item,
+                            item_guid: selection.item_guid,
+                            backpack_slot: selection.backpack_slot,
+                            spell: selection.spell,
+                            target: Some(selection.player),
+                            cast_count: 0,
+                        },
+                        false,
+                    )
+                    .await;
+                if sent {
+                    self.active_player_recovery = Some(ActivePlayerRecovery {
+                        selection: selection.clone(),
+                        started_at,
+                        deadline: started_at + PLAYER_RECOVERY_MAX,
+                        last_progress_at: started_at,
+                        last_resource: current,
+                        aura_seen: false,
+                    });
+                    self.maintenance_retry_after.insert(
+                        (selection.spell, selection.player),
+                        started_at + PLAYER_RECOVERY_RETRY,
+                    );
+                    tracing::info!(lane=?self.state.lane, kind=?selection.kind, item=selection.item, spell=selection.spell, current, maximum, "player recovery selected authoritative food or drink instance");
+                }
+                return Some(sent);
+            }
+        }
         if let Some(result) = self.tick_bank_deposit(&snapshot, now).await {
             return Some(result);
         }
@@ -6820,6 +6982,7 @@ impl LaneEngine {
         self.behind_retry_after.clear();
         self.behind_retry_cast_allowed.clear();
         self.maintenance_retry_after.clear();
+        self.active_player_recovery = None;
         self.recovery_vendor_buy_pending = None;
         self.repair_pending = None;
         self.repair_retry_after = None;
@@ -7086,6 +7249,214 @@ fn is_quest_search_work(movement: &PendingMovement) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn low_health_recovery_state() -> wow_state::AuthoritativeState {
+        let player = EntityId(1);
+        let mut state = wow_state::AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(player.0);
+        state.capabilities.class_id = Some(1);
+        state.auras.by_entity.insert(player, Default::default());
+        state.inventory.instances_authoritative = true;
+        state.inventory.instances.insert(
+            EntityId(2),
+            wow_state::inventory::InventoryItemInstance {
+                item: 100,
+                guid: EntityId(2),
+                backpack_slot: 23,
+                count: 1,
+            },
+        );
+        state.inventory.item_metadata.insert(
+            100,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Conjured Bread".into(),
+                item_class: 0,
+                subclass: 5,
+                use_spell_id: 200,
+                allowable_class: 0,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                id: player,
+                kind: wow_state::entities::EntityKind::Player,
+                health: Some((50, 100)),
+                level: Some(10),
+                unit_flags: Some(0),
+                ..Default::default()
+            },
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn player_recovery_dispatches_shared_item_command_and_waits_for_server_progress() {
+        let mut engine = test_engine(Mission::quest(MissionId(1)), low_health_recovery_state()).0;
+        let (proxy_tx, mut proxy) = mpsc::channel(4);
+        engine.proxy = proxy_tx;
+
+        assert!(engine.tick_maintenance().await.unwrap());
+        let WorkerToProxy::Action(action) = proxy.try_recv().expect("recovery item action") else {
+            panic!("expected a typed item action")
+        };
+        assert_eq!(
+            action.command(),
+            &GameplayCommand::UseItemInstance {
+                item: 100,
+                item_guid: EntityId(2),
+                backpack_slot: 23,
+                spell: 200,
+                target: Some(EntityId(1)),
+                cast_count: 0,
+            }
+        );
+        assert!(engine.active_player_recovery.is_some());
+
+        engine
+            .state
+            .authoritative
+            .auras
+            .by_entity
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .insert(
+                0,
+                wow_state::auras::AuraInstance {
+                    slot: 0,
+                    spell: 200,
+                    positive: Some(true),
+                    caster: Some(EntityId(1)),
+                    max_duration_ms: None,
+                    remaining_ms: None,
+                    observed_at_ms: None,
+                },
+            );
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert!(engine.tick_active_player_recovery(&snapshot, Instant::now()));
+        assert!(engine.active_player_recovery.as_ref().unwrap().aura_seen);
+
+        engine
+            .state
+            .authoritative
+            .entities
+            .0
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .health = Some((80, 100));
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert!(engine.tick_active_player_recovery(&snapshot, Instant::now()));
+        assert!(engine.active_player_recovery.is_some());
+
+        engine
+            .state
+            .authoritative
+            .entities
+            .0
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .health = Some((90, 100));
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert!(!engine.tick_active_player_recovery(&snapshot, Instant::now()));
+        assert!(engine.active_player_recovery.is_none());
+    }
+
+    #[tokio::test]
+    async fn player_recovery_uses_authoritative_drink_for_low_mana() {
+        let mut state = low_health_recovery_state();
+        let player = state.entities.0.get_mut(&EntityId(1)).unwrap();
+        player.health = Some((100, 100));
+        player.power = Some((20, 100));
+        player.power_type = Some(0);
+        state.inventory.instances.clear();
+        state.inventory.item_metadata.clear();
+        state.inventory.instances.insert(
+            EntityId(3),
+            wow_state::inventory::InventoryItemInstance {
+                item: 101,
+                guid: EntityId(3),
+                backpack_slot: 24,
+                count: 1,
+            },
+        );
+        state.inventory.item_metadata.insert(
+            101,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Conjured Water".into(),
+                item_class: 0,
+                subclass: 5,
+                use_spell_id: 201,
+                allowable_class: 0,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(1)), state);
+
+        assert!(engine.tick_maintenance().await.unwrap());
+        let WorkerToProxy::Action(action) = proxy.try_recv().expect("drink item action") else {
+            panic!("expected a typed drink action")
+        };
+        assert_eq!(
+            action.command(),
+            &GameplayCommand::UseItemInstance {
+                item: 101,
+                item_guid: EntityId(3),
+                backpack_slot: 24,
+                spell: 201,
+                target: Some(EntityId(1)),
+                cast_count: 0,
+            }
+        );
+        assert_eq!(
+            engine
+                .active_player_recovery
+                .as_ref()
+                .unwrap()
+                .selection
+                .kind,
+            wow_policy::maintenance::PlayerRecoveryKind::Drink
+        );
+    }
+
+    #[test]
+    fn combat_preempts_player_recovery_and_arms_bounded_retry() {
+        let mut engine = test_engine(Mission::quest(MissionId(1)), low_health_recovery_state()).0;
+        let now = Instant::now();
+        let selection = wow_policy::maintenance::select_player_recovery_item(
+            &Snapshot::from_state(&engine.state.authoritative),
+        )
+        .unwrap();
+        engine.active_player_recovery = Some(ActivePlayerRecovery {
+            selection: selection.clone(),
+            started_at: now,
+            deadline: now + PLAYER_RECOVERY_MAX,
+            last_progress_at: now,
+            last_resource: 50,
+            aura_seen: false,
+        });
+        engine
+            .state
+            .authoritative
+            .entities
+            .0
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .unit_flags = Some(0x0008_0000);
+
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        assert!(!engine.tick_active_player_recovery(&snapshot, now));
+        assert!(engine.active_player_recovery.is_none());
+        assert_eq!(
+            engine
+                .maintenance_retry_after
+                .get(&(selection.spell, selection.player)),
+            Some(&(now + PLAYER_RECOVERY_RETRY))
+        );
+    }
 
     #[test]
     fn recovery_vendor_purchase_wait_is_bounded_and_tracks_inventory_changes() {
