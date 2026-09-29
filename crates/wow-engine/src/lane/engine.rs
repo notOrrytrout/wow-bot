@@ -262,6 +262,8 @@ const MOVEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const QUEST_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RECOVERY_VENDOR_BUY_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 const COMBAT_POTION_FALLBACK_LOCKOUT: Duration = Duration::from_secs(60 * 60);
+const COMBAT_HEALTHSTONE_RETRY: Duration = Duration::from_secs(5);
+const COMBAT_EMERGENCY_HEALTH_ITEM_RETRY: Duration = Duration::from_secs(30);
 const MOVEMENT_STEP_EARLY_TOLERANCE: Duration = Duration::from_millis(10);
 const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
@@ -293,6 +295,45 @@ fn waiting_for_mail_observation(
     now: Instant,
 ) -> bool {
     pending_generation == current_generation && deadline > now
+}
+
+fn combat_item_retry_ready(retry_until: Option<Instant>, now: Instant) -> bool {
+    retry_until.is_none_or(|deadline| deadline <= now)
+}
+
+fn combat_item_use_authorized(snapshot: &Snapshot, target: EntityId, recovery: bool) -> bool {
+    let Some(player) = snapshot.state.session.character_guid.map(EntityId) else {
+        return false;
+    };
+    recovery
+        || snapshot
+            .state
+            .entities
+            .0
+            .get(&player)
+            .and_then(wow_state::entities::EntityState::in_combat)
+            == Some(true)
+        || snapshot
+            .state
+            .entities
+            .0
+            .get(&target)
+            .and_then(wow_state::entities::EntityState::in_combat)
+            == Some(true)
+}
+
+fn combat_item_command(
+    selection: wow_policy::combat::consumables::CombatItemUse,
+    player: EntityId,
+) -> GameplayCommand {
+    GameplayCommand::UseItemInstance {
+        item: selection.item,
+        item_guid: selection.instance.guid,
+        backpack_slot: selection.instance.backpack_slot,
+        spell: selection.spell,
+        target: Some(player),
+        cast_count: 0,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -408,6 +449,8 @@ pub struct LaneEngine {
     behind_retry_cast_allowed: BTreeSet<(u32, EntityId)>,
     maintenance_retry_after: BTreeMap<(u32, EntityId), Instant>,
     combat_potion_lockout_until: Option<Instant>,
+    combat_healthstone_retry_until: Option<Instant>,
+    combat_emergency_health_item_retry_until: Option<Instant>,
     recovery_vendor_buy_pending: Option<(u32, u32, Instant)>,
     repair_pending: Option<(wow_state::inventory::EquipmentCondition, Instant)>,
     repair_retry_after: Option<Instant>,
@@ -492,6 +535,8 @@ impl LaneEngine {
             behind_retry_cast_allowed: BTreeSet::new(),
             maintenance_retry_after: BTreeMap::new(),
             combat_potion_lockout_until: None,
+            combat_healthstone_retry_until: None,
+            combat_emergency_health_item_retry_until: None,
             recovery_vendor_buy_pending: None,
             repair_pending: None,
             repair_retry_after: None,
@@ -5041,16 +5086,31 @@ impl LaneEngine {
 
     async fn dispatch_combat_target(&mut self, target: EntityId, recovery: bool) -> bool {
         let snapshot = Snapshot::from_state(&self.state.authoritative);
+        if let Some(command) = self.select_combat_healthstone(&snapshot, target, recovery) {
+            tracing::info!(lane=?self.state.lane, ?target, ?command, "emergency healthstone selected");
+            let proposed = self.propose_combat_item(command, recovery).await;
+            if proposed {
+                self.combat_healthstone_retry_until =
+                    Some(Instant::now() + COMBAT_HEALTHSTONE_RETRY);
+            }
+            return proposed;
+        }
         if let Some(command) = self.select_combat_potion(&snapshot, target, recovery) {
             tracing::info!(lane=?self.state.lane, ?target, ?command, "critical combat potion selected");
-            let proposed = if recovery {
-                self.propose_recovery(command).await
-            } else {
-                self.propose_command(command, false).await
-            };
+            let proposed = self.propose_combat_item(command, recovery).await;
             if proposed {
                 self.combat_potion_lockout_until =
                     Some(Instant::now() + COMBAT_POTION_FALLBACK_LOCKOUT);
+            }
+            return proposed;
+        }
+        if let Some(command) = self.select_combat_emergency_health_item(&snapshot, target, recovery)
+        {
+            tracing::info!(lane=?self.state.lane, ?target, ?command, "emergency health item selected");
+            let proposed = self.propose_combat_item(command, recovery).await;
+            if proposed {
+                self.combat_emergency_health_item_retry_until =
+                    Some(Instant::now() + COMBAT_EMERGENCY_HEALTH_ITEM_RETRY);
             }
             return proposed;
         }
@@ -5083,6 +5143,59 @@ impl LaneEngine {
             )
             .await
         }
+    }
+
+    async fn propose_combat_item(&mut self, command: GameplayCommand, recovery: bool) -> bool {
+        if recovery {
+            self.propose_recovery(command).await
+        } else {
+            self.propose_command(command, false).await
+        }
+    }
+
+    fn select_combat_healthstone(
+        &self,
+        snapshot: &Snapshot,
+        target: EntityId,
+        recovery: bool,
+    ) -> Option<GameplayCommand> {
+        if !combat_item_use_authorized(snapshot, target, recovery)
+            || !combat_item_retry_ready(self.combat_healthstone_retry_until, Instant::now())
+        {
+            return None;
+        }
+        let selection =
+            wow_policy::combat::consumables::select_emergency_healthstone(snapshot, target)?;
+        Some(combat_item_command(
+            selection,
+            EntityId(snapshot.state.session.character_guid?),
+        ))
+    }
+
+    fn select_combat_emergency_health_item(
+        &self,
+        snapshot: &Snapshot,
+        target: EntityId,
+        recovery: bool,
+    ) -> Option<GameplayCommand> {
+        if !combat_item_use_authorized(snapshot, target, recovery)
+            || !combat_item_retry_ready(
+                self.combat_emergency_health_item_retry_until,
+                Instant::now(),
+            )
+        {
+            return None;
+        }
+        let self_heal_available = wow_policy::combat::selector::has_legal_self_heal(snapshot);
+        let selection = wow_policy::combat::consumables::select_emergency_health_item(
+            snapshot,
+            target,
+            self_heal_available,
+        )?;
+        Some(combat_item_command(
+            selection,
+            EntityId(snapshot.state.session.character_guid?),
+        ))
     }
 
     fn select_combat_potion(
@@ -5152,14 +5265,7 @@ impl LaneEngine {
             Some((if healer { 20 } else { 15 }, active_mana_work)),
             shared_lockout_ready,
         )?;
-        Some(GameplayCommand::UseItemInstance {
-            item: selection.item,
-            item_guid: selection.instance.guid,
-            backpack_slot: selection.instance.backpack_slot,
-            spell: selection.spell,
-            target: Some(player),
-            cast_count: 0,
-        })
+        Some(combat_item_command(selection, player))
     }
 
     fn combat_pending(&self, target: EntityId, cycle: Duration) -> PendingQuestAction {
@@ -6199,6 +6305,26 @@ mod tests {
         assert!(waiting_for_mail_observation(9, 9, deadline, now));
         assert!(!waiting_for_mail_observation(9, 10, deadline, now));
         assert!(!waiting_for_mail_observation(9, 9, deadline, deadline));
+    }
+
+    #[test]
+    fn survival_item_retry_windows_are_independent_of_the_potion_lockout() {
+        let now = Instant::now();
+        assert_eq!(COMBAT_HEALTHSTONE_RETRY, Duration::from_secs(5));
+        assert_eq!(COMBAT_EMERGENCY_HEALTH_ITEM_RETRY, Duration::from_secs(30));
+        assert!(!combat_item_retry_ready(
+            Some(now + COMBAT_HEALTHSTONE_RETRY),
+            now
+        ));
+        assert!(combat_item_retry_ready(
+            Some(now + COMBAT_HEALTHSTONE_RETRY),
+            now + COMBAT_HEALTHSTONE_RETRY
+        ));
+        assert!(combat_potion_lockout_ready(None, now));
+        assert!(!combat_potion_lockout_ready(
+            Some(now + COMBAT_POTION_FALLBACK_LOCKOUT),
+            now
+        ));
     }
     use crate::activity::ActivityArbiter;
 
@@ -8087,6 +8213,55 @@ mod tests {
         };
         assert_eq!(survival_action.command(), quest_action.command());
         assert_eq!(survival_action.origin(), PlanOrigin::Recovery);
+    }
+
+    #[tokio::test]
+    async fn emergency_non_potion_health_items_ignore_potion_lockout() {
+        let target = EntityId(9);
+        let (mut engine, _) = combat_engine();
+        engine
+            .state
+            .authoritative
+            .entities
+            .0
+            .get_mut(&EntityId(1))
+            .unwrap()
+            .health = Some((15, 100));
+        engine.state.authoritative.inventory.instances.insert(
+            EntityId(11),
+            wow_state::inventory::InventoryItemInstance {
+                item: 101,
+                guid: EntityId(11),
+                backpack_slot: 23,
+                count: 1,
+            },
+        );
+        engine.state.authoritative.inventory.item_metadata.insert(
+            101,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Whipper Root Tuber".into(),
+                item_class: 0,
+                use_spell_id: 900,
+                ..Default::default()
+            },
+        );
+        engine.combat_potion_lockout_until = Some(Instant::now() + COMBAT_POTION_FALLBACK_LOCKOUT);
+
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+        let command = engine
+            .select_combat_emergency_health_item(&snapshot, target, true)
+            .expect("non-potion survival items must ignore Potion Sickness fallback lockout");
+        assert_eq!(
+            command,
+            GameplayCommand::UseItemInstance {
+                item: 101,
+                item_guid: EntityId(11),
+                backpack_slot: 23,
+                spell: 900,
+                target: Some(EntityId(1)),
+                cast_count: 0,
+            }
+        );
     }
 
     #[tokio::test]

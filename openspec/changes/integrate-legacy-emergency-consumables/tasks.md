@@ -1,0 +1,5 @@
+- [x] Select emergency healthstones from authoritative backpack instances and templates at 30 percent health.
+- [x] Select Whipper Root Tuber and Night Dragon's Breath at the legacy critical-health gate.
+- [x] Keep five-second healthstone and 30-second non-potion retry windows separate from potion lockout.
+- [x] Add policy and lane regression tests for thresholds, authority, selection priority, and Potion Sickness independence.
+- [x] Update the baseline combat requirements.
