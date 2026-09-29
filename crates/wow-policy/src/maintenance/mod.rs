@@ -38,6 +38,7 @@ pub struct RankedSpell {
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 static GLYPHS: OnceLock<BTreeMap<u16, u32>> = OnceLock::new();
 pub const REPAIR_DURABILITY_THRESHOLD_PERCENT: u8 = 25;
+pub const QUEST_OFFER_PRIORITY_RADIUS_YARDS: f32 = 40.0;
 const ETERNAL_WATER_GLYPH_SPELL: u32 = 70_937;
 const MAGE_WATER_ELEMENTAL_SPELL: u32 = 31_687;
 
@@ -113,6 +114,14 @@ pub enum MaintenanceDecision {
         item: u32,
         slot: u32,
         lots: u32,
+    },
+    GearVendorList {
+        vendor: EntityId,
+    },
+    GearVendorBuy {
+        vendor: EntityId,
+        item: u32,
+        slot: u32,
     },
     RecoveryVendorBuy {
         vendor: EntityId,
@@ -250,6 +259,11 @@ pub fn decide_next_with_nearby_services(
         return pet_decision;
     }
     if let Some(decision) = gear_upgrade(snapshot, player, retry_after, now) {
+        return decision;
+    }
+    if let Some(decision) =
+        gear_vendor_upgrade(snapshot, player, retry_after, now, nearby_sell_vendor)
+    {
         return decision;
     }
     if class_id == 7
@@ -1563,21 +1577,12 @@ fn gear_upgrade(
     retry_after: &BTreeMap<(u32, EntityId), Instant>,
     now: Instant,
 ) -> Option<MaintenanceDecision> {
-    use wow_state::inventory::ItemTemplateMetadata;
     let inventory = &snapshot.state.inventory;
     if !inventory.equipment_slots_authoritative {
         return None;
     }
     let level = snapshot.state.entities.0.get(&player)?.level?;
     let class = snapshot.state.capabilities.class_id?;
-    let score = |metadata: &ItemTemplateMetadata| {
-        crate::gear::item_score_with_spec(
-            metadata,
-            class,
-            snapshot.state.capabilities.specialization_tree,
-        )
-    };
-    let mut best: Option<(f32, u32, EntityId, u8)> = None;
     if let Some(destination_slot) =
         (19u8..=22).find(|slot| !inventory.equipped_items.contains_key(slot))
     {
@@ -1603,13 +1608,7 @@ fn gear_upgrade(
             });
         }
     }
-    if inventory
-        .equipped_items
-        .values()
-        .any(|item| *item != 0 && !inventory.item_metadata.contains_key(item))
-    {
-        return None;
-    }
+    let mut best: Option<(f32, u32, EntityId, u8)> = None;
     for instance in inventory
         .instances
         .values()
@@ -1618,12 +1617,119 @@ fn gear_upgrade(
         let Some(metadata) = inventory.item_metadata.get(&instance.item) else {
             continue;
         };
-        if !crate::gear::player_can_use(metadata, class, level as u8) {
+        let Some((slot, delta)) = best_gear_destination(snapshot, player, metadata, 0.01) else {
+            continue;
+        };
+        if retry_after
+            .get(&(instance.item, player))
+            .is_some_and(|deadline| *deadline > now)
+        {
             continue;
         }
-        let slots = crate::gear::destination_slots(metadata);
-        let new_score = score(metadata);
-        for slot in slots {
+        if best.as_ref().is_none_or(|(known, ..)| delta > *known) {
+            best = Some((delta, instance.item, instance.guid, slot));
+        }
+    }
+    best.map(
+        |(_, item, item_guid, destination_slot)| MaintenanceDecision::EquipItem {
+            item,
+            item_guid,
+            destination_slot,
+            player,
+        },
+    )
+}
+
+/// Return true when a nearby quest offer should preempt optional service work.
+pub fn nearby_quest_offer(snapshot: &Snapshot, position: WorldPosition) -> bool {
+    snapshot.state.quests.offers.values().any(|offer| {
+        snapshot
+            .state
+            .entities
+            .0
+            .get(&offer.giver)
+            .and_then(|entity| entity.position)
+            .is_some_and(|giver| {
+                giver.map == position.map
+                    && giver.point.distance(position.point) <= QUEST_OFFER_PRIORITY_RADIUS_YARDS
+            })
+    })
+}
+
+/// Return whether optional gear buying still passes its shared safety gates.
+pub fn vendor_gear_purchase_allowed(snapshot: &Snapshot, player: EntityId) -> bool {
+    let inventory = &snapshot.state.inventory;
+    let Some(position) = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player)
+    else {
+        return false;
+    };
+    inventory.instances_authoritative
+        && inventory.free_slots > 0
+        && inventory.equipment_slots_authoritative
+        && snapshot.state.control.mover.is_none()
+        && !snapshot.state.position.moving
+        && snapshot.state.transport.attached != Some(true)
+        && !snapshot
+            .state
+            .entities
+            .0
+            .get(&player)
+            .and_then(wow_state::entities::EntityState::in_combat)
+            .unwrap_or(false)
+        && !nearby_quest_offer(snapshot, position)
+}
+
+/// Return the best valid equipment destination and score gain for a vendor item.
+pub fn vendor_gear_upgrade_destination(snapshot: &Snapshot, item: u32) -> Option<(u8, f32)> {
+    let player = snapshot.state.session.character_guid.map(EntityId)?;
+    let metadata = snapshot.state.inventory.item_metadata.get(&item)?;
+    best_gear_destination(snapshot, player, metadata, 0.05)
+}
+
+/// Keep vendor gear spending within the legacy percentage cap and lane reserve.
+pub fn vendor_gear_purchase_budget(money_copper: u64) -> u64 {
+    money_copper
+        .saturating_sub(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
+        .min(money_copper.saturating_mul(25) / 100)
+}
+
+fn best_gear_destination(
+    snapshot: &Snapshot,
+    player: EntityId,
+    metadata: &wow_state::inventory::ItemTemplateMetadata,
+    minimum_fraction: f32,
+) -> Option<(u8, f32)> {
+    let inventory = &snapshot.state.inventory;
+    if !inventory.equipment_slots_authoritative
+        || inventory
+            .equipped_items
+            .values()
+            .any(|item| *item != 0 && !inventory.item_metadata.contains_key(item))
+    {
+        return None;
+    }
+    let class = snapshot.state.capabilities.class_id?;
+    let level = snapshot.state.entities.0.get(&player)?.level?.min(255) as u8;
+    if !crate::gear::player_can_use(metadata, class, level) {
+        return None;
+    }
+    let score = |item: &wow_state::inventory::ItemTemplateMetadata| {
+        crate::gear::item_score_with_spec(
+            item,
+            class,
+            snapshot.state.capabilities.specialization_tree,
+        )
+    };
+    let new_score = score(metadata);
+    if !new_score.is_finite() {
+        return None;
+    }
+    crate::gear::destination_slots(metadata)
+        .iter()
+        .filter_map(|slot| {
             if *slot == 16
                 && inventory
                     .equipped_items
@@ -1631,7 +1737,7 @@ fn gear_upgrade(
                     .and_then(|item| inventory.item_metadata.get(item))
                     .is_some_and(|item| item.inventory_type == 17)
             {
-                continue;
+                return None;
             }
             let mut old_score = inventory
                 .equipped_items
@@ -1648,26 +1754,95 @@ fn gear_upgrade(
                     .unwrap_or(0.0);
             }
             let delta = new_score - old_score;
-            if !crate::gear::score_improves_by_fraction(new_score, old_score, 0.01)
-                || retry_after
-                    .get(&(instance.item, player))
-                    .is_some_and(|deadline| *deadline > now)
-            {
-                continue;
-            }
-            if best.as_ref().is_none_or(|(known, ..)| delta > *known) {
-                best = Some((delta, instance.item, instance.guid, *slot));
-            }
-        }
+            (old_score.is_finite()
+                && crate::gear::score_improves_by_fraction(new_score, old_score, minimum_fraction))
+            .then_some((*slot, delta))
+        })
+        .max_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })
+}
+
+/// Buy an optional gear upgrade only from a current nearby seller and within a small wallet cap.
+fn gear_vendor_upgrade(
+    snapshot: &Snapshot,
+    player: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+    nearby_vendor: Option<EntityId>,
+) -> Option<MaintenanceDecision> {
+    let inventory = &snapshot.state.inventory;
+    let vendor = nearby_vendor?;
+    if !vendor_gear_purchase_allowed(snapshot, player) {
+        return None;
     }
-    best.map(
-        |(_, item, item_guid, destination_slot)| MaintenanceDecision::EquipItem {
-            item,
-            item_guid,
-            destination_slot,
-            player,
-        },
-    )
+    if retry_after
+        .get(&(0, vendor))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    let money = inventory.money;
+    let budget = vendor_gear_purchase_budget(money);
+    if budget == 0 {
+        return None;
+    }
+
+    let offers = inventory
+        .vendor_inventory
+        .as_ref()
+        .filter(|offers| offers.vendor == vendor && inventory.vendor == Some(vendor));
+    let Some(offers) = offers else {
+        return Some(MaintenanceDecision::GearVendorList { vendor });
+    };
+    if let Some(offer) = offers.offers.iter().find(|offer| {
+        offer.extended_cost == 0
+            && offer.buy_count > 0
+            && offer.stock.is_none_or(|stock| stock >= offer.buy_count)
+            && u64::from(offer.price_copper) <= budget
+            && !inventory.item_metadata.contains_key(&offer.item)
+            && !retry_after
+                .get(&(offer.item, EntityId(0)))
+                .is_some_and(|deadline| *deadline > now)
+    }) {
+        return Some(MaintenanceDecision::QueryItem { item: offer.item });
+    }
+
+    if retry_after
+        .get(&(u32::MAX, vendor))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    offers
+        .offers
+        .iter()
+        .filter(|offer| {
+            offer.extended_cost == 0
+                && offer.buy_count > 0
+                && offer.stock.is_none_or(|stock| stock >= offer.buy_count)
+                && u64::from(offer.price_copper) <= budget
+        })
+        .filter_map(|offer| {
+            let (destination_slot, score_delta) =
+                vendor_gear_upgrade_destination(snapshot, offer.item)?;
+            Some((
+                score_delta,
+                offer.price_copper,
+                offer.item,
+                offer.slot,
+                destination_slot,
+            ))
+        })
+        .max_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| right.2.cmp(&left.2))
+        })
+        .map(|(_, _, item, slot, _)| MaintenanceDecision::GearVendorBuy { vendor, item, slot })
 }
 
 /// Restore a hunter's confirmed missing or dead pet before ordinary buffs.
@@ -3499,6 +3674,260 @@ mod tests {
                 item_guid: EntityId(44),
                 destination_slot: 0,
                 player: EntityId(7)
+            })
+        );
+    }
+
+    fn gear_vendor_state() -> (AuthoritativeState, EntityId, WorldPosition) {
+        let vendor = EntityId(55);
+        let position = WorldPosition {
+            map: 1,
+            point: wow_domain::Vec3::new(10.0, 20.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.position.player = Some(position);
+        state.capabilities.class_id = Some(8);
+        state.inventory.instances_authoritative = true;
+        state.inventory.equipment_slots_authoritative = true;
+        state.inventory.free_slots = 2;
+        state.inventory.money = 10_000;
+        state.inventory.vendor = Some(vendor);
+        state.entities.0.insert(
+            EntityId(7),
+            wow_state::entities::EntityState {
+                id: EntityId(7),
+                level: Some(20),
+                ..Default::default()
+            },
+        );
+        (state, vendor, position)
+    }
+
+    fn gear_offer(item: u32, slot: u32, price_copper: u32) -> wow_state::inventory::VendorOffer {
+        wow_state::inventory::VendorOffer {
+            slot,
+            item,
+            stock: Some(1),
+            price_copper,
+            buy_count: 1,
+            extended_cost: 0,
+        }
+    }
+
+    fn gear_metadata(item_level: u32) -> wow_state::inventory::ItemTemplateMetadata {
+        wow_state::inventory::ItemTemplateMetadata {
+            item_class: 4,
+            inventory_type: 1,
+            quality: 1,
+            item_level,
+            required_level: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vendor_gear_lists_queries_and_buys_only_a_bounded_usable_upgrade() {
+        let (mut state, vendor, _) = gear_vendor_state();
+        let now = Instant::now();
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(
+            gear_vendor_upgrade(&snapshot, EntityId(7), &BTreeMap::new(), now, Some(vendor)),
+            Some(MaintenanceDecision::GearVendorList { vendor })
+        );
+
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![gear_offer(100, 3, 500)],
+        });
+        assert_eq!(
+            gear_vendor_upgrade(
+                &Snapshot::from_state(&state),
+                EntityId(7),
+                &BTreeMap::new(),
+                now,
+                Some(vendor)
+            ),
+            Some(MaintenanceDecision::QueryItem { item: 100 })
+        );
+        state.inventory.item_metadata.insert(100, gear_metadata(10));
+        assert_eq!(
+            gear_vendor_upgrade(
+                &Snapshot::from_state(&state),
+                EntityId(7),
+                &BTreeMap::new(),
+                now,
+                Some(vendor)
+            ),
+            Some(MaintenanceDecision::GearVendorBuy {
+                vendor,
+                item: 100,
+                slot: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn vendor_gear_requires_authoritative_free_space_budget_and_safe_offer() {
+        let (mut state, vendor, _) = gear_vendor_state();
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![gear_offer(100, 3, 500)],
+        });
+        state.inventory.item_metadata.insert(100, gear_metadata(10));
+        let now = Instant::now();
+        let decide = |state: &AuthoritativeState| {
+            gear_vendor_upgrade(
+                &Snapshot::from_state(state),
+                EntityId(7),
+                &BTreeMap::new(),
+                now,
+                Some(vendor),
+            )
+        };
+        assert!(matches!(
+            decide(&state),
+            Some(MaintenanceDecision::GearVendorBuy { .. })
+        ));
+
+        state.inventory.free_slots = 0;
+        assert_eq!(decide(&state), None);
+        state.inventory.free_slots = 1;
+        state.inventory.instances_authoritative = false;
+        assert_eq!(decide(&state), None);
+        state.inventory.instances_authoritative = true;
+        state.inventory.money = 1_999;
+        assert_eq!(decide(&state), None);
+        state.inventory.money = 10_000;
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].stock = Some(0);
+        assert_eq!(decide(&state), None);
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].stock = Some(1);
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].extended_cost = 1;
+        assert_eq!(decide(&state), None);
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].extended_cost = 0;
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].price_copper = 2_501;
+        assert_eq!(decide(&state), None);
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].price_copper = 500;
+        state.entities.0.get_mut(&EntityId(7)).unwrap().unit_flags = Some(0x0008_0000);
+        assert_eq!(decide(&state), None);
+        state.entities.0.get_mut(&EntityId(7)).unwrap().unit_flags = Some(0);
+        state.transport.attached = Some(true);
+        assert_eq!(decide(&state), None);
+    }
+
+    #[test]
+    fn vendor_gear_skips_nearby_quest_offers_and_small_upgrades() {
+        let (mut state, vendor, position) = gear_vendor_state();
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![gear_offer(100, 3, 100)],
+        });
+        state.inventory.item_metadata.insert(100, gear_metadata(10));
+        let giver = EntityId(22);
+        state.entities.0.insert(
+            giver,
+            wow_state::entities::EntityState {
+                id: giver,
+                position: Some(WorldPosition {
+                    point: wow_domain::Vec3::new(position.point.x + 39.0, position.point.y, 0.0),
+                    ..position
+                }),
+                ..Default::default()
+            },
+        );
+        state
+            .quests
+            .offers
+            .insert(12, wow_state::quests::QuestOffer { giver, icon: 0 });
+        let decide = |state: &AuthoritativeState| {
+            gear_vendor_upgrade(
+                &Snapshot::from_state(state),
+                EntityId(7),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            )
+        };
+        assert_eq!(decide(&state), None);
+
+        state.quests.offers.clear();
+        state.inventory.item_metadata.insert(
+            101,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 4,
+                inventory_type: 1,
+                quality: 1,
+                item_level: 10,
+                ..Default::default()
+            },
+        );
+        state.inventory.equipped_items.insert(0, 101);
+        state.inventory.item_metadata.insert(
+            101,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 4,
+                inventory_type: 1,
+                quality: 1,
+                item_level: 10,
+                ..Default::default()
+            },
+        );
+        state.inventory.item_metadata.insert(100, gear_metadata(10));
+        // Equal gear score does not reach the required five percent improvement.
+        assert_eq!(decide(&state), None);
+    }
+
+    #[test]
+    fn vendor_gear_ranks_by_gain_then_price_then_item_id() {
+        let (mut state, vendor, _) = gear_vendor_state();
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![
+                gear_offer(102, 1, 200),
+                gear_offer(101, 2, 200),
+                gear_offer(103, 3, 100),
+            ],
+        });
+        state.inventory.item_metadata.insert(102, gear_metadata(10));
+        state.inventory.item_metadata.insert(101, gear_metadata(10));
+        state.inventory.item_metadata.insert(103, gear_metadata(20));
+        let decide = |state: &AuthoritativeState| {
+            gear_vendor_upgrade(
+                &Snapshot::from_state(state),
+                EntityId(7),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            )
+        };
+        assert_eq!(
+            decide(&state),
+            Some(MaintenanceDecision::GearVendorBuy {
+                vendor,
+                item: 103,
+                slot: 3,
+            })
+        );
+
+        state.inventory.item_metadata.insert(103, gear_metadata(10));
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[2].price_copper = 200;
+        assert_eq!(
+            decide(&state),
+            Some(MaintenanceDecision::GearVendorBuy {
+                vendor,
+                item: 101,
+                slot: 2,
+            })
+        );
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].price_copper = 100;
+        assert_eq!(
+            decide(&state),
+            Some(MaintenanceDecision::GearVendorBuy {
+                vendor,
+                item: 102,
+                slot: 1,
             })
         );
     }

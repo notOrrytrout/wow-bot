@@ -673,6 +673,20 @@ fn validate_economy_command(
             });
             let ranged_ammo =
                 wow_policy::maintenance::ranged_ammo_item_is_compatible(snapshot, *item);
+            let vendor_gear = snapshot
+                .state
+                .session
+                .character_guid
+                .map(EntityId)
+                .is_some_and(|player| {
+                    wow_policy::maintenance::vendor_gear_purchase_allowed(snapshot, player)
+                })
+                && u64::from(offer.map_or(0, |offer| offer.price_copper))
+                    <= wow_policy::maintenance::vendor_gear_purchase_budget(
+                        snapshot.state.inventory.money,
+                    )
+                && wow_policy::maintenance::vendor_gear_upgrade_destination(snapshot, *item)
+                    .is_some();
             let trusted_seller = snapshot.state.entities.0.get(vendor).is_some_and(|entity| {
                 let nearby = snapshot
                     .state
@@ -692,7 +706,7 @@ fn validate_economy_command(
                         .any(|service| service.entry_id == entity.entry && service.can_sell)
             });
             if !valid
-                || (!poison && !recovery_supply && !ranged_ammo)
+                || (!poison && !recovery_supply && !ranged_ammo && !vendor_gear)
                 || (poison && snapshot.state.capabilities.class_id != Some(4))
                 || !trusted_seller
             {
@@ -1626,6 +1640,10 @@ mod tests {
         };
         assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_ok());
 
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].item = 6948;
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].item = 6947;
+
         let oversized = GameplayCommand::VendorBuy {
             vendor,
             item: 6947,
@@ -1683,6 +1701,27 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
+
+        state.capabilities.class_id = Some(8);
+        state.inventory.money = 2_000;
+        state.inventory.free_slots = 1;
+        state.inventory.instances_authoritative = true;
+        state.inventory.equipment_slots_authoritative = true;
+        state.inventory.item_metadata.insert(
+            6947,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 4,
+                inventory_type: 1,
+                quality: 1,
+                item_level: 10,
+                allowable_class: 0,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_ok());
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].price_copper = 501;
         assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
     }
 

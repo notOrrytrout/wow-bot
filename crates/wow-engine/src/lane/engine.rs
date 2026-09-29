@@ -192,21 +192,6 @@ fn remembered_class_trainer_destination(
         })
 }
 
-fn nearby_quest_offer(snapshot: &Snapshot, position: WorldPosition) -> bool {
-    snapshot.state.quests.offers.values().any(|offer| {
-        snapshot
-            .state
-            .entities
-            .0
-            .get(&offer.giver)
-            .and_then(|entity| entity.position)
-            .is_some_and(|giver| {
-                giver.map == position.map
-                    && giver.point.distance(position.point) <= QUEST_OFFER_PRIORITY_RADIUS_YARDS
-            })
-    })
-}
-
 struct RoutePlanJob {
     token: crate::movement::ReplanToken,
     stamped: crate::runtime::Stamped<WorldPosition>,
@@ -273,7 +258,6 @@ const CLASS_TRAINER_TRAVEL_RETRY: Duration = Duration::from_secs(5 * 60);
 const CLASS_TRAINER_MONEY_RESERVE_COPPER: u64 = 1_000;
 const MAILBOX_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAILBOX_RETRY_DELAY: Duration = Duration::from_secs(30);
-const QUEST_OFFER_PRIORITY_RADIUS_YARDS: f32 = 40.0;
 
 fn recovery_vendor_buy_pending_done(
     baseline_count: u32,
@@ -2128,7 +2112,7 @@ impl LaneEngine {
             .and_then(|player| snapshot.state.entities.0.get(&player))
             .and_then(wow_state::entities::EntityState::in_combat)
             .unwrap_or(false);
-        !player_in_combat && !nearby_quest_offer(snapshot, position)
+        !player_in_combat && !wow_policy::maintenance::nearby_quest_offer(snapshot, position)
     }
 
     fn tick_class_trainer_travel(&mut self, snapshot: &Snapshot) -> Option<bool> {
@@ -2480,6 +2464,33 @@ impl LaneEngine {
                             item,
                             slot,
                             count: lots,
+                        },
+                        false,
+                    )
+                    .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::GearVendorList { vendor } => {
+                self.last_maintenance_status = Some(format!("gear_vendor_list:{}", vendor.0));
+                self.maintenance_retry_after
+                    .insert((0, vendor), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(GameplayCommand::VendorList { vendor }, false)
+                        .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::GearVendorBuy { vendor, item, slot } => {
+                self.last_maintenance_status =
+                    Some(format!("gear_vendor_buy:{item}:{slot}:{}", vendor.0));
+                self.maintenance_retry_after
+                    .insert((u32::MAX, vendor), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(
+                        GameplayCommand::VendorBuy {
+                            vendor,
+                            item,
+                            slot,
+                            count: wow_domain::MAX_MAINTENANCE_VENDOR_BUY_LOTS,
                         },
                         false,
                     )
