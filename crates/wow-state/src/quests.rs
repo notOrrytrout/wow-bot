@@ -14,10 +14,10 @@ pub struct QuestOffer {
     pub icon: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum QuestTurnInStage {
     RequestItems { can_complete: bool },
-    OfferReward { reward_choices: u32 },
+    OfferReward { reward_items: Vec<u32> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

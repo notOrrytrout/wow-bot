@@ -4,7 +4,7 @@ pub mod loader;
 pub mod validation;
 
 pub use azerothcore::{
-    AzerothCoreCatalog, CatalogProvenance, FishingItem, GatherNode, GeneratorSource,
+    AzerothCoreCatalog, CatalogProvenance, FishingItem, GatherNode, GatheringKind, GeneratorSource,
     HashedSourceFile, KnowledgeEntityKind, QuestActionHintCandidate, QuestCatalogSource,
     QuestItemUseRule, QuestKnowledge, QuestSpellRule, QuestStartLocation, TrainerService,
     VendorKind, VendorService, WorldDataSource, embedded_azerothcore_catalog,

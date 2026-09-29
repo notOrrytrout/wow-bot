@@ -9,6 +9,7 @@ pub enum SpellUnavailableReason {
     WrongClass,
     Cooldown,
     GlobalCooldown,
+    CastInProgress,
     InsufficientPower,
     InsufficientRunes,
     MissingComboPoints,
@@ -90,6 +91,14 @@ fn check_spell_readiness_inner(
         .character_guid
         .map(EntityId)
         .ok_or(SpellUnavailableReason::UnknownState)?;
+    if snapshot
+        .state
+        .active_casts
+        .get(&player_id)
+        .is_some_and(|cast| cast.ends_at_ms == u64::MAX || cast.ends_at_ms > now_ms)
+    {
+        return Err(SpellUnavailableReason::CastInProgress);
+    }
     let player = snapshot
         .state
         .entities
@@ -336,6 +345,10 @@ fn check_reagents(
     spell: &crate::combat::spells::SpellMetadata,
 ) -> Result<(), SpellUnavailableReason> {
     for reagent in &spell.reagents {
+        // Spell.dbc uses nonpositive reagent IDs for empty/sentinel slots.
+        if reagent.item <= 0 {
+            continue;
+        }
         let item = u32::try_from(reagent.item)
             .map_err(|_| SpellUnavailableReason::UnsupportedRequirement)?;
         if !snapshot.state.inventory.has(item, reagent.count) {
@@ -554,6 +567,21 @@ mod tests {
     }
 
     #[test]
+    fn healthstone_readiness_ignores_spell_dbc_empty_reagent_slots() {
+        let mut state = make_state(6202, 9, 0, 100);
+        state.inventory.items.insert(6265, 1);
+        assert!(
+            check_spell_readiness(
+                &Snapshot::from_state(&state),
+                6202,
+                Some(EntityId(1)),
+                u64::MAX,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn costs_cooldowns_and_unknown_required_state_fail_closed() {
         let mut state = make_state(686, 9, 0, 100);
         let mut snapshot = Snapshot::from_state(&state);
@@ -584,6 +612,28 @@ mod tests {
         assert_eq!(
             check_spell_readiness(&snapshot, 686, Some(EntityId(77)), 1),
             Err(SpellUnavailableReason::TargetNotAuthoritative)
+        );
+    }
+
+    #[test]
+    fn readiness_blocks_a_new_spell_while_the_player_is_casting() {
+        let mut state = make_state(686, 9, 0, 100);
+        state.active_casts.insert(
+            EntityId(1),
+            wow_state::ActiveCastState {
+                spell: 172,
+                started_at_ms: 1_000,
+                ends_at_ms: 4_000,
+            },
+        );
+
+        assert_eq!(
+            check_spell_readiness(&Snapshot::from_state(&state), 686, Some(EntityId(9)), 2_000),
+            Err(SpellUnavailableReason::CastInProgress)
+        );
+        assert!(
+            check_spell_readiness(&Snapshot::from_state(&state), 686, Some(EntityId(9)), 4_000)
+                .is_ok()
         );
     }
 

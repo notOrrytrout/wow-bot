@@ -179,6 +179,7 @@ impl ControllerRequest {
 fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) -> bool {
     let target = match command {
         GameplayCommand::Attack(target)
+        | GameplayCommand::PetAttack { target, .. }
         | GameplayCommand::Interact(target)
         | GameplayCommand::UseGameObject(target)
         | GameplayCommand::Loot(target)
@@ -191,12 +192,14 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::CastGameObject { target, .. }
         | GameplayCommand::VendorBuy { vendor: target, .. }
         | GameplayCommand::VendorList { vendor: target }
-        | GameplayCommand::VendorSell { vendor: target, .. } => Some(*target),
+        | GameplayCommand::VendorSell { vendor: target, .. }
+        | GameplayCommand::RepairEquipment { vendor: target } => Some(*target),
         GameplayCommand::Cast {
             target: Some(target),
             ..
         }
         | GameplayCommand::MaintainBuff { target, .. }
+        | GameplayCommand::SummonPet { player: target, .. }
         | GameplayCommand::VehicleCast {
             target: Some(target),
             ..
@@ -206,8 +209,13 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         GameplayCommand::FaceDirection { orientation } => return orientation.is_finite(),
         GameplayCommand::Cast { target: None, .. }
         | GameplayCommand::VehicleCast { target: None, .. }
+        | GameplayCommand::CastOnItem { .. }
         | GameplayCommand::UseItem { .. }
         | GameplayCommand::UseItemInstance { .. }
+        | GameplayCommand::UseItemOnItem { .. }
+        | GameplayCommand::EquipItem { .. }
+        | GameplayCommand::PetSetReaction { .. }
+        | GameplayCommand::PetSetAutocast { .. }
         | GameplayCommand::Fish
         | GameplayCommand::StopMovement
         | GameplayCommand::ReleaseSpirit

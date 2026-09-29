@@ -33,6 +33,25 @@ fn mark_entity_changed(delta: &mut StateDelta, entity: EntityId, sections: &[&st
         .extend(sections.iter().map(|section| (*section).into()));
 }
 
+fn clear_world_transients(state: &mut AuthoritativeState) {
+    state.entities = Default::default();
+    state.auras = Default::default();
+    state.transport = Default::default();
+    state.control = Default::default();
+    state.pet = Default::default();
+    state.active_casts.clear();
+    state.quests.giver_status.clear();
+    state.quests.offers.clear();
+    state.quests.turn_in.clear();
+    state.inventory.current_loot = None;
+    state.inventory.current_loot_owner = None;
+    state.inventory.vendor = None;
+    state.inventory.equipment_condition = Default::default();
+    state.inventory.trade = Default::default();
+    state.inventory.auction = Default::default();
+    state.inventory.mailbox = Default::default();
+}
+
 pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) -> StateDelta {
     let mut delta = StateDelta::default();
     match observation {
@@ -45,10 +64,53 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             character_guid,
             position,
         } => {
+            if state.session.in_world {
+                clear_world_transients(state);
+                delta.changed.extend(
+                    [
+                        "entities",
+                        "auras",
+                        "transport",
+                        "control",
+                        "pet",
+                        "active_casts",
+                        "quests",
+                        "inventory",
+                    ]
+                    .map(str::to_owned),
+                );
+            }
             state.session.in_world = true;
             state.session.character_guid = Some(character_guid);
             state.position.player = position;
             delta.changed.extend(["session".into(), "position".into()]);
+        }
+        ProtocolObservation::WorldChanged {
+            character_guid,
+            position,
+        } => {
+            state.session.in_world = true;
+            state.session.character_guid = Some(character_guid);
+            state.position.player = Some(position);
+            state.position.moving = false;
+            state.position.flags = 0;
+            state.position.client_time = 0;
+            clear_world_transients(state);
+            delta.changed.extend(
+                [
+                    "session",
+                    "position",
+                    "entities",
+                    "auras",
+                    "transport",
+                    "control",
+                    "pet",
+                    "active_casts",
+                    "quests",
+                    "inventory",
+                ]
+                .map(str::to_owned),
+            );
         }
         ProtocolObservation::LeftWorld => {
             let revision = state.revision;
@@ -115,9 +177,15 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 delta.changed.push("transport".into());
             }
         }
-        ProtocolObservation::PetControl { pet } => {
+        ProtocolObservation::PetControl {
+            pet,
+            reaction,
+            abilities,
+        } => {
             state.pet.control_known = true;
             state.pet.guid = pet;
+            state.pet.reaction = reaction;
+            state.pet.abilities = abilities;
             delta.changed.push("pet".into());
         }
         ProtocolObservation::CastFailed { .. } => {}
@@ -214,6 +282,10 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 .collect();
             delta.changed.push("inventory".into());
         }
+        ProtocolObservation::EquipmentCondition(condition) => {
+            state.inventory.equipment_condition = condition;
+            delta.changed.push("inventory".into());
+        }
         ProtocolObservation::InventoryFreeSlots { count } => {
             state.inventory.free_slots = count;
             delta.changed.push("inventory".into());
@@ -223,9 +295,10 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.inventory.equipment_authoritative = true;
             delta.changed.push("inventory".into());
         }
-        ProtocolObservation::EquippedItems { items } => {
+        ProtocolObservation::EquippedItems { items, instances } => {
             state.inventory.equipment_slots_authoritative = items.is_some();
             state.inventory.equipped_items = items.unwrap_or_default();
+            state.inventory.equipped_item_instances = instances.unwrap_or_default();
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::Money { copper } => {
@@ -384,12 +457,15 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             group_count,
             active_group,
             talents,
+            glyph_properties,
         } => {
             let valid = group_count.is_some_and(|count| (1..=2).contains(&count))
                 && active_group.is_some_and(|group| group_count.is_some_and(|count| group < count));
             state.capabilities.talent_group_count = valid.then_some(group_count).flatten();
             state.capabilities.active_talent_group = valid.then_some(active_group).flatten();
             state.capabilities.active_talents = if valid { talents } else { Vec::new() };
+            state.capabilities.active_glyph_properties =
+                if valid { glyph_properties } else { None };
             state.capabilities.specialization_tree = valid
                 .then(|| {
                     crate::talents::active_tree(
@@ -412,6 +488,20 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
         ProtocolObservation::AuraSlot { entity, slot, aura } => {
             let slots = state.auras.by_entity.entry(entity).or_default();
             if let Some(aura) = aura {
+                let aura = if let Some(previous) =
+                    slots.get(&slot).filter(|old| old.spell == aura.spell)
+                {
+                    crate::auras::AuraInstance {
+                        positive: aura.positive.or(previous.positive),
+                        caster: aura.caster.or(previous.caster),
+                        max_duration_ms: aura.max_duration_ms.or(previous.max_duration_ms),
+                        remaining_ms: aura.remaining_ms.or(previous.remaining_ms),
+                        observed_at_ms: aura.observed_at_ms.or(previous.observed_at_ms),
+                        ..aura
+                    }
+                } else {
+                    aura
+                };
                 slots.insert(slot, aura);
             } else {
                 slots.remove(&slot);
@@ -478,19 +568,71 @@ mod tests {
         inventory::InventoryItemInstance,
         quests::{QuestProgress, QuestTurnInDialog, QuestTurnInStage},
     };
+    use std::collections::BTreeMap;
     use wow_domain::{EntityId, Vec3, WorldPosition};
+
+    #[test]
+    fn partial_aura_update_keeps_known_caster_and_server_duration() {
+        let mut state = AuthoritativeState::default();
+        let target = EntityId(22);
+        reduce(
+            &mut state,
+            ProtocolObservation::AuraSlot {
+                entity: target,
+                slot: 1,
+                aura: Some(crate::auras::AuraInstance {
+                    slot: 1,
+                    spell: 172,
+                    positive: Some(false),
+                    caster: Some(EntityId(7)),
+                    max_duration_ms: Some(18_000),
+                    remaining_ms: Some(12_000),
+                    observed_at_ms: Some(100),
+                }),
+            },
+        );
+        reduce(
+            &mut state,
+            ProtocolObservation::AuraSlot {
+                entity: target,
+                slot: 1,
+                aura: Some(crate::auras::AuraInstance {
+                    slot: 1,
+                    spell: 172,
+                    positive: None,
+                    caster: None,
+                    max_duration_ms: None,
+                    remaining_ms: None,
+                    observed_at_ms: None,
+                }),
+            },
+        );
+
+        let aura = &state.auras.by_entity[&target][&1];
+        assert_eq!(aura.caster, Some(EntityId(7)));
+        assert_eq!(aura.remaining_at(1_100), Some(11_000));
+    }
 
     #[test]
     fn authoritative_pet_and_profession_snapshots_keep_unknown_distinct_from_empty() {
         let mut state = AuthoritativeState::default();
         assert_eq!(state.pet.has_active_pet(&state.entities), None);
-        reduce(&mut state, ProtocolObservation::PetControl { pet: None });
+        reduce(
+            &mut state,
+            ProtocolObservation::PetControl {
+                pet: None,
+                reaction: None,
+                abilities: Vec::new(),
+            },
+        );
         assert_eq!(state.pet.has_active_pet(&state.entities), Some(false));
 
         reduce(
             &mut state,
             ProtocolObservation::PetControl {
                 pet: Some(EntityId(10)),
+                reaction: None,
+                abilities: Vec::new(),
             },
         );
         assert_eq!(state.pet.has_active_pet(&state.entities), Some(true));
@@ -577,6 +719,97 @@ mod tests {
             state.quests.offers.get(&43).map(|offer| offer.giver),
             Some(EntityId(7))
         );
+    }
+
+    #[test]
+    fn world_change_clears_old_world_objects_and_keeps_character_progress() {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.position.player = Some(WorldPosition {
+            map: 1,
+            point: Vec3::new(1.0, 2.0, 3.0),
+            orientation: 0.0,
+        });
+        state.entities.0.insert(
+            EntityId(9),
+            EntityState {
+                id: EntityId(9),
+                ..Default::default()
+            },
+        );
+        state
+            .auras
+            .by_entity
+            .insert(EntityId(7), Default::default());
+        state.active_casts.insert(
+            EntityId(7),
+            crate::ActiveCastState {
+                spell: 686,
+                started_at_ms: 1,
+                ends_at_ms: 2,
+            },
+        );
+        state.quests.active.insert(
+            42,
+            QuestProgress {
+                complete: false,
+                objectives: vec![1],
+            },
+        );
+        state.inventory.items.insert(99, 2);
+        state.capabilities.spells.insert(686);
+        state.quests.giver_status.insert(EntityId(9), 1);
+
+        reduce(
+            &mut state,
+            ProtocolObservation::WorldChanged {
+                character_guid: 7,
+                position: WorldPosition {
+                    map: 2,
+                    point: Vec3::new(10.0, 20.0, 30.0),
+                    orientation: 1.0,
+                },
+            },
+        );
+
+        assert_eq!(state.position.player.map(|position| position.map), Some(2));
+        assert!(state.entities.0.is_empty());
+        assert!(state.auras.by_entity.is_empty());
+        assert!(state.active_casts.is_empty());
+        assert!(state.quests.giver_status.is_empty());
+        assert!(state.quests.active.contains_key(&42));
+        assert_eq!(state.inventory.count(99), 2);
+        assert!(state.capabilities.spells.contains(&686));
+    }
+
+    #[test]
+    fn repeated_world_entry_clears_old_session_npcs() {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.entities.0.insert(
+            EntityId(99),
+            EntityState {
+                id: EntityId(99),
+                ..Default::default()
+            },
+        );
+        state.quests.active.insert(42, QuestProgress::default());
+
+        reduce(
+            &mut state,
+            ProtocolObservation::EnteredWorld {
+                character_guid: 7,
+                position: Some(WorldPosition {
+                    map: 2,
+                    point: Vec3::new(10.0, 20.0, 30.0),
+                    orientation: 1.0,
+                }),
+            },
+        );
+
+        assert!(state.entities.0.is_empty());
+        assert!(state.quests.active.contains_key(&42));
     }
 
     #[test]
@@ -708,6 +941,68 @@ mod tests {
         assert_eq!(state.inventory.instances.len(), 2);
         assert_eq!(state.inventory.usable_instance(99), Some(&second));
     }
+
+    #[test]
+    fn equipment_condition_is_authoritative_and_clears_on_world_reset() {
+        let mut state = AuthoritativeState::default();
+        let condition = crate::inventory::EquipmentCondition {
+            observed: true,
+            lowest_durability_percent: Some(0),
+            broken_items: 1,
+        };
+        reduce(
+            &mut state,
+            ProtocolObservation::EquipmentCondition(condition),
+        );
+        assert_eq!(state.inventory.equipment_condition, condition);
+
+        reduce(
+            &mut state,
+            ProtocolObservation::WorldChanged {
+                character_guid: 1,
+                position: WorldPosition {
+                    map: 1,
+                    point: Vec3::new(0.0, 0.0, 0.0),
+                    orientation: 0.0,
+                },
+            },
+        );
+        assert_eq!(
+            state.inventory.equipment_condition,
+            crate::inventory::EquipmentCondition::default()
+        );
+    }
+
+    #[test]
+    fn equipped_item_observation_tracks_guid_and_temporary_enchant_evidence() {
+        let mut state = AuthoritativeState::default();
+        let weapon = crate::inventory::EquippedItemInstance {
+            item: 19019,
+            guid: EntityId(0x1234),
+            temporary_enchanted: Some(false),
+        };
+        reduce(
+            &mut state,
+            ProtocolObservation::EquippedItems {
+                items: Some([(15, 19019)].into_iter().collect()),
+                instances: Some([(15, weapon)].into_iter().collect()),
+            },
+        );
+        assert_eq!(
+            state.inventory.equipped_item_instances.get(&15),
+            Some(&weapon)
+        );
+        assert_eq!(state.inventory.equipped_items.get(&15), Some(&19019));
+
+        reduce(
+            &mut state,
+            ProtocolObservation::EquippedItems {
+                items: Some(BTreeMap::new()),
+                instances: Some(BTreeMap::new()),
+            },
+        );
+        assert!(state.inventory.equipped_item_instances.is_empty());
+    }
     #[test]
     fn removing_entity_clears_dependent_service_state() {
         let mut s = AuthoritativeState::default();
@@ -784,11 +1079,13 @@ mod tests {
                         rank: 3,
                     },
                 ],
+                glyph_properties: Some(vec![871]),
             },
         );
         assert_eq!(state.capabilities.specialization_tree, None);
         reduce(&mut state, ProtocolObservation::PlayerClass { class_id: 8 });
         assert_eq!(state.capabilities.active_talent_group, Some(1));
+        assert_eq!(state.capabilities.active_glyph_properties, Some(vec![871]));
         assert_eq!(state.capabilities.specialization_tree, Some(1));
 
         reduce(
@@ -797,8 +1094,10 @@ mod tests {
                 group_count: None,
                 active_group: None,
                 talents: Vec::new(),
+                glyph_properties: None,
             },
         );
         assert_eq!(state.capabilities.specialization_tree, None);
+        assert_eq!(state.capabilities.active_glyph_properties, None);
     }
 }

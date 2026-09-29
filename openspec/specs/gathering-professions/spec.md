@@ -20,6 +20,18 @@ The system SHALL verify applicable profession capability and known skill require
 - **WHEN** authoritative profession state proves the node requires a higher skill than the bot has
 - **THEN** the node is rejected for gathering
 
+### Requirement: Trusted gathering spawns guide bounded search
+When no matching live node is observed, the system MAY use trusted AzerothCore gathering spawns to guide local search movement. Static spawn data SHALL NOT authorize node interaction or count as gathering progress. Search attempts SHALL use current authoritative profession rank, stay within the active mover's map, and rotate through a bounded set of locations before retrying.
+
+#### Scenario: No matching node is currently visible
+- **WHEN** the active gather mission matches a trusted resource and authoritative profession state meets the node's skill requirement
+- **THEN** the system may travel to a bounded local spawn hint
+- **AND** it waits for a live matching node before sending a gather action
+
+#### Scenario: Profession state or skill is insufficient
+- **WHEN** profession state is unknown or the observed skill is below the node requirement
+- **THEN** the system does not route to or interact with that node
+
 ### Requirement: Authoritative gather completion
 The system SHALL require authoritative interaction and loot outcomes before considering a gather operation complete.
 
@@ -76,4 +88,3 @@ The system SHALL not permanently block ordinary progression solely because optio
 #### Scenario: First Aid trainer is unavailable
 - **WHEN** First Aid is desirable under policy but no valid trainable path is currently available
 - **THEN** ordinary mission progression remains eligible to continue
-

@@ -4,6 +4,7 @@ pub mod combat;
 pub mod dialogue;
 pub mod economy;
 pub mod gathering;
+pub mod gear;
 pub mod group;
 pub mod maintenance;
 pub mod missions;

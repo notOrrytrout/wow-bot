@@ -16,11 +16,58 @@ pub struct InventoryItemInstance {
     pub count: u32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EquippedItemInstance {
+    pub item: u32,
+    pub guid: EntityId,
+    /// None means the item update did not prove whether its temporary enchant is active.
+    #[serde(default)]
+    pub temporary_enchanted: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ItemTemplateMetadata {
+    #[serde(default)]
+    pub name: String,
     pub item_class: u32,
+    #[serde(default)]
+    pub subclass: u32,
     pub quality: u32,
     pub sell_price: u32,
+    #[serde(default)]
+    pub inventory_type: u32,
+    #[serde(default)]
+    pub allowable_class: u32,
+    #[serde(default)]
+    pub item_level: u32,
+    #[serde(default)]
+    pub required_level: u32,
+    #[serde(default)]
+    pub stats: Vec<(i32, i32)>,
+    #[serde(default)]
+    pub armor: u32,
+    #[serde(default)]
+    pub damage_min: f32,
+    #[serde(default)]
+    pub damage_max: f32,
+    #[serde(default)]
+    pub delay_ms: u32,
+    #[serde(default)]
+    pub container_slots: u32,
+    #[serde(default)]
+    pub ammo_type: u32,
+    #[serde(default)]
+    pub use_spell_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EquipmentCondition {
+    #[serde(default)]
+    pub observed: bool,
+    #[serde(default)]
+    pub lowest_durability_percent: Option<u8>,
+    #[serde(default)]
+    pub broken_items: u8,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -70,8 +117,12 @@ pub struct InventoryState {
     pub free_slots: u16,
     pub equipped_ranged_item: Option<u32>,
     pub equipped_items: BTreeMap<u8, u32>,
+    #[serde(default)]
+    pub equipped_item_instances: BTreeMap<u8, EquippedItemInstance>,
     pub equipment_slots_authoritative: bool,
     pub equipment_authoritative: bool,
+    #[serde(default)]
+    pub equipment_condition: EquipmentCondition,
     pub money: u64,
     pub loot_generation: u64,
     pub bot_loot_generation: u64,

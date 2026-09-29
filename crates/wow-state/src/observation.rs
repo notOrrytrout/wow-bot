@@ -16,6 +16,10 @@ pub enum ProtocolObservation {
         character_guid: u64,
         position: Option<WorldPosition>,
     },
+    WorldChanged {
+        character_guid: u64,
+        position: WorldPosition,
+    },
     LeftWorld,
     PlayerPosition {
         position: WorldPosition,
@@ -40,6 +44,10 @@ pub enum ProtocolObservation {
     },
     PetControl {
         pet: Option<EntityId>,
+        #[serde(default)]
+        reaction: Option<u8>,
+        #[serde(default)]
+        abilities: Vec<crate::pets::PetAbilityState>,
     },
     CastFailed {
         spell: u32,
@@ -95,7 +103,10 @@ pub enum ProtocolObservation {
     },
     EquippedItems {
         items: Option<std::collections::BTreeMap<u8, u32>>,
+        #[serde(default)]
+        instances: Option<std::collections::BTreeMap<u8, crate::inventory::EquippedItemInstance>>,
     },
+    EquipmentCondition(crate::inventory::EquipmentCondition),
     Money {
         copper: u64,
     },
@@ -177,6 +188,8 @@ pub enum ProtocolObservation {
         group_count: Option<u8>,
         active_group: Option<u8>,
         talents: Vec<crate::capabilities::TalentRank>,
+        #[serde(default)]
+        glyph_properties: Option<Vec<u16>>,
     },
     AuraSnapshot {
         entity: EntityId,

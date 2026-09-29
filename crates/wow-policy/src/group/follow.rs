@@ -1,7 +1,17 @@
-use wow_domain::{EntityId, Vec3, WorldPosition};
+use wow_domain::{EntityId, GroupRole, Vec3, WorldPosition};
 use wow_state::Snapshot;
 
 pub const GROUP_FOLLOW_STOP_DISTANCE: f32 = 5.0;
+
+/// Use the previous role-specific follow gaps in the new group policy.
+pub fn role_stop_distance(role: GroupRole) -> f32 {
+    match role {
+        GroupRole::Tank => 4.0,
+        GroupRole::Melee => 5.0,
+        GroupRole::Healer => 20.0,
+        GroupRole::Ranged | GroupRole::Support | GroupRole::Auto => 17.0,
+    }
+}
 
 /// Return the current observed position to follow, preferring the group leader.
 /// Positions from another map or absent entity state cannot guide movement.
@@ -33,7 +43,8 @@ pub fn follow_destination(from: WorldPosition, target: WorldPosition, stop: f32)
     }
     let dx = target.point.x - from.point.x;
     let dy = target.point.y - from.point.y;
-    let distance = dx.hypot(dy);
+    let dz = target.point.z - from.point.z;
+    let distance = dx.hypot(dy).hypot(dz);
     if !distance.is_finite() || distance <= stop.max(0.0) || distance == 0.0 {
         return None;
     }
@@ -41,7 +52,7 @@ pub fn follow_destination(from: WorldPosition, target: WorldPosition, stop: f32)
     Some(Vec3::new(
         target.point.x - dx / distance * gap,
         target.point.y - dy / distance * gap,
-        target.point.z,
+        target.point.z - dz / distance * gap,
     ))
 }
 
@@ -102,6 +113,27 @@ mod tests {
             follow_destination(position(1, 0.0, 0.0), position(1, 4.0, 0.0), 5.0),
             None
         );
+    }
+
+    #[test]
+    fn configured_roles_use_the_old_stop_distances() {
+        assert_eq!(role_stop_distance(GroupRole::Tank), 4.0);
+        assert_eq!(role_stop_distance(GroupRole::Melee), 5.0);
+        assert_eq!(role_stop_distance(GroupRole::Healer), 20.0);
+        assert_eq!(role_stop_distance(GroupRole::Ranged), 17.0);
+        assert_eq!(role_stop_distance(GroupRole::Support), 17.0);
+        assert_eq!(role_stop_distance(GroupRole::Auto), 17.0);
+    }
+
+    #[test]
+    fn follow_gap_uses_three_dimensional_distance() {
+        let from = position(1, 0.0, 0.0);
+        let target = WorldPosition {
+            point: Vec3::new(0.0, 0.0, 30.0),
+            ..position(1, 0.0, 0.0)
+        };
+        let destination = follow_destination(from, target, 20.0).unwrap();
+        assert_eq!(destination, Vec3::new(0.0, 0.0, 10.0));
     }
 
     #[test]

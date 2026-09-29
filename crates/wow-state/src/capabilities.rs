@@ -20,6 +20,9 @@ pub struct CapabilityState {
     pub talent_group_count: Option<u8>,
     pub active_talent_group: Option<u8>,
     pub active_talents: Vec<TalentRank>,
+    /// Active GlyphProperties.dbc IDs for the current talent group. `None` means unknown.
+    #[serde(default)]
+    pub active_glyph_properties: Option<Vec<u16>>,
     pub specialization_tree: Option<u8>,
     pub spells: BTreeSet<u32>,
     pub spell_cooldowns: BTreeMap<u32, u64>,

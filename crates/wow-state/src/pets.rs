@@ -2,6 +2,15 @@ use crate::entities::Entities;
 use serde::{Deserialize, Serialize};
 use wow_domain::EntityId;
 
+/// Server-reported pet ability and autocast state from SMSG_PET_SPELLS.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetAbilityState {
+    pub spell: u32,
+    /// `None` means the ability is passive or the server did not report its autocast state.
+    #[serde(default)]
+    pub autocast: Option<bool>,
+}
+
 /// Server-confirmed state for the player's current controllable pet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PetState {
@@ -10,6 +19,12 @@ pub struct PetState {
     pub control_known: bool,
     #[serde(default)]
     pub guid: Option<EntityId>,
+    /// WotLK reaction state: 0 passive, 1 defensive, 2 aggressive.
+    #[serde(default)]
+    pub reaction: Option<u8>,
+    /// Pet spell-bar state. It is authoritative after SMSG_PET_SPELLS.
+    #[serde(default)]
+    pub abilities: Vec<PetAbilityState>,
 }
 
 impl PetState {

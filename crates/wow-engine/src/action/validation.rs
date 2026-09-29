@@ -1,4 +1,5 @@
 use super::spatial;
+use wow_domain::time::Millis;
 use wow_domain::*;
 use wow_state::Snapshot;
 
@@ -106,20 +107,36 @@ fn validate_spatial_command(
                 false,
             ));
         }
-        GameplayCommand::Attack(entity)
-            if !snapshot.state.entities.0.get(entity).is_some_and(|e| {
-                e.hostile
-                    || active_quest_authorizes_attack(snapshot, e.entry)
-                    || wow_policy::combat::engagement::is_attacking_player_or_group(
-                        snapshot, *entity,
-                    )
-            }) =>
-        {
+        GameplayCommand::Attack(entity) if !attack_authorized(snapshot, *entity) => {
             return Err(reject(
                 "combat_authority",
                 "target is not an authoritative hostile, active quest target, or engaged survival attacker",
                 false,
             ));
+        }
+        GameplayCommand::PetAttack { pet, target } => {
+            if snapshot.state.pet.guid != Some(*pet)
+                || snapshot
+                    .state
+                    .entities
+                    .0
+                    .get(pet)
+                    .is_some_and(|entity| entity.is_dead())
+                || !has_entity(snapshot, *target)
+            {
+                return Err(reject(
+                    "stale_pet_attack",
+                    "pet or target state is not authoritative",
+                    true,
+                ));
+            }
+            if !attack_authorized(snapshot, *target) {
+                return Err(reject(
+                    "combat_authority",
+                    "target is not authorized for pet attack",
+                    false,
+                ));
+            }
         }
         GameplayCommand::Interact(entity)
         | GameplayCommand::UseGameObject(entity)
@@ -151,6 +168,46 @@ fn validate_spatial_command(
                 "spell target is not authoritative",
             )?;
         }
+        GameplayCommand::CastOnItem { spell, item_guid } => {
+            if snapshot.state.capabilities.class_id != Some(7)
+                || !snapshot.state.capabilities.spells.contains(spell)
+            {
+                return Err(reject(
+                    "invalid_item_cast",
+                    "item-targeted imbue is not a known Shaman spell",
+                    false,
+                ));
+            }
+            if !snapshot
+                .state
+                .inventory
+                .equipped_item_instances
+                .iter()
+                .any(|(slot, item)| {
+                    matches!(*slot, 15 | 16)
+                        && item.guid == *item_guid
+                        && item.temporary_enchanted == Some(false)
+                })
+            {
+                return Err(reject(
+                    "invalid_item_target",
+                    "target is not an observed unenchanted main-hand or off-hand weapon",
+                    true,
+                ));
+            }
+            if let Err(reason) = wow_policy::combat::readiness::check_spell_readiness(
+                snapshot,
+                *spell,
+                snapshot.state.session.character_guid.map(EntityId),
+                Millis::wall_clock_now().0,
+            ) {
+                return Err(reject(
+                    "spell_unavailable",
+                    &format!("weapon imbue is not ready: {reason:?}"),
+                    true,
+                ));
+            }
+        }
         GameplayCommand::MaintainBuff { spell, target } => {
             if !snapshot.state.capabilities.spells.contains(spell) {
                 return Err(reject(
@@ -167,6 +224,43 @@ fn validate_spatial_command(
                     "unknown_entity",
                     "maintenance target is not authoritative",
                 )?;
+            }
+        }
+        GameplayCommand::SummonPet { spell, player } => {
+            if snapshot.state.capabilities.class_id != Some(9)
+                || !wow_policy::maintenance::is_warlock_persistent_demon_summon(*spell)
+            {
+                return Err(reject(
+                    "invalid_pet_summon",
+                    "pet summon is not an allowed persistent Warlock demon spell",
+                    false,
+                ));
+            }
+            if snapshot.state.session.character_guid != Some(player.0) {
+                return Err(reject(
+                    "invalid_pet_summon_target",
+                    "pet summon correlation target must be the current character",
+                    false,
+                ));
+            }
+            if !snapshot.state.capabilities.spells.contains(spell) {
+                return Err(reject(
+                    "unknown_spell",
+                    "pet summon is not an authoritative known capability",
+                    false,
+                ));
+            }
+            if let Err(reason) = wow_policy::combat::readiness::check_spell_readiness(
+                snapshot,
+                *spell,
+                None,
+                Millis::wall_clock_now().0,
+            ) {
+                return Err(reject(
+                    "spell_unavailable",
+                    &format!("pet summon is not ready: {reason:?}"),
+                    true,
+                ));
             }
         }
         GameplayCommand::Fish if !snapshot.state.capabilities.can_fish => {
@@ -217,6 +311,56 @@ fn validate_spatial_command(
                 "unknown_entity",
                 "item target is not authoritative",
             )?;
+        }
+        GameplayCommand::UseItemOnItem {
+            item,
+            item_guid,
+            backpack_slot,
+            spell,
+            target_item_guid,
+        } => {
+            let matches = snapshot
+                .state
+                .inventory
+                .instances
+                .get(item_guid)
+                .is_some_and(|instance| {
+                    instance.item == *item
+                        && instance.backpack_slot == *backpack_slot
+                        && instance.count > 0
+                });
+            let poison_template = snapshot
+                .state
+                .inventory
+                .item_metadata
+                .get(item)
+                .is_some_and(|metadata| {
+                    metadata.item_class == 0
+                        && metadata.subclass == 6
+                        && metadata.use_spell_id == *spell
+                });
+            let valid_target =
+                snapshot
+                    .state
+                    .inventory
+                    .equipped_item_instances
+                    .iter()
+                    .any(|(slot, equipped)| {
+                        matches!(*slot, 15 | 16)
+                            && equipped.guid == *target_item_guid
+                            && equipped.temporary_enchanted == Some(false)
+                    });
+            if snapshot.state.capabilities.class_id != Some(4)
+                || !matches
+                || !poison_template
+                || !valid_target
+            {
+                return Err(reject(
+                    "invalid_poison_application",
+                    "poison and weapon instances must match authoritative inventory state",
+                    true,
+                ));
+            }
         }
         _ => {}
     }
@@ -278,6 +422,89 @@ fn validate_economy_command(
     command: &GameplayCommand,
 ) -> Result<(), ValidationOutcome> {
     match command {
+        GameplayCommand::EquipItem {
+            item_guid,
+            destination_slot,
+        } => {
+            let Some(instance) = snapshot.state.inventory.instances.get(item_guid) else {
+                return Err(reject(
+                    "stale_equipment",
+                    "equipment or item instance is not authoritative",
+                    true,
+                ));
+            };
+            let Some(metadata) = snapshot.state.inventory.item_metadata.get(&instance.item) else {
+                return Err(reject(
+                    "missing_item_metadata",
+                    "item metadata is not authoritative",
+                    true,
+                ));
+            };
+            let player_level = snapshot
+                .state
+                .session
+                .character_guid
+                .and_then(|guid| snapshot.state.entities.0.get(&EntityId(guid)))
+                .and_then(|player| player.level)
+                .unwrap_or_default()
+                .min(255) as u8;
+            let Some(class) = snapshot.state.capabilities.class_id else {
+                return Err(reject(
+                    "unknown_player_class",
+                    "player class is not authoritative",
+                    true,
+                ));
+            };
+            let bag_candidate = (19..=22).contains(destination_slot)
+                && wow_policy::gear::container_can_equip(metadata, class, player_level);
+            let gear_candidate = wow_policy::gear::player_can_use(metadata, class, player_level)
+                && wow_policy::gear::destination_slots(metadata).contains(destination_slot);
+            if !snapshot.state.inventory.equipment_slots_authoritative
+                || instance.backpack_slot < 23
+                || (!bag_candidate && !gear_candidate)
+            {
+                return Err(reject(
+                    "invalid_equipment_target",
+                    "item cannot equip to the selected authoritative slot",
+                    false,
+                ));
+            }
+        }
+        GameplayCommand::PetSetReaction { pet, reaction } => {
+            if snapshot.state.pet.guid != Some(*pet)
+                || *reaction > 2
+                || snapshot
+                    .state
+                    .entities
+                    .0
+                    .get(pet)
+                    .is_some_and(|entity| entity.is_dead())
+            {
+                return Err(reject("stale_pet", "pet control state changed", true));
+            }
+        }
+        GameplayCommand::PetSetAutocast { pet, spell, .. } => {
+            if snapshot.state.pet.guid != Some(*pet)
+                || snapshot
+                    .state
+                    .entities
+                    .0
+                    .get(pet)
+                    .is_some_and(|entity| entity.is_dead())
+                || !snapshot
+                    .state
+                    .pet
+                    .abilities
+                    .iter()
+                    .any(|ability| ability.spell == *spell && ability.autocast.is_some())
+            {
+                return Err(reject(
+                    "stale_pet_ability",
+                    "pet ability is not authoritatively autocastable",
+                    true,
+                ));
+            }
+        }
         GameplayCommand::VendorBuy { vendor, .. } | GameplayCommand::VendorSell { vendor, .. }
             if snapshot.state.inventory.vendor != Some(*vendor) =>
         {
@@ -304,6 +531,44 @@ fn validate_economy_command(
                 "sale item instance or quantity is no longer present",
                 false,
             ));
+        }
+        GameplayCommand::RepairEquipment { vendor } => {
+            let Some(entity) = snapshot.state.entities.0.get(vendor) else {
+                return Err(reject(
+                    "unknown_repair_vendor",
+                    "repair vendor is not currently observed",
+                    true,
+                ));
+            };
+            let is_repair_vendor = entity.kind == wow_state::entities::EntityKind::Unit
+                && entity.interactable
+                && wow_infra::world_knowledge::embedded_azerothcore_catalog()
+                    .world()
+                    .vendor_services
+                    .iter()
+                    .any(|service| service.entry_id == entity.entry && service.can_repair);
+            if !is_repair_vendor {
+                return Err(reject(
+                    "not_a_repair_vendor",
+                    "current entity data and trusted service catalog do not establish repair service",
+                    false,
+                ));
+            }
+            let condition = snapshot.state.inventory.equipment_condition;
+            if !condition.observed {
+                return Err(reject(
+                    "unknown_equipment_condition",
+                    "current equipment durability is not authoritative",
+                    true,
+                ));
+            }
+            if !wow_policy::maintenance::equipment_needs_repair(condition) {
+                return Err(reject(
+                    "repair_not_needed",
+                    "authoritative equipment durability does not require repair",
+                    false,
+                ));
+            }
         }
         GameplayCommand::TradeAccept { generation, .. }
             if snapshot.state.inventory.trade.generation != *generation
@@ -381,6 +646,19 @@ fn has_entity(snapshot: &Snapshot, entity: EntityId) -> bool {
     snapshot.state.entities.0.contains_key(&entity)
 }
 
+fn attack_authorized(snapshot: &Snapshot, target: EntityId) -> bool {
+    snapshot
+        .state
+        .entities
+        .0
+        .get(&target)
+        .is_some_and(|entity| {
+            entity.hostile
+                || active_quest_authorizes_attack(snapshot, entity.entry)
+                || wow_policy::combat::engagement::is_attacking_player_or_group(snapshot, target)
+        })
+}
+
 fn send(action: ProposedAction) -> ValidationOutcome {
     ValidationOutcome::Sendable(SendableAction::from_validated(ValidatedAction {
         id: action.id,
@@ -400,10 +678,21 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
         | GameplayCommand::QueryCorpse
         | GameplayCommand::ReclaimCorpse { .. } => PermissionSet::empty(),
         GameplayCommand::Attack(_)
+        | GameplayCommand::PetAttack { .. }
         | GameplayCommand::Cast { .. }
         | GameplayCommand::EnterVehicle(_)
         | GameplayCommand::VehicleCast { .. } => PermissionSet::COMBAT,
-        GameplayCommand::MaintainBuff { .. } => PermissionSet::MAINTENANCE,
+        GameplayCommand::MaintainBuff { .. } | GameplayCommand::SummonPet { .. } => {
+            PermissionSet::MAINTENANCE
+        }
+        GameplayCommand::CastOnItem { .. } | GameplayCommand::UseItemOnItem { .. } => {
+            PermissionSet::MAINTENANCE
+        }
+        GameplayCommand::EquipItem { .. } => PermissionSet::MAINTENANCE,
+        GameplayCommand::RepairEquipment { .. } => PermissionSet::MAINTENANCE,
+        GameplayCommand::PetSetReaction { .. } | GameplayCommand::PetSetAutocast { .. } => {
+            PermissionSet::MAINTENANCE
+        }
         GameplayCommand::Loot(_) => PermissionSet::LOOT,
         GameplayCommand::Gather(_) | GameplayCommand::Fish => PermissionSet::GATHER,
         GameplayCommand::QueryQuestGivers
@@ -432,6 +721,19 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
 }
 
 fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
+    if matches!(
+        command,
+        GameplayCommand::EquipItem { .. }
+            | GameplayCommand::RepairEquipment { .. }
+            | GameplayCommand::PetSetReaction { .. }
+            | GameplayCommand::PetSetAutocast { .. }
+            | GameplayCommand::CastOnItem { .. }
+            | GameplayCommand::UseItemOnItem { .. }
+            | GameplayCommand::PetAttack { .. }
+    ) && !matches!(origin, PlanOrigin::SystemPolicy | PlanOrigin::Operator)
+    {
+        return false;
+    }
     origin.permits(command)
 }
 
@@ -444,6 +746,13 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::UseItem { .. }
                 | GameplayCommand::UseItemInstance { .. }
                 | GameplayCommand::MaintainBuff { .. }
+                | GameplayCommand::SummonPet { .. }
+                | GameplayCommand::EquipItem { .. }
+                | GameplayCommand::RepairEquipment { .. }
+                | GameplayCommand::PetSetReaction { .. }
+                | GameplayCommand::PetSetAutocast { .. }
+                | GameplayCommand::CastOnItem { .. }
+                | GameplayCommand::UseItemOnItem { .. }
         ),
         ActivationStage::Move => matches!(
             command,
@@ -451,6 +760,13 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::UseItem { .. }
                 | GameplayCommand::UseItemInstance { .. }
                 | GameplayCommand::MaintainBuff { .. }
+                | GameplayCommand::SummonPet { .. }
+                | GameplayCommand::EquipItem { .. }
+                | GameplayCommand::RepairEquipment { .. }
+                | GameplayCommand::PetSetReaction { .. }
+                | GameplayCommand::PetSetAutocast { .. }
+                | GameplayCommand::CastOnItem { .. }
+                | GameplayCommand::UseItemOnItem { .. }
                 | GameplayCommand::MoveTo(_)
                 | GameplayCommand::FaceDirection { .. }
                 | GameplayCommand::StopMovement
@@ -589,6 +905,68 @@ mod tests {
         assert!(
             matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "unknown_spell")
         );
+    }
+
+    #[test]
+    fn repair_requires_observed_durability_that_needs_repair() {
+        use wow_state::{
+            entities::{EntityKind, EntityState},
+            inventory::EquipmentCondition,
+        };
+
+        let repair_entry = wow_infra::world_knowledge::embedded_azerothcore_catalog()
+            .world()
+            .vendor_services
+            .iter()
+            .find(|service| service.can_repair)
+            .expect("repair vendor catalog entry")
+            .entry_id;
+        let mut state = AuthoritativeState::default();
+        state.revision = base_stamp().state;
+        state.session.in_world = true;
+        state.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.inventory.equipment_condition = EquipmentCondition {
+            observed: true,
+            lowest_durability_percent: Some(100),
+            broken_items: 0,
+        };
+        state.entities.0.insert(
+            EntityId(2),
+            EntityState {
+                id: EntityId(2),
+                kind: EntityKind::Unit,
+                entry: repair_entry,
+                interactable: true,
+                position: state.position.player,
+                ..Default::default()
+            },
+        );
+        let action = ProposedAction {
+            id: ActionId(4),
+            task: TaskId(4),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: base_stamp(),
+            command: GameplayCommand::RepairEquipment {
+                vendor: EntityId(2),
+            },
+        };
+        let outcome = ActionValidator::validate(
+            &Snapshot::from_state(&state),
+            ValidationContext {
+                current: base_stamp(),
+                stage: ActivationStage::Act,
+                permissions: PermissionSet::MAINTENANCE,
+            },
+            action,
+        );
+        assert!(matches!(
+            outcome,
+            ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "repair_not_needed"
+        ));
     }
 
     #[test]

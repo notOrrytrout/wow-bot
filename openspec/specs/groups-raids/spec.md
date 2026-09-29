@@ -20,6 +20,21 @@ The system SHALL support role-aware party and raid behavior using the configured
 - **WHEN** a party or raid mission is active with healer role
 - **THEN** group behavior prioritizes healer-appropriate responsibilities subject to current mechanical legality
 
+### Requirement: Group following uses role-specific spacing
+When the bot follows an observed online group member, it SHALL use the configured group role to select a safe stop distance. It SHALL calculate the follow point in three dimensions and SHALL not cross map boundaries.
+
+#### Scenario: Tank follows the leader
+- **WHEN** a Party or Raid mission uses the Tank role and the observed leader is farther away than the tank stop distance
+- **THEN** the bot follows the leader and keeps the configured tank gap
+
+#### Scenario: Healer follows the leader
+- **WHEN** a Party or Raid mission uses the Healer role and the observed leader is farther away than the healer stop distance
+- **THEN** the bot keeps the healer spacing instead of closing to melee distance
+
+#### Scenario: Group members are separated vertically
+- **WHEN** the bot and observed member positions differ in height
+- **THEN** the follow point preserves the role's three-dimensional stop distance
+
 ### Requirement: Group lifecycle states
 The system SHALL support forming, following, engaging, recovering, and regrouping behavior as needed by current group state.
 

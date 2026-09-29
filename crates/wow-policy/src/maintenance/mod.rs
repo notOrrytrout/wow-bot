@@ -5,11 +5,20 @@ use std::{
     time::{Duration, Instant},
 };
 use wow_domain::{EntityId, WorldPosition, time::Millis};
-use wow_state::Snapshot;
+use wow_state::{Snapshot, group::GroupLifecycle};
 
 #[derive(Clone, Debug, Deserialize)]
 struct Catalog {
     policies: Vec<BuffFamilyPolicy>,
+}
+#[derive(Clone, Debug, Deserialize)]
+struct GlyphCatalog {
+    glyphs: Vec<GlyphDefinition>,
+}
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct GlyphDefinition {
+    property_id: u16,
+    spell_id: u32,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct BuffFamilyPolicy {
@@ -27,10 +36,36 @@ pub struct RankedSpell {
 }
 
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
+static GLYPHS: OnceLock<BTreeMap<u16, u32>> = OnceLock::new();
+pub const REPAIR_DURABILITY_THRESHOLD_PERCENT: u8 = 25;
+const ETERNAL_WATER_GLYPH_SPELL: u32 = 70_937;
+const MAGE_WATER_ELEMENTAL_SPELL: u32 = 31_687;
+
+pub fn equipment_needs_repair(condition: wow_state::inventory::EquipmentCondition) -> bool {
+    condition.observed
+        && (condition.broken_items > 0
+            || condition
+                .lowest_durability_percent
+                .is_some_and(|percent| percent < REPAIR_DURABILITY_THRESHOLD_PERCENT))
+}
+
 fn catalog() -> &'static Catalog {
     CATALOG.get_or_init(|| {
         serde_json::from_str(include_str!("../../data/buff-families.json"))
             .expect("embedded buff catalog must parse")
+    })
+}
+
+fn glyph_catalog() -> &'static BTreeMap<u16, u32> {
+    GLYPHS.get_or_init(|| {
+        let catalog: GlyphCatalog =
+            serde_json::from_str(include_str!("../../data/glyph-properties.json"))
+                .expect("embedded glyph catalog must parse");
+        catalog
+            .glyphs
+            .into_iter()
+            .map(|glyph| (glyph.property_id, glyph.spell_id))
+            .collect()
     })
 }
 
@@ -41,6 +76,43 @@ pub enum MaintenanceDecision {
         family: String,
         spell: u32,
         target: EntityId,
+    },
+    SummonPet {
+        spell: u32,
+        player: EntityId,
+    },
+    EquipItem {
+        item: u32,
+        item_guid: EntityId,
+        destination_slot: u8,
+        player: EntityId,
+    },
+    UseItemInstance {
+        item: u32,
+        item_guid: EntityId,
+        backpack_slot: u8,
+        spell: u32,
+        target: EntityId,
+    },
+    CastOnItem {
+        spell: u32,
+        item_guid: EntityId,
+    },
+    UseItemOnItem {
+        item: u32,
+        item_guid: EntityId,
+        backpack_slot: u8,
+        spell: u32,
+        target_item_guid: EntityId,
+    },
+    PetReaction {
+        pet: EntityId,
+        reaction: u8,
+    },
+    PetAutocast {
+        pet: EntityId,
+        spell: u32,
+        enabled: bool,
     },
     Deferred {
         family: String,
@@ -106,6 +178,44 @@ pub fn decide_next(
     if let Some(pet_decision) = hunter_pet_care(snapshot, class_id, player, retry_after, now) {
         return pet_decision;
     }
+    if let Some(pet_decision) = death_knight_pet_care(snapshot, class_id, player, retry_after, now)
+    {
+        return pet_decision;
+    }
+    if let Some(pet_decision) =
+        mage_water_elemental_care(snapshot, class_id, player, retry_after, now)
+    {
+        return pet_decision;
+    }
+    if let Some(pet_decision) = warlock_pet_care(snapshot, class_id, player, retry_after, now) {
+        return pet_decision;
+    }
+    if let Some(pet_decision) = pet_setup(snapshot, retry_after, now) {
+        return pet_decision;
+    }
+    if let Some(decision) = gear_upgrade(snapshot, player, retry_after, now) {
+        return decision;
+    }
+    if class_id == 7
+        && let Some(decision) = shaman_weapon_imbue(snapshot, retry_after, now)
+    {
+        return decision;
+    }
+    if class_id == 4
+        && let Some(decision) = rogue_weapon_poison(snapshot, retry_after, now)
+    {
+        return decision;
+    }
+    if class_id == 8
+        && let Some(decision) = mage_supplies(snapshot, player, retry_after, now)
+    {
+        return decision;
+    }
+    if class_id == 9
+        && let Some(decision) = warlock_stones(snapshot, player, retry_after, now)
+    {
+        return decision;
+    }
     let player_position = snapshot
         .state
         .entities
@@ -152,6 +262,536 @@ pub fn decide_next(
     MaintenanceDecision::Satisfied
 }
 
+/// Keep the Mage's old ten item reserve using current inventory and spell state.
+fn mage_supplies(
+    snapshot: &Snapshot,
+    player: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    let (food, drink) = mage_food_and_drink(snapshot)?;
+    let ready_spell = |needle: &str| {
+        snapshot
+            .state
+            .capabilities
+            .spells
+            .iter()
+            .filter_map(|spell| {
+                let metadata = crate::combat::spells::metadata(*spell)?;
+                let name = metadata.name.to_ascii_lowercase();
+                (name.contains(needle) || name.contains("conjure refreshment")).then_some(*spell)
+            })
+            .filter(|spell| {
+                !retry_after
+                    .get(&(*spell, player))
+                    .is_some_and(|deadline| *deadline > now)
+            })
+            .filter(|spell| {
+                crate::combat::readiness::check_spell_readiness(
+                    snapshot,
+                    *spell,
+                    Some(player),
+                    Millis::wall_clock_now().0,
+                )
+                .is_ok()
+            })
+            .max()
+    };
+    if drink < 10
+        && let Some(spell) = ready_spell("conjure water")
+    {
+        return Some(MaintenanceDecision::Cast {
+            family: "mage_water".into(),
+            spell,
+            target: player,
+        });
+    }
+    if food < 10
+        && let Some(spell) = ready_spell("conjure food")
+    {
+        return Some(MaintenanceDecision::Cast {
+            family: "mage_food".into(),
+            spell,
+            target: player,
+        });
+    }
+    None
+}
+
+/// Return None until all backpack item templates are authoritative.
+fn mage_food_and_drink(snapshot: &Snapshot) -> Option<(u32, u32)> {
+    let inventory = &snapshot.state.inventory;
+    let mut food = 0u32;
+    let mut drink = 0u32;
+    for instance in inventory
+        .instances
+        .values()
+        .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+    {
+        let item = inventory.item_metadata.get(&instance.item)?;
+        if item.item_class != 0 || item.subclass != 5 || item.use_spell_id == 0 {
+            continue;
+        }
+        let name = item.name.to_ascii_lowercase();
+        let is_drink = name.contains("water")
+            || name.contains("drink")
+            || name.contains("refreshment")
+            || name.contains("strudel");
+        let is_food = name.contains("food")
+            || name.contains("bread")
+            || name.contains("biscuit")
+            || name.contains("strudel")
+            || name.contains("refreshment");
+        if is_food {
+            food = food.saturating_add(instance.count);
+        }
+        if is_drink {
+            drink = drink.saturating_add(instance.count);
+        }
+    }
+    Some((food, drink))
+}
+
+/// Create missing Warlock stones, then prepare an available Soulstone on self.
+fn warlock_stones(
+    snapshot: &Snapshot,
+    player: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    let has_healthstone = inventory_has_named_use_spell(snapshot, "healthstone");
+    if !has_healthstone
+        && let Some(spell) =
+            highest_ready_named_spell(snapshot, player, "create healthstone", retry_after, now)
+    {
+        return Some(MaintenanceDecision::Cast {
+            family: "warlock_create_healthstone".into(),
+            spell,
+            target: player,
+        });
+    }
+
+    let soulstone = soulstone_instance(snapshot);
+    if soulstone.is_none()
+        && let Some(spell) =
+            highest_ready_named_spell(snapshot, player, "create soulstone", retry_after, now)
+    {
+        return Some(MaintenanceDecision::Cast {
+            family: "warlock_create_soulstone".into(),
+            spell,
+            target: player,
+        });
+    }
+
+    let item = soulstone?;
+    let spell = snapshot
+        .state
+        .inventory
+        .item_metadata
+        .get(&item.item)?
+        .use_spell_id;
+    if spell == 0 {
+        return None;
+    }
+    if retry_after
+        .get(&(spell, player))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    if snapshot
+        .state
+        .auras
+        .by_entity
+        .get(&player)?
+        .values()
+        .any(|aura| {
+            aura.spell == spell
+                || crate::combat::spells::metadata(aura.spell).is_some_and(|metadata| {
+                    metadata
+                        .name
+                        .to_ascii_lowercase()
+                        .contains("soulstone resurrection")
+                })
+        })
+    {
+        return None;
+    }
+    Some(MaintenanceDecision::UseItemInstance {
+        item: item.item,
+        item_guid: item.guid,
+        backpack_slot: item.backpack_slot,
+        spell,
+        target: player,
+    })
+}
+
+fn highest_ready_named_spell(
+    snapshot: &Snapshot,
+    player: EntityId,
+    name: &str,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<u32> {
+    snapshot
+        .state
+        .capabilities
+        .spells
+        .iter()
+        .filter_map(|spell| {
+            let metadata = crate::combat::spells::metadata(*spell)?;
+            metadata
+                .name
+                .to_ascii_lowercase()
+                .contains(name)
+                .then_some(*spell)
+        })
+        .filter(|spell| {
+            !retry_after
+                .get(&(*spell, player))
+                .is_some_and(|deadline| *deadline > now)
+        })
+        .filter(|spell| {
+            crate::combat::readiness::check_spell_readiness(
+                snapshot,
+                *spell,
+                Some(player),
+                Millis::wall_clock_now().0,
+            )
+            .is_ok()
+        })
+        .max()
+}
+
+fn inventory_has_named_use_spell(snapshot: &Snapshot, name: &str) -> bool {
+    snapshot
+        .state
+        .inventory
+        .instances
+        .values()
+        .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+        .any(|instance| {
+            let Some(metadata) = snapshot.state.inventory.item_metadata.get(&instance.item) else {
+                return false;
+            };
+            metadata.use_spell_id != 0
+                && (metadata.name.to_ascii_lowercase().contains(name)
+                    || crate::combat::spells::metadata(metadata.use_spell_id)
+                        .is_some_and(|spell| spell.name.to_ascii_lowercase().contains(name)))
+        })
+}
+
+fn soulstone_instance(snapshot: &Snapshot) -> Option<&wow_state::inventory::InventoryItemInstance> {
+    snapshot
+        .state
+        .inventory
+        .instances
+        .values()
+        .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+        .filter(|instance| {
+            let Some(metadata) = snapshot.state.inventory.item_metadata.get(&instance.item) else {
+                return false;
+            };
+            metadata.use_spell_id != 0
+                && (metadata.name.to_ascii_lowercase().contains("soulstone")
+                    || crate::combat::spells::metadata(metadata.use_spell_id)
+                        .is_some_and(|spell| spell.name.to_ascii_lowercase().contains("soulstone")))
+        })
+        .min_by_key(|instance| (instance.backpack_slot, instance.guid))
+}
+
+fn shaman_weapon_imbue(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    let specialization = snapshot.state.capabilities.specialization_tree;
+    let main_hand_names: &[&str] = match specialization {
+        Some(0) => &["flametongue weapon"],
+        Some(1) => &["windfury weapon", "flametongue weapon"],
+        Some(2) => &["earthliving weapon", "flametongue weapon"],
+        _ => &["flametongue weapon", "rockbiter weapon"],
+    };
+    let off_hand_names: &[&str] = if specialization == Some(1) {
+        &["flametongue weapon"]
+    } else {
+        &[]
+    };
+    for (slot, names) in [(15, main_hand_names), (16, off_hand_names)] {
+        let Some(item) = snapshot
+            .state
+            .inventory
+            .equipped_item_instances
+            .get(&slot)
+            .filter(|item| item.temporary_enchanted == Some(false))
+        else {
+            continue;
+        };
+        for name in names {
+            let spell = snapshot
+                .state
+                .capabilities
+                .spells
+                .iter()
+                .filter_map(|spell| {
+                    let metadata = crate::combat::spells::metadata(*spell)?;
+                    metadata
+                        .name
+                        .to_ascii_lowercase()
+                        .contains(name)
+                        .then_some(*spell)
+                })
+                .filter(|spell| {
+                    !retry_after
+                        .get(&(*spell, item.guid))
+                        .is_some_and(|deadline| *deadline > now)
+                })
+                .filter(|spell| {
+                    crate::combat::readiness::check_spell_readiness(
+                        snapshot,
+                        *spell,
+                        snapshot.state.session.character_guid.map(EntityId),
+                        Millis::wall_clock_now().0,
+                    )
+                    .is_ok()
+                })
+                .max();
+            if let Some(spell) = spell {
+                return Some(MaintenanceDecision::CastOnItem {
+                    spell,
+                    item_guid: item.guid,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn rogue_weapon_poison(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    // Keep the legacy PvE default behind this policy seam. Poison choice can
+    // later vary by spec or user configuration without changing item actions.
+    for (slot, family) in [(15, "instant poison"), (16, "deadly poison")] {
+        let Some(weapon) = snapshot
+            .state
+            .inventory
+            .equipped_item_instances
+            .get(&slot)
+            .filter(|weapon| weapon.temporary_enchanted == Some(false))
+        else {
+            continue;
+        };
+        let poison = snapshot
+            .state
+            .inventory
+            .instances
+            .values()
+            .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+            .filter_map(|instance| {
+                let metadata = snapshot.state.inventory.item_metadata.get(&instance.item)?;
+                let name = metadata.name.to_ascii_lowercase();
+                let rank = poison_name_rank(&name, family)?;
+                (metadata.item_class == 0 && metadata.subclass == 6 && metadata.use_spell_id != 0)
+                    .then_some((rank, instance.item, instance, metadata.use_spell_id))
+            })
+            .max_by_key(|(rank, item, _, _)| (*rank, *item));
+        let Some((_, item, instance, spell)) = poison else {
+            continue;
+        };
+        if retry_after
+            .get(&(spell, weapon.guid))
+            .is_some_and(|deadline| *deadline > now)
+        {
+            continue;
+        }
+        return Some(MaintenanceDecision::UseItemOnItem {
+            item,
+            item_guid: instance.guid,
+            backpack_slot: instance.backpack_slot,
+            spell,
+            target_item_guid: weapon.guid,
+        });
+    }
+    None
+}
+
+fn poison_name_rank(name: &str, family: &str) -> Option<u8> {
+    let suffix = name.strip_prefix(family)?.trim();
+    if suffix.is_empty() {
+        return Some(1);
+    }
+    match suffix {
+        "ii" => Some(2),
+        "iii" => Some(3),
+        "iv" => Some(4),
+        "v" => Some(5),
+        "vi" => Some(6),
+        "vii" => Some(7),
+        "viii" => Some(8),
+        "ix" => Some(9),
+        _ => None,
+    }
+}
+
+/// Apply the old pet defaults after SMSG_PET_SPELLS confirms a control bar.
+fn pet_setup(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    let pet = snapshot.state.pet.guid?;
+    let reaction = snapshot.state.pet.reaction?;
+    if reaction != 1
+        && !retry_after
+            .get(&(0, pet))
+            .is_some_and(|deadline| *deadline > now)
+    {
+        return Some(MaintenanceDecision::PetReaction { pet, reaction: 1 });
+    }
+    let grouped = snapshot.state.group.lifecycle != GroupLifecycle::Solo
+        || !snapshot.state.group.members.is_empty();
+    const ALWAYS_MANUAL: &[u32] = &[
+        1742, 24450, 24452, 24453, 47482, 19244, 19647, 19505, 19731, 19734, 19736, 27276, 27277,
+        48011, 58867,
+    ];
+    const TAUNTS: &[u32] = &[2649, 3716, 17735, 33698];
+    snapshot.state.pet.abilities.iter().find_map(|ability| {
+        let current = ability.autocast?;
+        let desired = if ALWAYS_MANUAL.contains(&ability.spell) {
+            false
+        } else if TAUNTS.contains(&ability.spell) {
+            !grouped
+        } else {
+            true
+        };
+        (current != desired
+            && !retry_after
+                .get(&(ability.spell, pet))
+                .is_some_and(|deadline| *deadline > now))
+        .then_some(MaintenanceDecision::PetAutocast {
+            pet,
+            spell: ability.spell,
+            enabled: desired,
+        })
+    })
+}
+
+fn gear_upgrade(
+    snapshot: &Snapshot,
+    player: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    use wow_state::inventory::ItemTemplateMetadata;
+    let inventory = &snapshot.state.inventory;
+    if !inventory.equipment_slots_authoritative {
+        return None;
+    }
+    let level = snapshot.state.entities.0.get(&player)?.level?;
+    let class = snapshot.state.capabilities.class_id?;
+    let score = |metadata: &ItemTemplateMetadata| {
+        crate::gear::item_score_with_spec(
+            metadata,
+            class,
+            snapshot.state.capabilities.specialization_tree,
+        )
+    };
+    let mut best: Option<(f32, u32, EntityId, u8)> = None;
+    if let Some(destination_slot) =
+        (19u8..=22).find(|slot| !inventory.equipped_items.contains_key(slot))
+    {
+        if let Some(candidate) = inventory
+            .instances
+            .values()
+            .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+            .filter_map(|instance| {
+                let metadata = inventory.item_metadata.get(&instance.item)?;
+                (crate::gear::container_can_equip(metadata, class, level.min(255) as u8)
+                    && !retry_after
+                        .get(&(instance.item, player))
+                        .is_some_and(|deadline| *deadline > now))
+                .then_some((metadata.container_slots, instance))
+            })
+            .max_by_key(|(slots, _)| *slots)
+        {
+            return Some(MaintenanceDecision::EquipItem {
+                item: candidate.1.item,
+                item_guid: candidate.1.guid,
+                destination_slot,
+                player,
+            });
+        }
+    }
+    if inventory
+        .equipped_items
+        .values()
+        .any(|item| *item != 0 && !inventory.item_metadata.contains_key(item))
+    {
+        return None;
+    }
+    for instance in inventory
+        .instances
+        .values()
+        .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+    {
+        let Some(metadata) = inventory.item_metadata.get(&instance.item) else {
+            continue;
+        };
+        if !crate::gear::player_can_use(metadata, class, level as u8) {
+            continue;
+        }
+        let slots = crate::gear::destination_slots(metadata);
+        let new_score = score(metadata);
+        for slot in slots {
+            if *slot == 16
+                && inventory
+                    .equipped_items
+                    .get(&15)
+                    .and_then(|item| inventory.item_metadata.get(item))
+                    .is_some_and(|item| item.inventory_type == 17)
+            {
+                continue;
+            }
+            let mut old_score = inventory
+                .equipped_items
+                .get(slot)
+                .and_then(|item| inventory.item_metadata.get(item))
+                .map(score)
+                .unwrap_or(0.0);
+            if metadata.inventory_type == 17 && *slot == 15 {
+                old_score += inventory
+                    .equipped_items
+                    .get(&16)
+                    .and_then(|item| inventory.item_metadata.get(item))
+                    .map(score)
+                    .unwrap_or(0.0);
+            }
+            let delta = new_score - old_score;
+            if !crate::gear::score_improves_by_fraction(new_score, old_score, 0.01)
+                || retry_after
+                    .get(&(instance.item, player))
+                    .is_some_and(|deadline| *deadline > now)
+            {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(known, ..)| delta > *known) {
+                best = Some((delta, instance.item, instance.guid, *slot));
+            }
+        }
+    }
+    best.map(
+        |(_, item, item_guid, destination_slot)| MaintenanceDecision::EquipItem {
+            item,
+            item_guid,
+            destination_slot,
+            player,
+        },
+    )
+}
+
 /// Restore a hunter's confirmed missing or dead pet before ordinary buffs.
 /// Unknown control state and an unobserved pet entity remain fail-closed.
 fn hunter_pet_care(
@@ -192,6 +832,180 @@ fn hunter_pet_care(
         spell,
         target: player,
     })
+}
+
+/// Restore an absent or dead Warlock demon before ordinary buffs.
+fn warlock_pet_care(
+    snapshot: &Snapshot,
+    class_id: u8,
+    player: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    if class_id != 9 {
+        return None;
+    }
+    if let Some(pet) = snapshot.state.pet.guid {
+        let entity = snapshot.state.entities.0.get(&pet)?;
+        if !entity.is_dead() {
+            return None;
+        }
+    }
+
+    if WARLOCK_PET_SUMMONS.iter().any(|spell| {
+        retry_after
+            .get(&(*spell, player))
+            .is_some_and(|deadline| *deadline > now)
+    }) {
+        return None;
+    }
+
+    let spell = preferred_warlock_demon_spells(snapshot)
+        .into_iter()
+        .find(|spell| {
+            snapshot.state.capabilities.spells.contains(spell)
+                && crate::combat::readiness::check_spell_readiness(
+                    snapshot,
+                    **spell,
+                    None,
+                    Millis::wall_clock_now().0,
+                )
+                .is_ok()
+        })?;
+
+    Some(MaintenanceDecision::SummonPet {
+        spell: *spell,
+        player,
+    })
+}
+
+const WARLOCK_PET_SUMMONS: [u32; 5] = [688, 697, 712, 691, 30146];
+const DEATH_KNIGHT_PERSISTENT_PET: u32 = 46584;
+
+pub fn is_warlock_persistent_demon_summon(spell: u32) -> bool {
+    WARLOCK_PET_SUMMONS.contains(&spell)
+}
+
+pub fn is_persistent_pet_summon(spell: u32) -> bool {
+    is_warlock_persistent_demon_summon(spell)
+        || spell == DEATH_KNIGHT_PERSISTENT_PET
+        || spell == MAGE_WATER_ELEMENTAL_SPELL
+}
+
+/// Restore a Death Knight's permanent ghoul only with Master of Ghouls.
+fn death_knight_pet_care(
+    snapshot: &Snapshot,
+    class_id: u8,
+    player: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    if class_id != 6
+        || !snapshot
+            .state
+            .capabilities
+            .active_talents
+            .iter()
+            .any(|talent| talent.talent_id == 1984)
+        || !snapshot
+            .state
+            .capabilities
+            .spells
+            .contains(&DEATH_KNIGHT_PERSISTENT_PET)
+    {
+        return None;
+    }
+    persistent_pet_summon(
+        snapshot,
+        player,
+        DEATH_KNIGHT_PERSISTENT_PET,
+        retry_after,
+        now,
+    )
+}
+
+/// Restore the Eternal Water elemental only when its glyph is proven active.
+fn mage_water_elemental_care(
+    snapshot: &Snapshot,
+    class_id: u8,
+    player: EntityId,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    if class_id != 8
+        || !snapshot
+            .state
+            .capabilities
+            .spells
+            .contains(&MAGE_WATER_ELEMENTAL_SPELL)
+        || !active_glyph_spell_ids(snapshot)?.contains(&ETERNAL_WATER_GLYPH_SPELL)
+    {
+        return None;
+    }
+    persistent_pet_summon(
+        snapshot,
+        player,
+        MAGE_WATER_ELEMENTAL_SPELL,
+        retry_after,
+        now,
+    )
+}
+
+fn active_glyph_spell_ids(snapshot: &Snapshot) -> Option<Vec<u32>> {
+    snapshot
+        .state
+        .capabilities
+        .active_glyph_properties
+        .as_ref()?
+        .iter()
+        .map(|property| glyph_catalog().get(property).copied())
+        .collect()
+}
+
+fn persistent_pet_summon(
+    snapshot: &Snapshot,
+    player: EntityId,
+    spell: u32,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+) -> Option<MaintenanceDecision> {
+    if let Some(pet) = snapshot.state.pet.guid {
+        let entity = snapshot.state.entities.0.get(&pet)?;
+        if !entity.is_dead() {
+            return None;
+        }
+    }
+    if retry_after
+        .get(&(spell, player))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    crate::combat::readiness::check_spell_readiness(
+        snapshot,
+        spell,
+        None,
+        Millis::wall_clock_now().0,
+    )
+    .ok()?;
+    Some(MaintenanceDecision::SummonPet { spell, player })
+}
+
+fn preferred_warlock_demon_spells(snapshot: &Snapshot) -> &'static [u32] {
+    const DEMONOLOGY: &[u32] = &[30146, 697, 688];
+    const DESTRUCTION: &[u32] = &[688, 691];
+    const AFFLICTION_GROUP: &[u32] = &[691, 688];
+    const AFFLICTION_SOLO: &[u32] = &[697, 688];
+    const UNKNOWN_SPEC: &[u32] = &[688, 697];
+    let grouped = snapshot.state.group.lifecycle != GroupLifecycle::Solo
+        || !snapshot.state.group.members.is_empty();
+    match snapshot.state.capabilities.specialization_tree {
+        Some(1) => DEMONOLOGY,
+        Some(2) => DESTRUCTION,
+        Some(0) if grouped => AFFLICTION_GROUP,
+        Some(0) => AFFLICTION_SOLO,
+        _ => UNKNOWN_SPEC,
+    }
 }
 
 fn cast_decision(
@@ -235,6 +1049,7 @@ fn readiness_reason(reason: crate::combat::readiness::SpellUnavailableReason) ->
         WrongClass => "spell_wrong_class",
         Cooldown => "spell_cooldown",
         GlobalCooldown => "global_cooldown",
+        CastInProgress => "cast_in_progress",
         InsufficientPower => "insufficient_power",
         InsufficientRunes => "insufficient_runes",
         MissingComboPoints => "missing_combo_points",
@@ -293,7 +1108,168 @@ fn party_member_nearby(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wow_state::{AuthoritativeState, Snapshot, auras::AuraInstance, entities::EntityState};
+
+    #[test]
+    fn repair_requires_observed_broken_or_yellow_equipment() {
+        assert!(!equipment_needs_repair(
+            wow_state::inventory::EquipmentCondition::default()
+        ));
+        assert!(!equipment_needs_repair(
+            wow_state::inventory::EquipmentCondition {
+                observed: true,
+                lowest_durability_percent: Some(25),
+                broken_items: 0,
+            }
+        ));
+        assert!(equipment_needs_repair(
+            wow_state::inventory::EquipmentCondition {
+                observed: true,
+                lowest_durability_percent: Some(24),
+                broken_items: 0,
+            }
+        ));
+        assert!(equipment_needs_repair(
+            wow_state::inventory::EquipmentCondition {
+                observed: true,
+                lowest_durability_percent: None,
+                broken_items: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn shaman_applies_highest_known_spec_weapon_imbue_only_to_observed_unenchanted_weapon() {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(7);
+        state.capabilities.specialization_tree = Some(0);
+        state.capabilities.spells.extend([8024, 16342]);
+        state.inventory.equipped_item_instances.insert(
+            15,
+            wow_state::inventory::EquippedItemInstance {
+                item: 19019,
+                guid: EntityId(19),
+                temporary_enchanted: Some(false),
+            },
+        );
+        authoritative_caster(&mut state, EntityId(7));
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+        state.inventory.equipment_slots_authoritative = true;
+        state.inventory.equipped_items.insert(15, 19019);
+
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false,
+            ),
+            MaintenanceDecision::CastOnItem {
+                spell: 16342,
+                item_guid: EntityId(19),
+            }
+        );
+
+        state
+            .inventory
+            .equipped_item_instances
+            .get_mut(&15)
+            .unwrap()
+            .temporary_enchanted = Some(true);
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false,
+            ),
+            MaintenanceDecision::Satisfied
+        );
+    }
+
+    #[test]
+    fn rogue_applies_highest_inventory_poison_to_each_unenchanted_weapon() {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(4);
+        state.inventory.equipped_item_instances.insert(
+            15,
+            wow_state::inventory::EquippedItemInstance {
+                item: 19019,
+                guid: EntityId(19),
+                temporary_enchanted: Some(false),
+            },
+        );
+        state.inventory.equipped_item_instances.insert(
+            16,
+            wow_state::inventory::EquippedItemInstance {
+                item: 19019,
+                guid: EntityId(20),
+                temporary_enchanted: Some(false),
+            },
+        );
+        for (item, guid, name) in [
+            (100, EntityId(100), "Instant Poison V"),
+            (101, EntityId(101), "Instant Poison IX"),
+            (102, EntityId(102), "Deadly Poison VIII"),
+        ] {
+            state.inventory.instances.insert(
+                guid,
+                InventoryItemInstance {
+                    item,
+                    guid,
+                    backpack_slot: 23 + (item - 100) as u8,
+                    count: 1,
+                },
+            );
+            state.inventory.item_metadata.insert(
+                item,
+                ItemTemplateMetadata {
+                    name: name.into(),
+                    item_class: 0,
+                    subclass: 6,
+                    use_spell_id: 5000 + item,
+                    ..Default::default()
+                },
+            );
+        }
+        authoritative_caster(&mut state, EntityId(7));
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(
+            decide_next(&snapshot, &BTreeMap::new(), Instant::now(), false),
+            MaintenanceDecision::UseItemOnItem {
+                item: 101,
+                item_guid: EntityId(101),
+                backpack_slot: 24,
+                spell: 5101,
+                target_item_guid: EntityId(19),
+            }
+        );
+        let retry = [(5101, EntityId(19))]
+            .into_iter()
+            .map(|key| (key, Instant::now() + Duration::from_secs(20)))
+            .collect();
+        assert_eq!(
+            decide_next(&snapshot, &retry, Instant::now(), false),
+            MaintenanceDecision::UseItemOnItem {
+                item: 102,
+                item_guid: EntityId(102),
+                backpack_slot: 25,
+                spell: 5102,
+                target_item_guid: EntityId(20),
+            }
+        );
+    }
+    use wow_state::{
+        AuthoritativeState, Snapshot,
+        auras::AuraInstance,
+        entities::EntityState,
+        inventory::{InventoryItemInstance, ItemTemplateMetadata},
+    };
 
     fn authoritative_caster(state: &mut AuthoritativeState, entity: EntityId) {
         state.entities.0.insert(
@@ -323,6 +1299,34 @@ mod tests {
         authoritative_caster(&mut state, EntityId(7));
         state.auras.by_entity.entry(EntityId(7)).or_default();
         state.pet.control_known = true;
+        state
+    }
+
+    fn warlock_state() -> AuthoritativeState {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(9);
+        state.capabilities.specialization_tree = Some(0);
+        state.capabilities.spells.extend([687, 688, 697]);
+        state.inventory.items.insert(6265, 1);
+        authoritative_caster(&mut state, EntityId(7));
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+        state.pet.control_known = true;
+        state
+    }
+
+    fn warlock_with_active_pet() -> AuthoritativeState {
+        let mut state = warlock_state();
+        state.pet.guid = Some(EntityId(9));
+        state.entities.0.insert(
+            EntityId(9),
+            EntityState {
+                id: EntityId(9),
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
         state
     }
 
@@ -400,6 +1404,385 @@ mod tests {
     }
 
     #[test]
+    fn death_knight_restores_only_the_talented_persistent_ghoul() {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(6);
+        state.capabilities.spells.insert(46584);
+        state
+            .capabilities
+            .active_talents
+            .push(wow_state::capabilities::TalentRank {
+                talent_id: 1984,
+                rank: 0,
+            });
+        authoritative_caster(&mut state, EntityId(7));
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+        state.pet.control_known = true;
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet {
+                spell: 46584,
+                player: EntityId(7)
+            }
+        );
+
+        state.pet.guid = Some(EntityId(9));
+        state.entities.0.insert(
+            EntityId(9),
+            EntityState {
+                id: EntityId(9),
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+        assert_ne!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet {
+                spell: 46584,
+                player: EntityId(7)
+            }
+        );
+
+        state.capabilities.active_talents.clear();
+        state.pet.guid = None;
+        assert_ne!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet {
+                spell: 46584,
+                player: EntityId(7)
+            }
+        );
+    }
+
+    #[test]
+    fn mage_restores_water_elemental_only_with_proven_eternal_water_glyph() {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(8);
+        state.capabilities.spells.insert(MAGE_WATER_ELEMENTAL_SPELL);
+        state.capabilities.active_glyph_properties = Some(vec![871]);
+        authoritative_caster(&mut state, EntityId(7));
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+        state.pet.control_known = true;
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet {
+                spell: MAGE_WATER_ELEMENTAL_SPELL,
+                player: EntityId(7)
+            }
+        );
+
+        state.capabilities.active_glyph_properties = None;
+        assert_ne!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet {
+                spell: MAGE_WATER_ELEMENTAL_SPELL,
+                player: EntityId(7)
+            }
+        );
+        state.capabilities.active_glyph_properties = Some(vec![u16::MAX]);
+        assert_ne!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet {
+                spell: MAGE_WATER_ELEMENTAL_SPELL,
+                player: EntityId(7)
+            }
+        );
+    }
+
+    #[test]
+    fn pet_setup_sets_defensive_then_enables_default_autocast() {
+        let mut state = hunter_state();
+        state.pet.guid = Some(EntityId(9));
+        state.pet.reaction = Some(2);
+        state.pet.abilities.push(wow_state::pets::PetAbilityState {
+            spell: 2641,
+            autocast: Some(false),
+        });
+        let now = Instant::now();
+        assert_eq!(
+            pet_setup(&Snapshot::from_state(&state), &BTreeMap::new(), now),
+            Some(MaintenanceDecision::PetReaction {
+                pet: EntityId(9),
+                reaction: 1
+            })
+        );
+        state.pet.reaction = Some(1);
+        assert_eq!(
+            pet_setup(&Snapshot::from_state(&state), &BTreeMap::new(), now),
+            Some(MaintenanceDecision::PetAutocast {
+                pet: EntityId(9),
+                spell: 2641,
+                enabled: true
+            })
+        );
+    }
+
+    #[test]
+    fn pet_setup_keeps_manual_control_spells_off_and_taunts_solo_only() {
+        let mut state = hunter_state();
+        state.pet.guid = Some(EntityId(9));
+        state.pet.reaction = Some(1);
+        state.pet.abilities = vec![
+            wow_state::pets::PetAbilityState {
+                spell: 19505,
+                autocast: Some(true),
+            },
+            wow_state::pets::PetAbilityState {
+                spell: 2649,
+                autocast: Some(false),
+            },
+        ];
+        let now = Instant::now();
+        assert_eq!(
+            pet_setup(&Snapshot::from_state(&state), &BTreeMap::new(), now),
+            Some(MaintenanceDecision::PetAutocast {
+                pet: EntityId(9),
+                spell: 19505,
+                enabled: false
+            })
+        );
+        state.pet.abilities.remove(0);
+        assert_eq!(
+            pet_setup(&Snapshot::from_state(&state), &BTreeMap::new(), now),
+            Some(MaintenanceDecision::PetAutocast {
+                pet: EntityId(9),
+                spell: 2649,
+                enabled: true
+            })
+        );
+        state.group.lifecycle = GroupLifecycle::Active;
+        assert_eq!(
+            pet_setup(&Snapshot::from_state(&state), &BTreeMap::new(), now),
+            None
+        );
+    }
+
+    #[test]
+    fn gear_maintenance_selects_a_scored_bag_upgrade() {
+        let mut state = hunter_state();
+        state.inventory.equipment_slots_authoritative = true;
+        state.inventory.instances.insert(
+            EntityId(44),
+            InventoryItemInstance {
+                item: 100,
+                guid: EntityId(44),
+                backpack_slot: 23,
+                count: 1,
+            },
+        );
+        state.inventory.item_metadata.insert(
+            100,
+            ItemTemplateMetadata {
+                item_class: 4,
+                inventory_type: 1,
+                quality: 2,
+                item_level: 10,
+                ..Default::default()
+            },
+        );
+        state.inventory.equipped_items.insert(0, 101);
+        state
+            .entities
+            .0
+            .get_mut(&EntityId(7))
+            .expect("player")
+            .level = Some(10);
+        assert_eq!(
+            gear_upgrade(
+                &Snapshot::from_state(&state),
+                EntityId(7),
+                &BTreeMap::new(),
+                Instant::now()
+            ),
+            None
+        );
+        state.inventory.item_metadata.insert(
+            101,
+            ItemTemplateMetadata {
+                item_class: 4,
+                inventory_type: 1,
+                item_level: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            gear_upgrade(
+                &Snapshot::from_state(&state),
+                EntityId(7),
+                &BTreeMap::new(),
+                Instant::now()
+            ),
+            Some(MaintenanceDecision::EquipItem {
+                item: 100,
+                item_guid: EntityId(44),
+                destination_slot: 0,
+                player: EntityId(7)
+            })
+        );
+    }
+
+    #[test]
+    fn warlock_pet_care_uses_affliction_solo_preference_before_buffs() {
+        let state = warlock_state();
+
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet {
+                spell: 697,
+                player: EntityId(7)
+            }
+        );
+    }
+
+    #[test]
+    fn warlock_pet_care_uses_group_preference_and_falls_back_when_shard_is_missing() {
+        let mut state = warlock_state();
+        state.group.lifecycle = GroupLifecycle::Active;
+        state.capabilities.spells.insert(691);
+        state.inventory.items.clear();
+        let decision = decide_next(
+            &Snapshot::from_state(&state),
+            &BTreeMap::new(),
+            Instant::now(),
+            false,
+        );
+        assert!(matches!(
+            decision,
+            MaintenanceDecision::SummonPet { spell: 688, .. }
+        ));
+    }
+
+    #[test]
+    fn warlock_pet_care_uses_demonology_and_destruction_preferences() {
+        let mut state = warlock_state();
+        state.capabilities.specialization_tree = Some(1);
+        state.capabilities.spells.extend([30146, 691]);
+        assert!(matches!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet { spell: 30146, .. }
+        ));
+
+        state.capabilities.specialization_tree = Some(2);
+        assert!(matches!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet { spell: 688, .. }
+        ));
+    }
+
+    #[test]
+    fn warlock_pet_care_can_probe_unknown_pet_control_and_obeys_retry_window() {
+        let mut state = warlock_state();
+        state.pet.control_known = false;
+        let now = Instant::now();
+        let snap = Snapshot::from_state(&state);
+        assert!(matches!(
+            decide_next(&snap, &BTreeMap::new(), now, false),
+            MaintenanceDecision::SummonPet { spell: 697, .. }
+        ));
+        let retry = BTreeMap::from([((697, EntityId(7)), now + Duration::from_secs(60))]);
+        assert!(!matches!(
+            decide_next(&snap, &retry, now, false),
+            MaintenanceDecision::SummonPet { .. }
+        ));
+    }
+
+    #[test]
+    fn warlock_pet_care_does_not_replace_a_live_pet() {
+        let mut state = warlock_state();
+        state.pet.guid = Some(EntityId(9));
+        state.entities.0.insert(
+            EntityId(9),
+            EntityState {
+                id: EntityId(9),
+                health: Some((50, 100)),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::Cast {
+                family,
+                spell: 687,
+                target: EntityId(7)
+            } if family == "warlock_armor"
+        ));
+    }
+
+    #[test]
+    fn warlock_pet_care_uses_a_lower_ready_summon_without_a_soul_shard() {
+        let mut state = warlock_state();
+        state.inventory.items.clear();
+
+        assert!(matches!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::SummonPet {
+                spell: 688,
+                player: EntityId(7)
+            }
+        ));
+    }
+
+    #[test]
     fn mage_chooses_highest_known_intellect_and_stops_when_family_present() {
         let mut state = AuthoritativeState::default();
         state.session.in_world = true;
@@ -433,11 +1816,201 @@ mod tests {
                     caster: Some(EntityId(7)),
                     max_duration_ms: None,
                     remaining_ms: None,
+                    observed_at_ms: None,
                 },
             );
         assert_eq!(
             decide_next(&Snapshot::from_state(&state), &retry, now, false),
             MaintenanceDecision::Satisfied
+        );
+    }
+
+    #[test]
+    fn mage_restocks_drink_before_food_from_authoritative_backpack_state() {
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(8);
+        state.capabilities.spells.extend([5504, 587]);
+        authoritative_caster(&mut state, EntityId(7));
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+        state.inventory.instances.insert(
+            EntityId(70),
+            wow_state::inventory::InventoryItemInstance {
+                item: 700,
+                guid: EntityId(70),
+                backpack_slot: 23,
+                count: 10,
+            },
+        );
+        state.inventory.item_metadata.insert(
+            700,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Conjured Sweet Roll".into(),
+                item_class: 0,
+                subclass: 5,
+                use_spell_id: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::Cast {
+                family: "mage_water".into(),
+                spell: 5504,
+                target: EntityId(7)
+            }
+        );
+        state
+            .inventory
+            .instances
+            .get_mut(&EntityId(70))
+            .unwrap()
+            .count = 1;
+        let now = Instant::now();
+        let retry = BTreeMap::from([((5504, EntityId(7)), now + Duration::from_secs(10))]);
+        assert_eq!(
+            decide_next(&Snapshot::from_state(&state), &retry, now, false),
+            MaintenanceDecision::Cast {
+                family: "mage_food".into(),
+                spell: 587,
+                target: EntityId(7)
+            }
+        );
+    }
+
+    #[test]
+    fn mage_supply_count_waits_for_backpack_templates_and_counts_refreshments_both_ways() {
+        let mut state = AuthoritativeState::default();
+        state.inventory.instances.insert(
+            EntityId(71),
+            wow_state::inventory::InventoryItemInstance {
+                item: 701,
+                guid: EntityId(71),
+                backpack_slot: 23,
+                count: 10,
+            },
+        );
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(mage_food_and_drink(&snapshot), None);
+        state.inventory.item_metadata.insert(
+            701,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Conjured Refreshment".into(),
+                item_class: 0,
+                subclass: 5,
+                use_spell_id: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mage_food_and_drink(&Snapshot::from_state(&state)),
+            Some((10, 10))
+        );
+    }
+
+    #[test]
+    fn warlock_creates_a_missing_healthstone_before_other_supplies() {
+        let mut state = warlock_with_active_pet();
+        state.capabilities.spells.insert(6202);
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::Cast {
+                family: "warlock_create_healthstone".into(),
+                spell: 6202,
+                target: EntityId(7)
+            }
+        );
+    }
+
+    #[test]
+    fn warlock_creates_and_applies_soulstone_through_typed_item_work() {
+        let mut state = warlock_with_active_pet();
+        state.capabilities.spells.insert(20752);
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::Cast {
+                family: "warlock_create_soulstone".into(),
+                spell: 20752,
+                target: EntityId(7)
+            }
+        );
+
+        state.inventory.instances.insert(
+            EntityId(81),
+            wow_state::inventory::InventoryItemInstance {
+                item: 810,
+                guid: EntityId(81),
+                backpack_slot: 23,
+                count: 1,
+            },
+        );
+        state.inventory.item_metadata.insert(
+            810,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Minor Soulstone".into(),
+                item_class: 0,
+                subclass: 5,
+                use_spell_id: 20707,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::UseItemInstance {
+                item: 810,
+                item_guid: EntityId(81),
+                backpack_slot: 23,
+                spell: 20707,
+                target: EntityId(7)
+            }
+        );
+        state.auras.by_entity.get_mut(&EntityId(7)).unwrap().insert(
+            1,
+            AuraInstance {
+                slot: 1,
+                spell: 20707,
+                positive: Some(true),
+                caster: Some(EntityId(7)),
+                max_duration_ms: None,
+                remaining_ms: None,
+                observed_at_ms: None,
+            },
+        );
+        assert_ne!(
+            decide_next(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                false
+            ),
+            MaintenanceDecision::UseItemInstance {
+                item: 810,
+                item_guid: EntityId(81),
+                backpack_slot: 23,
+                spell: 20707,
+                target: EntityId(7)
+            }
         );
     }
     #[test]
@@ -479,6 +2052,14 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn persistent_pet_retry_classification_covers_all_supported_companions() {
+        assert!(is_persistent_pet_summon(688));
+        assert!(is_persistent_pet_summon(DEATH_KNIGHT_PERSISTENT_PET));
+        assert!(is_persistent_pet_summon(MAGE_WATER_ELEMENTAL_SPELL));
+        assert!(!is_persistent_pet_summon(30146 + 1));
     }
 
     #[test]
@@ -531,6 +2112,7 @@ mod tests {
                     caster: Some(EntityId(7)),
                     max_duration_ms: None,
                     remaining_ms: None,
+                    observed_at_ms: None,
                 },
             );
         state.entities.0.insert(

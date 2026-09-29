@@ -7,7 +7,7 @@ const INTERACTION_MAX_RANGE: f32 = 5.0;
 const INTERACTION_APPROACH_RANGE: f32 = 4.0;
 // Keep the corpse approach inside the server interaction limit.
 const CORPSE_LOOT_SAFE_RANGE: f32 = 2.5;
-const NPC_FRONT_STANDOFF: f32 = 3.0;
+pub const NPC_FRONT_STANDOFF: f32 = 3.0;
 const NPC_FRONT_TOLERANCE: f32 = 0.8;
 const MOB_REAR_STANDOFF: f32 = 3.0;
 const MOB_REAR_TOLERANCE: f32 = 1.0;
@@ -137,6 +137,14 @@ pub fn profile(command: &GameplayCommand) -> Option<SpatialProfile> {
             INTERACTION_MAX_RANGE,
             INTERACTION_APPROACH_RANGE,
             Some(INTERACTION_FACING_TOLERANCE),
+            true,
+        ),
+        GameplayCommand::RepairEquipment { vendor } => (
+            *vendor,
+            0.0,
+            INTERACTION_MAX_RANGE,
+            INTERACTION_APPROACH_RANGE,
+            None,
             true,
         ),
         GameplayCommand::Cast {
@@ -347,6 +355,30 @@ pub fn npc_front_approach_point(target: WorldPosition, standoff: f32) -> Option<
     target_approach_point(target, 0.0, standoff)
 }
 
+/// Return the first NPC approach destination that passes the caller's safety
+/// check. Try the NPC's front first, then nearby sides, then its rear.
+pub fn first_safe_npc_approach_point(
+    target: WorldPosition,
+    standoff: f32,
+    mut is_safe: impl FnMut(Vec3) -> Option<Vec3>,
+) -> Option<Vec3> {
+    const APPROACH_ANGLE_OFFSETS: [f32; 8] = [
+        0.0,
+        PI / 4.0,
+        -PI / 4.0,
+        PI / 2.0,
+        -PI / 2.0,
+        3.0 * PI / 4.0,
+        -3.0 * PI / 4.0,
+        PI,
+    ];
+
+    APPROACH_ANGLE_OFFSETS
+        .into_iter()
+        .filter_map(|offset| target_approach_point(target, offset, standoff))
+        .find_map(&mut is_safe)
+}
+
 fn target_approach_point(target: WorldPosition, angle_offset: f32, standoff: f32) -> Option<Vec3> {
     if !target.point.is_finite()
         || !target.orientation.is_finite()
@@ -375,6 +407,14 @@ fn requires_npc_front_approach(command: &GameplayCommand) -> bool {
             | GameplayCommand::VendorList { .. }
             | GameplayCommand::VendorSell { .. }
     )
+}
+
+pub fn npc_front_approach_target(command: &GameplayCommand) -> Option<EntityId> {
+    if requires_npc_front_approach(command) {
+        profile(command).map(|profile| profile.target)
+    } else {
+        None
+    }
 }
 
 pub fn movement_requirement(
@@ -462,6 +502,78 @@ pub fn movement_requirement(
             movement_uses_3d_distance(snapshot),
         )
     }
+}
+
+/// Return a bounded set of grounded approach points for a targeted combat
+/// action. The first point faces the mover; the remaining points provide
+/// nearby alternatives when that side of the target is behind terrain.
+pub fn combat_approach_candidates(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+) -> Option<(Vec<Vec3>, f32)> {
+    let profile = profile(command)?;
+    let band = match command {
+        GameplayCommand::Attack(_) => RangeBand {
+            minimum: 0.0,
+            maximum: MOB_MELEE_MAX_RANGE,
+            preferred: MOB_MELEE_APPROACH_RANGE,
+        },
+        GameplayCommand::Cast {
+            spell,
+            target: Some(_),
+        } => {
+            let hostile_target = snapshot
+                .state
+                .entities
+                .0
+                .get(&profile.target)
+                .is_some_and(|entity| entity.hostile);
+            spell_range_band(*spell, hostile_target)
+        }
+        _ => return None,
+    };
+    let mover = active_mover(snapshot)?;
+    let target = target_position(snapshot, profile.target)?;
+    if mover.map != target.map {
+        return None;
+    }
+    let distance = movement_distance(snapshot, mover.point, target.point);
+    if distance <= band.maximum {
+        return None;
+    }
+
+    let desired = band.preferred.clamp(band.minimum, band.maximum);
+    let dx = mover.point.x - target.point.x;
+    let dy = mover.point.y - target.point.y;
+    let angle = if dx.hypot(dy) > f32::EPSILON {
+        dy.atan2(dx)
+    } else {
+        mover.orientation
+    };
+    let vertical = if movement_uses_3d_distance(snapshot) {
+        mover.point.z - target.point.z
+    } else {
+        0.0
+    };
+    let horizontal_range = (desired * desired - vertical * vertical).max(0.0).sqrt();
+    let offsets = [0.0_f32, 35.0, -35.0, 60.0, -60.0, 90.0, -90.0, 180.0];
+    let mut candidates = Vec::with_capacity(offsets.len());
+    for offset in offsets {
+        let candidate_angle = angle + offset.to_radians();
+        let point = Vec3::new(
+            target.point.x + candidate_angle.cos() * horizontal_range,
+            target.point.y + candidate_angle.sin() * horizontal_range,
+            target.point.z,
+        );
+        if point.is_finite()
+            && !candidates
+                .iter()
+                .any(|known: &Vec3| known.distance(point) < 0.1)
+        {
+            candidates.push(point);
+        }
+    }
+    (!candidates.is_empty()).then_some((candidates, 0.75))
 }
 
 /// Report whether a targeted action is authoritatively in range. `None` means
@@ -819,6 +931,33 @@ mod tests {
     }
 
     #[test]
+    fn combat_approach_candidates_stay_in_action_range_and_offer_sides() {
+        let snapshot = snapshot(
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(0.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+            WorldPosition {
+                map: 1,
+                point: Vec3::new(20.0, 0.0, 0.0),
+                orientation: 0.0,
+            },
+        );
+        let (candidates, acceptable_range) =
+            combat_approach_candidates(&snapshot, &GameplayCommand::Attack(EntityId(7))).unwrap();
+
+        assert_eq!(candidates.len(), 8);
+        assert_eq!(acceptable_range, 0.75);
+        for candidate in candidates {
+            assert!(
+                (candidate.distance(Vec3::new(20.0, 0.0, 0.0)) - MOB_MELEE_APPROACH_RANGE).abs()
+                    < 0.001
+            );
+        }
+    }
+
+    #[test]
     fn interaction_approach_keeps_margin_inside_server_range() {
         let s = snapshot(
             WorldPosition {
@@ -917,6 +1056,37 @@ mod tests {
 
         assert_eq!(requirement.destination, Vec3::new(3.0, 0.0, 0.0));
         assert_eq!(requirement.acceptable_range, 0.8);
+    }
+
+    #[test]
+    fn npc_approach_skips_unsafe_front_and_uses_a_safe_side() {
+        let target = WorldPosition {
+            map: 1,
+            point: Vec3::new(5.0, 6.0, 7.0),
+            orientation: 0.0,
+        };
+        let selected = first_safe_npc_approach_point(target, 3.0, |candidate| {
+            // Model lava at the NPC's front point. A side point is safe.
+            (candidate.x < 7.9).then_some(candidate)
+        })
+        .expect("a safe side point should be available");
+
+        assert_ne!(selected, npc_front_approach_point(target, 3.0).unwrap());
+        assert!((selected.distance(target.point) - 3.0).abs() < 0.001);
+        assert_eq!(selected.z, target.point.z);
+    }
+
+    #[test]
+    fn npc_approach_requires_an_authoritative_npc_target() {
+        let command = GameplayCommand::TurnInQuest {
+            quest: 170,
+            giver: EntityId(7),
+        };
+        assert_eq!(npc_front_approach_target(&command), Some(EntityId(7)));
+        assert_eq!(
+            npc_front_approach_target(&GameplayCommand::Attack(EntityId(7))),
+            None
+        );
     }
 
     #[test]

@@ -1,0 +1,1453 @@
+{
+  "format_version": 1,
+  "source": {
+    "client_build": 12340,
+    "sha256": "11237852179c218efdba4ddbb899c835a63770505c5dd383b710a3d8c01c1d50"
+  },
+  "glyphs": [
+    {
+      "property_id": 2,
+      "spell_id": 52084
+    },
+    {
+      "property_id": 21,
+      "spell_id": 12320
+    },
+    {
+      "property_id": 22,
+      "spell_id": 12297
+    },
+    {
+      "property_id": 61,
+      "spell_id": 46831
+    },
+    {
+      "property_id": 81,
+      "spell_id": 52084
+    },
+    {
+      "property_id": 82,
+      "spell_id": 52085
+    },
+    {
+      "property_id": 121,
+      "spell_id": 46487
+    },
+    {
+      "property_id": 141,
+      "spell_id": 54292
+    },
+    {
+      "property_id": 161,
+      "spell_id": 54810
+    },
+    {
+      "property_id": 162,
+      "spell_id": 54811
+    },
+    {
+      "property_id": 163,
+      "spell_id": 54812
+    },
+    {
+      "property_id": 164,
+      "spell_id": 54813
+    },
+    {
+      "property_id": 165,
+      "spell_id": 54815
+    },
+    {
+      "property_id": 166,
+      "spell_id": 54818
+    },
+    {
+      "property_id": 167,
+      "spell_id": 54821
+    },
+    {
+      "property_id": 168,
+      "spell_id": 54824
+    },
+    {
+      "property_id": 169,
+      "spell_id": 54832
+    },
+    {
+      "property_id": 170,
+      "spell_id": 54733
+    },
+    {
+      "property_id": 171,
+      "spell_id": 54743
+    },
+    {
+      "property_id": 172,
+      "spell_id": 54754
+    },
+    {
+      "property_id": 173,
+      "spell_id": 54825
+    },
+    {
+      "property_id": 174,
+      "spell_id": 54826
+    },
+    {
+      "property_id": 175,
+      "spell_id": 54845
+    },
+    {
+      "property_id": 176,
+      "spell_id": 54830
+    },
+    {
+      "property_id": 177,
+      "spell_id": 54831
+    },
+    {
+      "property_id": 178,
+      "spell_id": 54828
+    },
+    {
+      "property_id": 179,
+      "spell_id": 54756
+    },
+    {
+      "property_id": 180,
+      "spell_id": 54829
+    },
+    {
+      "property_id": 181,
+      "spell_id": 54760
+    },
+    {
+      "property_id": 182,
+      "spell_id": 54912
+    },
+    {
+      "property_id": 183,
+      "spell_id": 54922
+    },
+    {
+      "property_id": 184,
+      "spell_id": 54925
+    },
+    {
+      "property_id": 185,
+      "spell_id": 54923
+    },
+    {
+      "property_id": 186,
+      "spell_id": 54924
+    },
+    {
+      "property_id": 187,
+      "spell_id": 54926
+    },
+    {
+      "property_id": 188,
+      "spell_id": 54927
+    },
+    {
+      "property_id": 189,
+      "spell_id": 54928
+    },
+    {
+      "property_id": 190,
+      "spell_id": 54929
+    },
+    {
+      "property_id": 191,
+      "spell_id": 54930
+    },
+    {
+      "property_id": 192,
+      "spell_id": 54931
+    },
+    {
+      "property_id": 193,
+      "spell_id": 54934
+    },
+    {
+      "property_id": 194,
+      "spell_id": 54935
+    },
+    {
+      "property_id": 195,
+      "spell_id": 54936
+    },
+    {
+      "property_id": 196,
+      "spell_id": 54937
+    },
+    {
+      "property_id": 197,
+      "spell_id": 54938
+    },
+    {
+      "property_id": 198,
+      "spell_id": 54939
+    },
+    {
+      "property_id": 199,
+      "spell_id": 54940
+    },
+    {
+      "property_id": 200,
+      "spell_id": 54943
+    },
+    {
+      "property_id": 211,
+      "spell_id": 55436
+    },
+    {
+      "property_id": 212,
+      "spell_id": 55437
+    },
+    {
+      "property_id": 213,
+      "spell_id": 55449
+    },
+    {
+      "property_id": 214,
+      "spell_id": 55454
+    },
+    {
+      "property_id": 215,
+      "spell_id": 55442
+    },
+    {
+      "property_id": 216,
+      "spell_id": 55439
+    },
+    {
+      "property_id": 217,
+      "spell_id": 55455
+    },
+    {
+      "property_id": 218,
+      "spell_id": 55450
+    },
+    {
+      "property_id": 219,
+      "spell_id": 55447
+    },
+    {
+      "property_id": 220,
+      "spell_id": 55451
+    },
+    {
+      "property_id": 221,
+      "spell_id": 55443
+    },
+    {
+      "property_id": 222,
+      "spell_id": 55456
+    },
+    {
+      "property_id": 223,
+      "spell_id": 55440
+    },
+    {
+      "property_id": 224,
+      "spell_id": 55438
+    },
+    {
+      "property_id": 225,
+      "spell_id": 55448
+    },
+    {
+      "property_id": 226,
+      "spell_id": 55453
+    },
+    {
+      "property_id": 227,
+      "spell_id": 55441
+    },
+    {
+      "property_id": 228,
+      "spell_id": 55446
+    },
+    {
+      "property_id": 229,
+      "spell_id": 55444
+    },
+    {
+      "property_id": 230,
+      "spell_id": 55452
+    },
+    {
+      "property_id": 231,
+      "spell_id": 55445
+    },
+    {
+      "property_id": 251,
+      "spell_id": 55675
+    },
+    {
+      "property_id": 252,
+      "spell_id": 55677
+    },
+    {
+      "property_id": 253,
+      "spell_id": 55684
+    },
+    {
+      "property_id": 254,
+      "spell_id": 55678
+    },
+    {
+      "property_id": 255,
+      "spell_id": 55679
+    },
+    {
+      "property_id": 256,
+      "spell_id": 55683
+    },
+    {
+      "property_id": 257,
+      "spell_id": 55686
+    },
+    {
+      "property_id": 258,
+      "spell_id": 55673
+    },
+    {
+      "property_id": 259,
+      "spell_id": 55691
+    },
+    {
+      "property_id": 260,
+      "spell_id": 55688
+    },
+    {
+      "property_id": 261,
+      "spell_id": 55681
+    },
+    {
+      "property_id": 262,
+      "spell_id": 55689
+    },
+    {
+      "property_id": 263,
+      "spell_id": 55672
+    },
+    {
+      "property_id": 264,
+      "spell_id": 55680
+    },
+    {
+      "property_id": 265,
+      "spell_id": 55676
+    },
+    {
+      "property_id": 266,
+      "spell_id": 55674
+    },
+    {
+      "property_id": 267,
+      "spell_id": 55690
+    },
+    {
+      "property_id": 268,
+      "spell_id": 55682
+    },
+    {
+      "property_id": 269,
+      "spell_id": 55687
+    },
+    {
+      "property_id": 270,
+      "spell_id": 55692
+    },
+    {
+      "property_id": 271,
+      "spell_id": 55685
+    },
+    {
+      "property_id": 272,
+      "spell_id": 56242
+    },
+    {
+      "property_id": 273,
+      "spell_id": 56235
+    },
+    {
+      "property_id": 274,
+      "spell_id": 56218
+    },
+    {
+      "property_id": 275,
+      "spell_id": 56241
+    },
+    {
+      "property_id": 276,
+      "spell_id": 56232
+    },
+    {
+      "property_id": 277,
+      "spell_id": 56244
+    },
+    {
+      "property_id": 278,
+      "spell_id": 56246
+    },
+    {
+      "property_id": 279,
+      "spell_id": 56249
+    },
+    {
+      "property_id": 280,
+      "spell_id": 56238
+    },
+    {
+      "property_id": 281,
+      "spell_id": 56224
+    },
+    {
+      "property_id": 282,
+      "spell_id": 56217
+    },
+    {
+      "property_id": 283,
+      "spell_id": 56228
+    },
+    {
+      "property_id": 284,
+      "spell_id": 56248
+    },
+    {
+      "property_id": 285,
+      "spell_id": 56226
+    },
+    {
+      "property_id": 286,
+      "spell_id": 56240
+    },
+    {
+      "property_id": 287,
+      "spell_id": 56229
+    },
+    {
+      "property_id": 288,
+      "spell_id": 56216
+    },
+    {
+      "property_id": 289,
+      "spell_id": 56231
+    },
+    {
+      "property_id": 290,
+      "spell_id": 56250
+    },
+    {
+      "property_id": 291,
+      "spell_id": 56233
+    },
+    {
+      "property_id": 292,
+      "spell_id": 56247
+    },
+    {
+      "property_id": 311,
+      "spell_id": 56360
+    },
+    {
+      "property_id": 312,
+      "spell_id": 56363
+    },
+    {
+      "property_id": 313,
+      "spell_id": 56381
+    },
+    {
+      "property_id": 314,
+      "spell_id": 56365
+    },
+    {
+      "property_id": 315,
+      "spell_id": 56380
+    },
+    {
+      "property_id": 316,
+      "spell_id": 56368
+    },
+    {
+      "property_id": 317,
+      "spell_id": 56369
+    },
+    {
+      "property_id": 318,
+      "spell_id": 56376
+    },
+    {
+      "property_id": 319,
+      "spell_id": 56370
+    },
+    {
+      "property_id": 320,
+      "spell_id": 56384
+    },
+    {
+      "property_id": 321,
+      "spell_id": 56372
+    },
+    {
+      "property_id": 322,
+      "spell_id": 56377
+    },
+    {
+      "property_id": 323,
+      "spell_id": 56374
+    },
+    {
+      "property_id": 324,
+      "spell_id": 56371
+    },
+    {
+      "property_id": 325,
+      "spell_id": 56366
+    },
+    {
+      "property_id": 326,
+      "spell_id": 56383
+    },
+    {
+      "property_id": 327,
+      "spell_id": 56367
+    },
+    {
+      "property_id": 328,
+      "spell_id": 56382
+    },
+    {
+      "property_id": 329,
+      "spell_id": 56375
+    },
+    {
+      "property_id": 330,
+      "spell_id": 56364
+    },
+    {
+      "property_id": 331,
+      "spell_id": 56373
+    },
+    {
+      "property_id": 351,
+      "spell_id": 56824
+    },
+    {
+      "property_id": 352,
+      "spell_id": 56841
+    },
+    {
+      "property_id": 353,
+      "spell_id": 56857
+    },
+    {
+      "property_id": 354,
+      "spell_id": 56833
+    },
+    {
+      "property_id": 355,
+      "spell_id": 56851
+    },
+    {
+      "property_id": 356,
+      "spell_id": 56830
+    },
+    {
+      "property_id": 357,
+      "spell_id": 56850
+    },
+    {
+      "property_id": 358,
+      "spell_id": 56844
+    },
+    {
+      "property_id": 359,
+      "spell_id": 56845
+    },
+    {
+      "property_id": 360,
+      "spell_id": 56847
+    },
+    {
+      "property_id": 361,
+      "spell_id": 56829
+    },
+    {
+      "property_id": 362,
+      "spell_id": 56846
+    },
+    {
+      "property_id": 363,
+      "spell_id": 56856
+    },
+    {
+      "property_id": 364,
+      "spell_id": 56836
+    },
+    {
+      "property_id": 365,
+      "spell_id": 56828
+    },
+    {
+      "property_id": 366,
+      "spell_id": 56832
+    },
+    {
+      "property_id": 367,
+      "spell_id": 56849
+    },
+    {
+      "property_id": 368,
+      "spell_id": 56826
+    },
+    {
+      "property_id": 369,
+      "spell_id": 56842
+    },
+    {
+      "property_id": 370,
+      "spell_id": 56838
+    },
+    {
+      "property_id": 371,
+      "spell_id": 56848
+    },
+    {
+      "property_id": 391,
+      "spell_id": 56808
+    },
+    {
+      "property_id": 392,
+      "spell_id": 56813
+    },
+    {
+      "property_id": 393,
+      "spell_id": 56800
+    },
+    {
+      "property_id": 394,
+      "spell_id": 56818
+    },
+    {
+      "property_id": 395,
+      "spell_id": 56820
+    },
+    {
+      "property_id": 396,
+      "spell_id": 56806
+    },
+    {
+      "property_id": 397,
+      "spell_id": 56799
+    },
+    {
+      "property_id": 398,
+      "spell_id": 56802
+    },
+    {
+      "property_id": 399,
+      "spell_id": 56803
+    },
+    {
+      "property_id": 400,
+      "spell_id": 56804
+    },
+    {
+      "property_id": 401,
+      "spell_id": 56812
+    },
+    {
+      "property_id": 402,
+      "spell_id": 56814
+    },
+    {
+      "property_id": 403,
+      "spell_id": 56809
+    },
+    {
+      "property_id": 404,
+      "spell_id": 56807
+    },
+    {
+      "property_id": 405,
+      "spell_id": 56819
+    },
+    {
+      "property_id": 406,
+      "spell_id": 56801
+    },
+    {
+      "property_id": 407,
+      "spell_id": 56798
+    },
+    {
+      "property_id": 408,
+      "spell_id": 56805
+    },
+    {
+      "property_id": 409,
+      "spell_id": 56821
+    },
+    {
+      "property_id": 410,
+      "spell_id": 56810
+    },
+    {
+      "property_id": 411,
+      "spell_id": 56811
+    },
+    {
+      "property_id": 431,
+      "spell_id": 57856
+    },
+    {
+      "property_id": 432,
+      "spell_id": 57858
+    },
+    {
+      "property_id": 433,
+      "spell_id": 57855
+    },
+    {
+      "property_id": 434,
+      "spell_id": 57857
+    },
+    {
+      "property_id": 435,
+      "spell_id": 57862
+    },
+    {
+      "property_id": 436,
+      "spell_id": 58133
+    },
+    {
+      "property_id": 438,
+      "spell_id": 58132
+    },
+    {
+      "property_id": 439,
+      "spell_id": 57866
+    },
+    {
+      "property_id": 440,
+      "spell_id": 57870
+    },
+    {
+      "property_id": 441,
+      "spell_id": 57903
+    },
+    {
+      "property_id": 442,
+      "spell_id": 57902
+    },
+    {
+      "property_id": 443,
+      "spell_id": 57904
+    },
+    {
+      "property_id": 444,
+      "spell_id": 57900
+    },
+    {
+      "property_id": 445,
+      "spell_id": 57924
+    },
+    {
+      "property_id": 446,
+      "spell_id": 57926
+    },
+    {
+      "property_id": 447,
+      "spell_id": 57927
+    },
+    {
+      "property_id": 448,
+      "spell_id": 57928
+    },
+    {
+      "property_id": 449,
+      "spell_id": 58136
+    },
+    {
+      "property_id": 450,
+      "spell_id": 52648
+    },
+    {
+      "property_id": 451,
+      "spell_id": 57925
+    },
+    {
+      "property_id": 452,
+      "spell_id": 57937
+    },
+    {
+      "property_id": 453,
+      "spell_id": 57958
+    },
+    {
+      "property_id": 454,
+      "spell_id": 57979
+    },
+    {
+      "property_id": 455,
+      "spell_id": 57955
+    },
+    {
+      "property_id": 456,
+      "spell_id": 57947
+    },
+    {
+      "property_id": 457,
+      "spell_id": 57954
+    },
+    {
+      "property_id": 458,
+      "spell_id": 57985
+    },
+    {
+      "property_id": 459,
+      "spell_id": 57987
+    },
+    {
+      "property_id": 460,
+      "spell_id": 58009
+    },
+    {
+      "property_id": 461,
+      "spell_id": 57986
+    },
+    {
+      "property_id": 462,
+      "spell_id": 58015
+    },
+    {
+      "property_id": 463,
+      "spell_id": 58228
+    },
+    {
+      "property_id": 464,
+      "spell_id": 58032
+    },
+    {
+      "property_id": 465,
+      "spell_id": 58027
+    },
+    {
+      "property_id": 466,
+      "spell_id": 58017
+    },
+    {
+      "property_id": 467,
+      "spell_id": 58033
+    },
+    {
+      "property_id": 468,
+      "spell_id": 58039
+    },
+    {
+      "property_id": 469,
+      "spell_id": 58038
+    },
+    {
+      "property_id": 470,
+      "spell_id": 58058
+    },
+    {
+      "property_id": 471,
+      "spell_id": 58135
+    },
+    {
+      "property_id": 472,
+      "spell_id": 58134
+    },
+    {
+      "property_id": 473,
+      "spell_id": 58059
+    },
+    {
+      "property_id": 474,
+      "spell_id": 58055
+    },
+    {
+      "property_id": 475,
+      "spell_id": 58063
+    },
+    {
+      "property_id": 476,
+      "spell_id": 58057
+    },
+    {
+      "property_id": 477,
+      "spell_id": 58079
+    },
+    {
+      "property_id": 478,
+      "spell_id": 58070
+    },
+    {
+      "property_id": 479,
+      "spell_id": 58081
+    },
+    {
+      "property_id": 480,
+      "spell_id": 58080
+    },
+    {
+      "property_id": 481,
+      "spell_id": 58107
+    },
+    {
+      "property_id": 482,
+      "spell_id": 58094
+    },
+    {
+      "property_id": 483,
+      "spell_id": 58095
+    },
+    {
+      "property_id": 484,
+      "spell_id": 58096
+    },
+    {
+      "property_id": 485,
+      "spell_id": 58097
+    },
+    {
+      "property_id": 486,
+      "spell_id": 58099
+    },
+    {
+      "property_id": 487,
+      "spell_id": 58098
+    },
+    {
+      "property_id": 488,
+      "spell_id": 58104
+    },
+    {
+      "property_id": 489,
+      "spell_id": 58368
+    },
+    {
+      "property_id": 490,
+      "spell_id": 58369
+    },
+    {
+      "property_id": 491,
+      "spell_id": 58355
+    },
+    {
+      "property_id": 492,
+      "spell_id": 58366
+    },
+    {
+      "property_id": 493,
+      "spell_id": 58388
+    },
+    {
+      "property_id": 494,
+      "spell_id": 58367
+    },
+    {
+      "property_id": 495,
+      "spell_id": 58372
+    },
+    {
+      "property_id": 496,
+      "spell_id": 58357
+    },
+    {
+      "property_id": 497,
+      "spell_id": 58377
+    },
+    {
+      "property_id": 498,
+      "spell_id": 58365
+    },
+    {
+      "property_id": 499,
+      "spell_id": 58386
+    },
+    {
+      "property_id": 500,
+      "spell_id": 58385
+    },
+    {
+      "property_id": 501,
+      "spell_id": 58364
+    },
+    {
+      "property_id": 502,
+      "spell_id": 58375
+    },
+    {
+      "property_id": 503,
+      "spell_id": 58376
+    },
+    {
+      "property_id": 504,
+      "spell_id": 58387
+    },
+    {
+      "property_id": 505,
+      "spell_id": 58384
+    },
+    {
+      "property_id": 506,
+      "spell_id": 58353
+    },
+    {
+      "property_id": 507,
+      "spell_id": 58356
+    },
+    {
+      "property_id": 508,
+      "spell_id": 58382
+    },
+    {
+      "property_id": 509,
+      "spell_id": 58370
+    },
+    {
+      "property_id": 511,
+      "spell_id": 58613
+    },
+    {
+      "property_id": 512,
+      "spell_id": 58623
+    },
+    {
+      "property_id": 513,
+      "spell_id": 58616
+    },
+    {
+      "property_id": 514,
+      "spell_id": 58640
+    },
+    {
+      "property_id": 515,
+      "spell_id": 58673
+    },
+    {
+      "property_id": 516,
+      "spell_id": 58620
+    },
+    {
+      "property_id": 518,
+      "spell_id": 58677
+    },
+    {
+      "property_id": 519,
+      "spell_id": 62259
+    },
+    {
+      "property_id": 520,
+      "spell_id": 58629
+    },
+    {
+      "property_id": 521,
+      "spell_id": 58647
+    },
+    {
+      "property_id": 522,
+      "spell_id": 58680
+    },
+    {
+      "property_id": 523,
+      "spell_id": 58625
+    },
+    {
+      "property_id": 524,
+      "spell_id": 58631
+    },
+    {
+      "property_id": 525,
+      "spell_id": 58671
+    },
+    {
+      "property_id": 526,
+      "spell_id": 58657
+    },
+    {
+      "property_id": 527,
+      "spell_id": 58686
+    },
+    {
+      "property_id": 528,
+      "spell_id": 58669
+    },
+    {
+      "property_id": 529,
+      "spell_id": 58642
+    },
+    {
+      "property_id": 530,
+      "spell_id": 58618
+    },
+    {
+      "property_id": 531,
+      "spell_id": 58635
+    },
+    {
+      "property_id": 532,
+      "spell_id": 58676
+    },
+    {
+      "property_id": 551,
+      "spell_id": 59219
+    },
+    {
+      "property_id": 552,
+      "spell_id": 59289
+    },
+    {
+      "property_id": 553,
+      "spell_id": 59309
+    },
+    {
+      "property_id": 554,
+      "spell_id": 59307
+    },
+    {
+      "property_id": 555,
+      "spell_id": 60200
+    },
+    {
+      "property_id": 556,
+      "spell_id": 59327
+    },
+    {
+      "property_id": 557,
+      "spell_id": 59332
+    },
+    {
+      "property_id": 558,
+      "spell_id": 59336
+    },
+    {
+      "property_id": 559,
+      "spell_id": 56420
+    },
+    {
+      "property_id": 560,
+      "spell_id": 56414
+    },
+    {
+      "property_id": 561,
+      "spell_id": 56416
+    },
+    {
+      "property_id": 571,
+      "spell_id": 60200
+    },
+    {
+      "property_id": 591,
+      "spell_id": 61205
+    },
+    {
+      "property_id": 611,
+      "spell_id": 62126
+    },
+    {
+      "property_id": 612,
+      "spell_id": 62132
+    },
+    {
+      "property_id": 613,
+      "spell_id": 62135
+    },
+    {
+      "property_id": 631,
+      "spell_id": 62080
+    },
+    {
+      "property_id": 651,
+      "spell_id": 62210
+    },
+    {
+      "property_id": 671,
+      "spell_id": 62969
+    },
+    {
+      "property_id": 672,
+      "spell_id": 62970
+    },
+    {
+      "property_id": 673,
+      "spell_id": 62971
+    },
+    {
+      "property_id": 674,
+      "spell_id": 63055
+    },
+    {
+      "property_id": 675,
+      "spell_id": 63056
+    },
+    {
+      "property_id": 676,
+      "spell_id": 63057
+    },
+    {
+      "property_id": 677,
+      "spell_id": 63065
+    },
+    {
+      "property_id": 691,
+      "spell_id": 63066
+    },
+    {
+      "property_id": 692,
+      "spell_id": 63067
+    },
+    {
+      "property_id": 693,
+      "spell_id": 63068
+    },
+    {
+      "property_id": 694,
+      "spell_id": 63069
+    },
+    {
+      "property_id": 695,
+      "spell_id": 63086
+    },
+    {
+      "property_id": 696,
+      "spell_id": 63090
+    },
+    {
+      "property_id": 697,
+      "spell_id": 63091
+    },
+    {
+      "property_id": 698,
+      "spell_id": 63092
+    },
+    {
+      "property_id": 699,
+      "spell_id": 63093
+    },
+    {
+      "property_id": 700,
+      "spell_id": 63095
+    },
+    {
+      "property_id": 701,
+      "spell_id": 63218
+    },
+    {
+      "property_id": 702,
+      "spell_id": 63219
+    },
+    {
+      "property_id": 703,
+      "spell_id": 63220
+    },
+    {
+      "property_id": 704,
+      "spell_id": 63222
+    },
+    {
+      "property_id": 705,
+      "spell_id": 63223
+    },
+    {
+      "property_id": 706,
+      "spell_id": 63224
+    },
+    {
+      "property_id": 707,
+      "spell_id": 63225
+    },
+    {
+      "property_id": 708,
+      "spell_id": 63229
+    },
+    {
+      "property_id": 709,
+      "spell_id": 63231
+    },
+    {
+      "property_id": 710,
+      "spell_id": 63235
+    },
+    {
+      "property_id": 711,
+      "spell_id": 63237
+    },
+    {
+      "property_id": 712,
+      "spell_id": 63246
+    },
+    {
+      "property_id": 713,
+      "spell_id": 63248
+    },
+    {
+      "property_id": 714,
+      "spell_id": 63249
+    },
+    {
+      "property_id": 715,
+      "spell_id": 63252
+    },
+    {
+      "property_id": 716,
+      "spell_id": 63253
+    },
+    {
+      "property_id": 731,
+      "spell_id": 63254
+    },
+    {
+      "property_id": 732,
+      "spell_id": 63256
+    },
+    {
+      "property_id": 733,
+      "spell_id": 63268
+    },
+    {
+      "property_id": 734,
+      "spell_id": 63269
+    },
+    {
+      "property_id": 735,
+      "spell_id": 63270
+    },
+    {
+      "property_id": 736,
+      "spell_id": 63271
+    },
+    {
+      "property_id": 737,
+      "spell_id": 63273
+    },
+    {
+      "property_id": 751,
+      "spell_id": 63279
+    },
+    {
+      "property_id": 752,
+      "spell_id": 63280
+    },
+    {
+      "property_id": 753,
+      "spell_id": 63291
+    },
+    {
+      "property_id": 754,
+      "spell_id": 63298
+    },
+    {
+      "property_id": 755,
+      "spell_id": 63302
+    },
+    {
+      "property_id": 756,
+      "spell_id": 63303
+    },
+    {
+      "property_id": 757,
+      "spell_id": 63304
+    },
+    {
+      "property_id": 758,
+      "spell_id": 63309
+    },
+    {
+      "property_id": 759,
+      "spell_id": 63310
+    },
+    {
+      "property_id": 760,
+      "spell_id": 63320
+    },
+    {
+      "property_id": 761,
+      "spell_id": 63312
+    },
+    {
+      "property_id": 762,
+      "spell_id": 63324
+    },
+    {
+      "property_id": 763,
+      "spell_id": 63325
+    },
+    {
+      "property_id": 764,
+      "spell_id": 63326
+    },
+    {
+      "property_id": 765,
+      "spell_id": 63327
+    },
+    {
+      "property_id": 766,
+      "spell_id": 63328
+    },
+    {
+      "property_id": 767,
+      "spell_id": 63329
+    },
+    {
+      "property_id": 768,
+      "spell_id": 63330
+    },
+    {
+      "property_id": 769,
+      "spell_id": 63331
+    },
+    {
+      "property_id": 770,
+      "spell_id": 63332
+    },
+    {
+      "property_id": 771,
+      "spell_id": 63333
+    },
+    {
+      "property_id": 772,
+      "spell_id": 63334
+    },
+    {
+      "property_id": 773,
+      "spell_id": 63335
+    },
+    {
+      "property_id": 791,
+      "spell_id": 64199
+    },
+    {
+      "property_id": 811,
+      "spell_id": 65243
+    },
+    {
+      "property_id": 831,
+      "spell_id": 67598
+    },
+    {
+      "property_id": 851,
+      "spell_id": 68164
+    },
+    {
+      "property_id": 871,
+      "spell_id": 70937
+    },
+    {
+      "property_id": 891,
+      "spell_id": 71013
+    },
+    {
+      "property_id": 911,
+      "spell_id": 70947
+    }
+  ]
+}

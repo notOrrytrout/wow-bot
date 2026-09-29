@@ -560,7 +560,7 @@ fn owned_dot_is_active(
                 aura.caster == Some(player)
                     && same_dot_family
                     && aura
-                        .remaining_ms
+                        .remaining_at(Millis::wall_clock_now().0)
                         .is_none_or(|remaining| remaining > refresh_window)
             })
         })
@@ -601,7 +601,7 @@ fn select_combat_utility(snapshot: &Snapshot, target: EntityId) -> Option<(u32, 
             if aura.caster != Some(player) || !cc.contains(&aura.spell) {
                 continue;
             }
-            let Some(remaining) = aura.remaining_ms else {
+            let Some(remaining) = aura.remaining_at(now_ms) else {
                 continue;
             };
             let window = aura_refresh_window_ms(aura.max_duration_ms);
@@ -647,7 +647,9 @@ fn select_combat_utility(snapshot: &Snapshot, target: EntityId) -> Option<(u32, 
                 auras.values().any(|aura| {
                     aura.positive == Some(true)
                         && aura.caster == Some(target)
-                        && aura.remaining_ms.is_none_or(|remaining| remaining > 500)
+                        && aura
+                            .remaining_at(now_ms)
+                            .is_none_or(|remaining| remaining > 500)
                 })
             });
         if owns_buff {
@@ -995,6 +997,45 @@ mod tests {
             Some(6222)
         );
 
+        let mut dot_on_cooldown = state.clone();
+        dot_on_cooldown
+            .capabilities
+            .spell_cooldowns
+            .insert(6222, Millis::wall_clock_now().saturating_add(5_000).0);
+        let selected_while_one_dot_is_on_cooldown =
+            select_damage_over_time(&Snapshot::from_state(&dot_on_cooldown), target);
+        assert_ne!(
+            selected_while_one_dot_is_on_cooldown,
+            Some(6222),
+            "DoT maintenance must skip a spell that is on cooldown"
+        );
+        if let Some(spell) = selected_while_one_dot_is_on_cooldown {
+            assert!(
+                crate::combat::readiness::check_spell_readiness(
+                    &Snapshot::from_state(&dot_on_cooldown),
+                    spell,
+                    Some(target),
+                    Millis::wall_clock_now().0
+                )
+                .is_ok()
+            );
+        }
+
+        let mut another_spell_is_running = state.clone();
+        another_spell_is_running.active_casts.insert(
+            EntityId(1),
+            wow_state::ActiveCastState {
+                spell: 172,
+                started_at_ms: Millis::wall_clock_now().0,
+                ends_at_ms: Millis::wall_clock_now().saturating_add(3_000).0,
+            },
+        );
+        assert_eq!(
+            select_damage_over_time(&Snapshot::from_state(&another_spell_is_running), target),
+            None,
+            "DoT maintenance must wait for the active spell to finish"
+        );
+
         let mut no_known_dot = state.clone();
         let dot_family = crate::combat::spells::metadata(6222).unwrap().family_id;
         for spell in crate::combat::spells::family_spells(dot_family).unwrap() {
@@ -1022,6 +1063,7 @@ mod tests {
                 caster: Some(EntityId(1)),
                 max_duration_ms: Some(15_000),
                 remaining_ms: Some(12_000),
+                observed_at_ms: None,
             },
         );
         let snapshot = Snapshot::from_state(&state);
@@ -1029,6 +1071,20 @@ mod tests {
         assert_eq!(
             select(&snapshot, target),
             CombatDecision::Cast { spell: 686, target }
+        );
+
+        let aura = state
+            .auras
+            .by_entity
+            .get_mut(&target)
+            .unwrap()
+            .get_mut(&0)
+            .unwrap();
+        aura.observed_at_ms = Some(Millis::wall_clock_now().0.saturating_sub(11_000));
+        assert_eq!(
+            select_damage_over_time(&Snapshot::from_state(&state), target),
+            Some(6222),
+            "server duration samples must age into the refresh window"
         );
 
         state
@@ -1039,6 +1095,14 @@ mod tests {
             .get_mut(&0)
             .unwrap()
             .remaining_ms = Some(2_000);
+        state
+            .auras
+            .by_entity
+            .get_mut(&target)
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .observed_at_ms = None;
         assert_eq!(
             select_damage_over_time(&Snapshot::from_state(&state), target),
             Some(6222)
@@ -1064,6 +1128,7 @@ mod tests {
                     caster: None,
                     max_duration_ms: None,
                     remaining_ms: None,
+                    observed_at_ms: None,
                 },
             );
         let snapshot = Snapshot::from_state(&state);
@@ -1109,6 +1174,7 @@ mod tests {
             caster: Some(EntityId(1)),
             max_duration_ms: Some(50_000),
             remaining_ms: Some(1_200),
+            observed_at_ms: None,
         };
         state
             .auras
@@ -1166,6 +1232,7 @@ mod tests {
                 caster: Some(target),
                 max_duration_ms: Some(30_000),
                 remaining_ms: Some(10_000),
+                observed_at_ms: None,
             },
         );
         assert_eq!(
@@ -1207,6 +1274,7 @@ mod tests {
                     caster: None,
                     max_duration_ms: None,
                     remaining_ms: None,
+                    observed_at_ms: None,
                 },
             );
         assert_eq!(

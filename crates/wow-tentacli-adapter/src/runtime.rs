@@ -23,6 +23,13 @@ use crate::objects::object_to_entity;
 const SMSG_TALENTS_INFO: u16 = 0x04c0;
 const SMSG_PET_SPELLS: u16 = 0x0179;
 
+fn new_processor_context() -> Result<(ObjectProcessor, Arc<RwLock<CtxMap>>)> {
+    let mut processor = ObjectProcessor::default();
+    let mut context = CtxMap::default();
+    processor.init(&mut context)?;
+    Ok((processor, Arc::new(RwLock::new(context))))
+}
+
 /// Stateful bridge around Tentacli's WotLK ObjectProcessor.
 ///
 /// The proxy owns this adapter per configured WorldSession. Tentacli maintains
@@ -44,7 +51,9 @@ pub struct ObjectObservationRuntime {
     known_equipped_ranged_item: Option<u32>,
     equipment_observed: bool,
     known_equipped_items: Option<BTreeMap<u8, u32>>,
+    known_equipped_item_instances: Option<BTreeMap<u8, wow_state::inventory::EquippedItemInstance>>,
     equipment_slots_observed: bool,
+    known_equipment_condition: Option<wow_state::inventory::EquipmentCondition>,
     profession_skill_info_observed: bool,
     known_profession_skills: Option<(BTreeMap<u32, (u16, u16)>, BTreeMap<usize, u32>)>,
     pet_control_observed: bool,
@@ -52,18 +61,17 @@ pub struct ObjectObservationRuntime {
     last_player_position: Option<WorldPosition>,
     map_id: u32,
     player_guid: Option<EntityId>,
+    world_initialized: bool,
     last_transport: Option<wow_state::transport::TransportState>,
     transport_observed: bool,
 }
 
 impl ObjectObservationRuntime {
     pub fn new() -> Result<Self> {
-        let mut processor = ObjectProcessor::default();
-        let mut context = CtxMap::default();
-        processor.init(&mut context)?;
+        let (processor, context) = new_processor_context()?;
         Ok(Self {
             processor,
-            context: Arc::new(RwLock::new(context)),
+            context,
             known: BTreeMap::new(),
             known_quests: BTreeMap::new(),
             known_inventory: BTreeMap::new(),
@@ -76,7 +84,9 @@ impl ObjectObservationRuntime {
             known_equipped_ranged_item: None,
             equipment_observed: false,
             known_equipped_items: None,
+            known_equipped_item_instances: None,
             equipment_slots_observed: false,
+            known_equipment_condition: None,
             profession_skill_info_observed: false,
             known_profession_skills: None,
             pet_control_observed: false,
@@ -84,19 +94,74 @@ impl ObjectObservationRuntime {
             last_player_position: None,
             map_id: 0,
             player_guid: None,
+            world_initialized: false,
             last_transport: None,
             transport_observed: false,
         })
     }
 
-    pub fn set_world(&mut self, map_id: u32, player_guid: Option<EntityId>) {
+    pub fn set_world(
+        &mut self,
+        position: WorldPosition,
+        player_guid: Option<EntityId>,
+    ) -> Result<()> {
+        let area_changed = self.world_initialized
+            && (self.map_id != position.map
+                || self.last_player_position.is_some_and(|previous| {
+                    previous.map != position.map || previous.point.distance(position.point) > 100.0
+                }));
+        if area_changed {
+            self.reset_world_objects()?;
+        }
+        self.apply_world_position(position, player_guid);
+        Ok(())
+    }
+
+    pub fn change_world(
+        &mut self,
+        position: WorldPosition,
+        player_guid: Option<EntityId>,
+    ) -> Result<()> {
+        self.reset_world_objects()?;
+        self.apply_world_position(position, player_guid);
+        Ok(())
+    }
+
+    fn reset_world_objects(&mut self) -> Result<()> {
+        (self.processor, self.context) = new_processor_context()?;
+        self.known.clear();
+        self.known_inventory.clear();
+        self.known_inventory_instances.clear();
+        self.known_backpack_free_slots = None;
+        self.known_controlled_mover = None;
+        self.last_controlled_position = None;
+        self.last_controlled_flags = 0;
+        self.last_money = None;
+        self.known_equipped_ranged_item = None;
+        self.equipment_observed = false;
+        self.known_equipped_items = None;
+        self.known_equipped_item_instances = None;
+        self.equipment_slots_observed = false;
+        self.known_equipment_condition = None;
+        self.profession_skill_info_observed = false;
+        self.known_profession_skills = None;
+        self.pet_control_observed = false;
+        self.last_class_id = None;
+        self.last_transport = None;
+        self.transport_observed = false;
+        Ok(())
+    }
+
+    fn apply_world_position(&mut self, position: WorldPosition, player_guid: Option<EntityId>) {
         if player_guid.is_some() {
             self.profession_skill_info_observed = false;
             self.known_profession_skills = None;
             self.last_transport = None;
             self.transport_observed = false;
         }
-        self.map_id = map_id;
+        self.map_id = position.map;
+        self.last_player_position = Some(position);
+        self.world_initialized = true;
         if player_guid.is_some() {
             self.player_guid = player_guid;
         }
@@ -110,17 +175,55 @@ impl ObjectObservationRuntime {
         let mut observations = Vec::new();
         if opcode == SMSG_PET_SPELLS && body.len() >= 8 {
             let raw_pet = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
-            observations.push(ProtocolObservation::PetControl {
-                pet: (raw_pet != 0).then_some(EntityId(raw_pet)),
-            });
-            self.pet_control_observed = true;
+            if raw_pet == 0 {
+                observations.push(ProtocolObservation::PetControl {
+                    pet: None,
+                    reaction: None,
+                    abilities: Vec::new(),
+                });
+                self.pet_control_observed = true;
+            } else if body.len() >= 58 {
+                let reaction = Some(body[14]);
+                let mut abilities = Vec::new();
+                for index in 0..10 {
+                    let offset = 18 + index * 4;
+                    let packed =
+                        u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap_or_default());
+                    let spell = packed & 0x00ff_ffff;
+                    let action_type = (packed >> 24) as u8;
+                    let autocast = match action_type {
+                        0xc1 => Some(true),
+                        0x81 => Some(false),
+                        _ => None,
+                    };
+                    if spell != 0
+                        && !abilities
+                            .iter()
+                            .any(|ability: &wow_state::pets::PetAbilityState| {
+                                ability.spell == spell
+                            })
+                    {
+                        abilities.push(wow_state::pets::PetAbilityState { spell, autocast });
+                    }
+                }
+                observations.push(ProtocolObservation::PetControl {
+                    pet: Some(EntityId(raw_pet)),
+                    reaction,
+                    abilities,
+                });
+                self.pet_control_observed = true;
+            }
         } else if opcode == SMSG_TALENTS_INFO
             && body.first().copied() == Some(0)
             && !self.pet_control_observed
         {
             // AzerothCore sends the player talent packet after pet initialization.
             // If no pet-spell packet arrived first, this confirms no active pet.
-            observations.push(ProtocolObservation::PetControl { pet: None });
+            observations.push(ProtocolObservation::PetControl {
+                pet: None,
+                reaction: None,
+                abilities: Vec::new(),
+            });
             self.pet_control_observed = true;
         }
         let mut packet = Packet::default();
@@ -138,12 +241,14 @@ impl ObjectObservationRuntime {
         }
 
         if opcode == SMSG_TALENTS_INFO
-            && let Some((group_count, active_group, talents)) = parse_player_talents_info(body)
+            && let Some((group_count, active_group, talents, glyph_properties)) =
+                parse_player_talents_info(body)
         {
             observations.push(ProtocolObservation::PlayerTalents {
                 group_count,
                 active_group,
                 talents,
+                glyph_properties,
             });
         }
         let mut current = BTreeMap::new();
@@ -204,14 +309,30 @@ impl ObjectObservationRuntime {
                         .find(|object| object.guid().0 == guid)
                         .and_then(|object| object.entry_id())
                 });
-                if !self.equipment_observed
-                    || equipped_ranged_item != self.known_equipped_ranged_item
+                if self
+                    .player_guid
+                    .is_some_and(|player| map.values().any(|object| object.guid().0 == player.0))
+                    && (!self.equipment_observed
+                        || equipped_ranged_item != self.known_equipped_ranged_item)
                 {
                     observations.push(ProtocolObservation::EquippedRangedItem {
                         item: equipped_ranged_item,
                     });
                     self.known_equipped_ranged_item = equipped_ranged_item;
                     self.equipment_observed = true;
+                }
+                let equipment_condition = self
+                    .player_guid
+                    .and_then(|player| map.values().find(|object| object.guid().0 == player.0))
+                    .and_then(|player| equipment_condition_of(player, map))
+                    .unwrap_or_default();
+                if self
+                    .player_guid
+                    .is_some_and(|player| map.values().any(|object| object.guid().0 == player.0))
+                    && self.known_equipment_condition != Some(equipment_condition)
+                {
+                    observations.push(ProtocolObservation::EquipmentCondition(equipment_condition));
+                    self.known_equipment_condition = Some(equipment_condition);
                 }
                 for object in map.values() {
                     let entity = object_to_entity(object, names, self.map_id);
@@ -278,14 +399,23 @@ impl ObjectObservationRuntime {
                                 self.profession_skill_info_observed = true;
                             }
                         }
-                        let equipped_items = equipped_items_of(object, map);
+                        let equipped_item_instances = equipped_item_instances_of(object, map);
+                        let equipped_items = equipped_item_instances.as_ref().map(|instances| {
+                            instances
+                                .iter()
+                                .map(|(slot, instance)| (*slot, instance.item))
+                                .collect()
+                        });
                         if !self.equipment_slots_observed
                             || equipped_items != self.known_equipped_items
+                            || equipped_item_instances != self.known_equipped_item_instances
                         {
                             observations.push(ProtocolObservation::EquippedItems {
                                 items: equipped_items.clone(),
+                                instances: equipped_item_instances.clone(),
                             });
                             self.known_equipped_items = equipped_items;
+                            self.known_equipped_item_instances = equipped_item_instances;
                             self.equipment_slots_observed = true;
                         }
                         if let Some(class_id) = object
@@ -476,20 +606,42 @@ fn equipped_ranged_guid_of(object: &Object) -> Option<u64> {
         .filter(|guid| *guid != 0)
 }
 
-fn equipped_items_of(player: &Object, objects: &ObjectMap) -> Option<BTreeMap<u8, u32>> {
+fn equipped_item_instances_of(
+    player: &Object,
+    objects: &ObjectMap,
+) -> Option<BTreeMap<u8, wow_state::inventory::EquippedItemInstance>> {
     let slots = inventory_slot_guids(player)?;
     let mut equipped = BTreeMap::new();
     for (slot, guid) in slots.iter().take(19).enumerate() {
         let Some(guid) = guid.filter(|guid| *guid != 0) else {
             continue;
         };
-        let item = objects
-            .values()
-            .find(|object| object.guid().0 == guid)
-            .and_then(|object| object.entry_id())?;
-        equipped.insert(u8::try_from(slot).ok()?, item);
+        let object = objects.values().find(|object| object.guid().0 == guid)?;
+        let item = object.entry_id()?;
+        equipped.insert(
+            u8::try_from(slot).ok()?,
+            wow_state::inventory::EquippedItemInstance {
+                item,
+                guid: EntityId(guid),
+                temporary_enchanted: temporary_enchant_id(object).map(|id| id != 0),
+            },
+        );
     }
     Some(equipped)
+}
+
+fn temporary_enchant_id(object: &Object) -> Option<u32> {
+    temporary_enchant_id_from_field(object.item_fields.get(&ItemField::Enchantment))
+}
+
+fn temporary_enchant_id_from_field(field: Option<&FieldValue>) -> Option<u32> {
+    let Some(FieldValue::CustomArray(enchantments)) = field else {
+        return None;
+    };
+    let FieldValue::Integer(enchant) = enchantments.get(1)?.first()?.as_ref()? else {
+        return None;
+    };
+    u32::try_from(*enchant).ok()
 }
 
 fn inventory_slot_guids(object: &Object) -> Option<&[Option<u64>]> {
@@ -497,6 +649,53 @@ fn inventory_slot_guids(object: &Object) -> Option<&[Option<u64>]> {
         Some(FieldValue::LongArray(values)) => Some(values),
         _ => None,
     }
+}
+
+fn equipment_condition_of(
+    player: &Object,
+    objects: &ObjectMap,
+) -> Option<wow_state::inventory::EquipmentCondition> {
+    let slots = inventory_slot_guids(player)?;
+    let mut durabilities = Vec::new();
+    for guid in slots
+        .iter()
+        .take(19)
+        .flatten()
+        .copied()
+        .filter(|guid| *guid != 0)
+    {
+        let item = objects.values().find(|object| object.guid().0 == guid)?;
+        let current = field_u32(item.item_fields.get(&ItemField::Durability)?)?;
+        let maximum = field_u32(item.item_fields.get(&ItemField::MaxDurability)?)?;
+        if maximum > 0 {
+            durabilities.push((current.min(maximum), maximum));
+        }
+    }
+    Some(equipment_condition_from_durabilities(&durabilities))
+}
+
+fn equipment_condition_from_durabilities(
+    durabilities: &[(u32, u32)],
+) -> wow_state::inventory::EquipmentCondition {
+    let mut result = wow_state::inventory::EquipmentCondition {
+        observed: true,
+        ..Default::default()
+    };
+    for &(current, maximum) in durabilities {
+        if maximum == 0 {
+            continue;
+        }
+        let percent = (u64::from(current.min(maximum)) * 100 / u64::from(maximum)) as u8;
+        result.lowest_durability_percent = Some(
+            result
+                .lowest_durability_percent
+                .map_or(percent, |lowest| lowest.min(percent)),
+        );
+        if current == 0 {
+            result.broken_items = result.broken_items.saturating_add(1);
+        }
+    }
+    result
 }
 
 fn backpack_slots_of(
@@ -608,6 +807,21 @@ fn quest_journal(
 }
 
 pub fn login_verify_world(body: &[u8], character_guid: u64) -> Option<ProtocolObservation> {
+    let position = parse_world_position(body)?;
+    Some(ProtocolObservation::EnteredWorld {
+        character_guid,
+        position: Some(position),
+    })
+}
+
+pub fn new_world(body: &[u8], character_guid: u64) -> Option<ProtocolObservation> {
+    Some(ProtocolObservation::WorldChanged {
+        character_guid,
+        position: parse_world_position(body)?,
+    })
+}
+
+fn parse_world_position(body: &[u8]) -> Option<WorldPosition> {
     let map = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
     let x = f32::from_le_bytes(body.get(4..8)?.try_into().ok()?);
     let y = f32::from_le_bytes(body.get(8..12)?.try_into().ok()?);
@@ -618,23 +832,19 @@ pub fn login_verify_world(body: &[u8], character_guid: u64) -> Option<ProtocolOb
         point: wow_domain::Vec3::new(x, y, z),
         orientation,
     };
-    position
-        .point
-        .is_finite()
-        .then_some(ProtocolObservation::EnteredWorld {
-            character_guid,
-            position: Some(position),
-        })
+    position.point.is_finite().then_some(position)
 }
 
 /// Parse AzerothCore's player SMSG_TALENTS_INFO payload. Pet packets use marker 1
 /// and are ignored. A malformed player packet emits unknown talent data so stale
 /// specialization state cannot remain active.
-fn parse_player_talents_info(body: &[u8]) -> Option<(Option<u8>, Option<u8>, Vec<TalentRank>)> {
+fn parse_player_talents_info(
+    body: &[u8],
+) -> Option<(Option<u8>, Option<u8>, Vec<TalentRank>, Option<Vec<u16>>)> {
     if body.first().copied()? != 0 {
         return None;
     }
-    let invalid = || Some((None, None, Vec::new()));
+    let invalid = || Some((None, None, Vec::new(), None));
     let mut reader = TalentPacketReader::new(&body[1..]);
     let Some(_unspent_points) = reader.u32() else {
         return invalid();
@@ -650,6 +860,7 @@ fn parse_player_talents_info(body: &[u8]) -> Option<(Option<u8>, Option<u8>, Vec
     }
 
     let mut active_talents = None;
+    let mut active_glyphs = None;
     for group in 0..group_count {
         let Some(count) = reader.u8().map(usize::from) else {
             return invalid();
@@ -674,13 +885,16 @@ fn parse_player_talents_info(body: &[u8]) -> Option<(Option<u8>, Option<u8>, Vec
         if glyph_count > 6 {
             return invalid();
         }
+        let mut glyphs = Vec::with_capacity(glyph_count);
         for _ in 0..glyph_count {
-            if reader.u16().is_none() {
+            let Some(glyph) = reader.u16() else {
                 return invalid();
-            }
+            };
+            glyphs.push(glyph);
         }
         if group == active_group {
             active_talents = Some(talents);
+            active_glyphs = Some(glyphs);
         }
     }
     if !reader.is_empty() {
@@ -690,6 +904,7 @@ fn parse_player_talents_info(body: &[u8]) -> Option<(Option<u8>, Option<u8>, Vec
         Some(group_count),
         Some(active_group),
         active_talents.unwrap_or_default(),
+        active_glyphs,
     ))
 }
 
@@ -736,6 +951,8 @@ mod tests {
         let mut runtime = ObjectObservationRuntime::new().expect("object observer");
         let mut pet_packet = vec![0; 58];
         pet_packet[..8].copy_from_slice(&55_u64.to_le_bytes());
+        pet_packet[14] = 2;
+        pet_packet[18..22].copy_from_slice(&(0xc100_0085_u32).to_le_bytes());
         let observations = runtime
             .observe(SMSG_PET_SPELLS, &pet_packet)
             .await
@@ -743,8 +960,22 @@ mod tests {
         assert!(matches!(
             observations.first(),
             Some(ProtocolObservation::PetControl {
-                pet: Some(EntityId(55))
+                pet: Some(EntityId(55)),
+                ..
             })
+        ));
+        assert!(
+            matches!(observations.first(), Some(ProtocolObservation::PetControl { reaction: Some(2), abilities, .. }) if abilities == &vec![wow_state::pets::PetAbilityState { spell: 133, autocast: Some(true) }])
+        );
+
+        let mut absent_runtime = ObjectObservationRuntime::new().expect("object observer");
+        let absent = absent_runtime
+            .observe(SMSG_PET_SPELLS, &0_u64.to_le_bytes())
+            .await
+            .expect("empty pet packet");
+        assert!(matches!(
+            absent.first(),
+            Some(ProtocolObservation::PetControl { pet: None, .. })
         ));
 
         let talents = player_talents_packet(0, &[talent_group(&[], &[])]);
@@ -757,6 +988,13 @@ mod tests {
                 .iter()
                 .any(|observation| matches!(observation, ProtocolObservation::PetControl { .. }))
         );
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            ProtocolObservation::PlayerTalents {
+                glyph_properties: Some(glyphs),
+                ..
+            } if glyphs.is_empty()
+        )));
 
         let mut no_pet_runtime = ObjectObservationRuntime::new().expect("object observer");
         let observations = no_pet_runtime
@@ -765,7 +1003,7 @@ mod tests {
             .expect("talents packet");
         assert!(matches!(
             observations.first(),
-            Some(ProtocolObservation::PetControl { pet: None })
+            Some(ProtocolObservation::PetControl { pet: None, .. })
         ));
     }
 
@@ -824,6 +1062,43 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            new_world(&body, 77),
+            Some(ProtocolObservation::WorldChanged {
+                character_guid: 77,
+                position: WorldPosition { map: 1, .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn world_change_resets_observer_objects_and_old_map_entities() {
+        let mut runtime = ObjectObservationRuntime::new().expect("object observer");
+        let position = WorldPosition {
+            map: 1,
+            point: wow_domain::Vec3::new(10.0, 10.0, 10.0),
+            orientation: 0.0,
+        };
+        runtime
+            .set_world(position, Some(EntityId(7)))
+            .expect("initial world");
+        runtime.known.insert(
+            EntityId(99),
+            wow_state::entities::EntityState {
+                id: EntityId(99),
+                ..Default::default()
+            },
+        );
+        runtime.known_inventory.insert(123, 2);
+
+        runtime
+            .set_world(WorldPosition { map: 2, ..position }, Some(EntityId(7)))
+            .expect("new world");
+
+        assert_eq!(runtime.map_id, 2);
+        assert!(!runtime.known.contains_key(&EntityId(99)));
+        assert!(runtime.known_inventory.is_empty());
+        assert!(runtime.last_player_position.is_some_and(|pos| pos.map == 2));
     }
 
     #[test]
@@ -831,6 +1106,42 @@ mod tests {
         assert_eq!(field_u32(&FieldValue::Integer(12)), Some(12));
         assert_eq!(field_u32(&FieldValue::Integer(-1)), None);
         assert_eq!(field_u32(&FieldValue::Bytes(12)), None);
+    }
+
+    #[test]
+    fn temporary_enchant_parser_reads_the_temporary_slot_and_fails_closed() {
+        let fields = FieldValue::CustomArray(vec![
+            vec![
+                Some(FieldValue::Integer(700)),
+                Some(FieldValue::Integer(60)),
+            ],
+            vec![Some(FieldValue::Integer(0)), Some(FieldValue::Integer(0))],
+        ]);
+        assert_eq!(temporary_enchant_id_from_field(Some(&fields)), Some(0));
+
+        let fields = FieldValue::CustomArray(vec![
+            vec![Some(FieldValue::Integer(700))],
+            vec![Some(FieldValue::Integer(803))],
+        ]);
+        assert_eq!(temporary_enchant_id_from_field(Some(&fields)), Some(803));
+        assert_eq!(temporary_enchant_id_from_field(None), None);
+        assert_eq!(
+            temporary_enchant_id_from_field(Some(&FieldValue::None)),
+            None
+        );
+    }
+
+    #[test]
+    fn equipment_durability_summary_ignores_items_without_durability() {
+        let summary = equipment_condition_from_durabilities(&[(0, 100), (26, 100), (90, 0)]);
+        assert!(summary.observed);
+        assert_eq!(summary.lowest_durability_percent, Some(0));
+        assert_eq!(summary.broken_items, 1);
+
+        let no_durable_items = equipment_condition_from_durabilities(&[]);
+        assert!(no_durable_items.observed);
+        assert_eq!(no_durable_items.lowest_durability_percent, None);
+        assert_eq!(no_durable_items.broken_items, 0);
     }
 
     #[test]
@@ -844,7 +1155,8 @@ mod tests {
                 vec![TalentRank {
                     talent_id: 74,
                     rank: 2,
-                }]
+                }],
+                Some(vec![123, 456])
             ))
         );
 
@@ -870,7 +1182,8 @@ mod tests {
                 vec![TalentRank {
                     talent_id: 74,
                     rank: 1,
-                }]
+                }],
+                Some(Vec::new())
             ))
         );
         assert_eq!(
@@ -887,7 +1200,8 @@ mod tests {
                         talent_id: 26,
                         rank: 0,
                     }
-                ]
+                ],
+                Some(vec![7])
             ))
         );
     }
@@ -896,21 +1210,21 @@ mod tests {
     fn truncated_or_invalid_player_talents_are_reported_as_unknown() {
         assert_eq!(
             parse_player_talents_info(&[0]),
-            Some((None, None, Vec::new()))
+            Some((None, None, Vec::new(), None))
         );
         assert_eq!(
             parse_player_talents_info(&player_talents_packet(0, &[vec![1, 74, 0]])),
-            Some((None, None, Vec::new()))
+            Some((None, None, Vec::new(), None))
         );
         let mut invalid_active = player_talents_packet(2, &[talent_group(&[], &[])]);
         assert_eq!(
             parse_player_talents_info(&invalid_active),
-            Some((None, None, Vec::new()))
+            Some((None, None, Vec::new(), None))
         );
         invalid_active = player_talents_packet(0, &[talent_group(&[(0, 0)], &[])]);
         assert_eq!(
             parse_player_talents_info(&invalid_active),
-            Some((None, None, Vec::new()))
+            Some((None, None, Vec::new(), None))
         );
         assert_eq!(parse_player_talents_info(&[1, 0, 0, 0, 0]), None);
     }

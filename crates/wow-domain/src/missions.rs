@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GroupRole {
+    Auto,
     Tank,
     Healer,
     Melee,
@@ -69,6 +70,17 @@ impl Mission {
             },
             permissions: PermissionSet::MOVE
                 | PermissionSet::COMBAT
+                | PermissionSet::LOOT
+                | PermissionSet::MAINTENANCE,
+        }
+    }
+    pub fn battleground(id: MissionId) -> Self {
+        Self {
+            id,
+            intent: MissionIntent::Battleground { battleground: None },
+            permissions: PermissionSet::MOVE
+                | PermissionSet::COMBAT
+                | PermissionSet::GROUP
                 | PermissionSet::LOOT
                 | PermissionSet::MAINTENANCE,
         }

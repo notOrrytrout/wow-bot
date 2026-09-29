@@ -56,6 +56,10 @@ The system SHALL use reviewed spell identity and authoritative ability metadata 
 ### Requirement: Spell legality before transmission
 The system SHALL verify applicable knowledge, cooldown, global cooldown, resources, runes, range, target legality, reagents, equipment, cast state, mission authority, and encounter authority before transmitting a spell action.
 
+#### Scenario: Another player spell is still casting
+- **WHEN** authoritative state shows an active player cast or channel
+- **THEN** combat selection does not issue a new DoT or other spell until that cast ends
+
 #### Scenario: Required resource is missing
 - **WHEN** an otherwise selected spell lacks a required authoritative resource or reagent
 - **THEN** the spell is not transmitted

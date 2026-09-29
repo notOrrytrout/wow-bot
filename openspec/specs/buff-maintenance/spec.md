@@ -101,3 +101,96 @@ Party maintenance SHALL only consider an online member after proving the member 
 - **WHEN** an online nearby party member already has a satisfying family aura
 - **THEN** the maintainer skips that member
 - **AND** it does not cast simply because retry backoff is absent
+
+### Requirement: Confirmed missing class pets are restored during maintenance
+When authoritative pet state confirms that a class pet is absent or dead, maintenance SHALL use a known, ready class summon or recovery spell before ordinary buff work. An active pet SHALL NOT be replaced. For Warlocks, unknown pet control state MAY trigger a bounded summon probe when a known persistent demon summon is ready. Maintenance SHALL retry a known-control summon no sooner than 15 seconds and an unknown-control probe no sooner than 60 seconds after an attempt.
+
+#### Scenario: Warlock has no active demon
+- **WHEN** authoritative pet state has no active demon and the Warlock knows a ready persistent demon summon
+- **THEN** maintenance selects a summon by specialization and solo/group context, with Imp as the unknown-specialization fallback
+- **AND** the summon passes shared spell readiness checks and uses an implicit self-target cast
+- **AND** the summon is queued through the shared maintenance action path before ordinary buffs
+
+#### Scenario: Warlock pet control state is unknown
+- **WHEN** pet control state is unknown and a known persistent demon summon is ready
+- **THEN** maintenance may issue one summon probe
+- **AND** maintenance does not issue another summon probe for at least 60 seconds
+
+#### Scenario: Death Knight has Master of Ghouls but no ghoul
+- **WHEN** the active talent state includes Master of Ghouls
+- **AND** Raise Dead is known and ready
+- **AND** authoritative pet state confirms no active ghoul
+- **THEN** maintenance uses the shared summon action to restore the ghoul
+- **AND** it does not summon a ghoul when Master of Ghouls is not active
+
+#### Scenario: Mage has Eternal Water but no elemental
+- **WHEN** active glyph metadata resolves to Eternal Water
+- **AND** Summon Water Elemental is known and ready
+- **AND** authoritative pet state confirms no active elemental
+- **THEN** maintenance uses the shared summon action to restore the elemental
+- **AND** it does not summon a temporary elemental without proof of Eternal Water
+
+### Requirement: Restored pets receive their safe default controls
+After the server reports a pet spell bar for a summoned or revived pet, maintenance SHALL set the pet to Defensive and enable autocast for its autocastable spells. It SHALL keep control, crowd-control, and other reviewed manual spells disabled. It SHALL enable pet taunts only when the player is not grouped. Maintenance SHALL use server-reported spell-bar state to decide which settings need correction.
+
+#### Scenario: Summoned pet has default controls disabled
+- **WHEN** the server reports an active pet in a non-Defensive reaction state with safe autocast spells disabled
+- **THEN** maintenance sets Defensive reaction and enables those autocast spells
+- **AND** it does not enable a reviewed manual ability
+
+#### Scenario: Pet taunt autocast depends on group state
+- **WHEN** the server reports an autocastable pet taunt
+- **THEN** maintenance enables it while solo and disables it while grouped
+
+#### Scenario: Pet follows the bot's authorized combat target
+- **WHEN** the bot selects an authorized combat target and has an active pet
+- **THEN** the pet receives an attack command for that target
+- **AND** an unauthorized target does not receive a pet attack command
+
+### Requirement: Mage food and drink reserves use authoritative inventory
+Mage maintenance SHALL keep at least ten food items and ten drink items in the backpack when the inventory templates are known. It SHALL select a known, ready Conjure spell and use the shared maintenance cast path. Refreshments that serve as both food and drink SHALL count toward both reserves.
+
+#### Scenario: Mage has food but lacks drink
+- **WHEN** the backpack has fewer than ten drinks and a known ready Conjure Water or Conjure Refreshment spell
+- **THEN** maintenance casts that spell on the Mage
+- **AND** it checks inventory again after the server updates the backpack
+
+#### Scenario: Inventory item templates are still loading
+- **WHEN** a backpack item has no authoritative item template
+- **THEN** Mage supply maintenance waits
+- **AND** it does not infer a supply count from incomplete inventory data
+
+### Requirement: Warlock stones use known spells and current inventory
+Warlock maintenance SHALL create a Healthstone when the backpack has none and create a Soulstone when the backpack has none. It SHALL apply an available Soulstone to self only when authoritative self-aura state does not show Soulstone Resurrection. Casts SHALL use known ready spells and item use SHALL use the shared typed item action.
+
+#### Scenario: Warlock lacks a Healthstone
+- **WHEN** the backpack has no item with a Healthstone use effect and a known ready Create Healthstone spell
+- **THEN** maintenance casts Create Healthstone on the Warlock
+- **AND** it waits for authoritative inventory before creating another
+
+#### Scenario: Warlock has an unused Soulstone
+- **WHEN** the backpack contains a Soulstone and self aura state does not show Soulstone Resurrection
+- **THEN** maintenance uses that observed item instance on self
+- **AND** it checks authoritative aura state before trying again
+
+### Requirement: Shaman weapon imbues use explicit specialization policy
+Shaman weapon imbues SHALL use a typed specialization policy and authoritative equipped-item state. The maintainer SHALL apply the highest known ready imbue in the specialization priority to an observed unenchanted weapon. Enhancement MAY maintain Flametongue on the off hand. Missing or unknown temporary-enchant evidence SHALL NOT authorize an application.
+
+#### Scenario: Unenchanted main-hand weapon is observed
+- **GIVEN** the character is a Shaman and the active specialization is known
+- **AND** the main-hand GUID and temporary-enchant state are authoritative
+- **WHEN** the main hand has no temporary enchant
+- **THEN** maintenance selects the highest known ready imbue for that specialization
+- **AND** the typed item-target command is validated against the same equipped GUID before send
+
+#### Scenario: Weapon enchant state is unknown
+- **WHEN** the equipped weapon update does not prove whether a temporary enchant is present
+- **THEN** maintenance does not apply an imbue to that weapon
+
+### Requirement: Rogue poison application uses authoritative inventory and weapons
+Rogue maintenance SHALL apply the highest ranked matching poison from authoritative backpack metadata to an observed unenchanted weapon. The PvE default SHALL use Instant Poison on main hand and Deadly Poison on off hand. It SHALL not apply a poison when weapon enchant state is unknown or already set.
+
+#### Scenario: Rogue has poison and an unenchanted main-hand weapon
+- **WHEN** an authoritative backpack item matches the configured poison family and contains a use spell
+- **AND** the main-hand instance is observed without a temporary enchant
+- **THEN** maintenance issues a typed item-on-item command for those exact item GUIDs

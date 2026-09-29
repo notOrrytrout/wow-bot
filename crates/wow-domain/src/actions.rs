@@ -1,6 +1,9 @@
 use crate::{ActionId, EntityId, TaskId, ValidityStamp, Vec3};
 use serde::{Deserialize, Serialize};
 
+/// Spell used by the captured WotLK client to open quest-item game objects.
+pub const QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID: u32 = 6_478;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PlanOrigin {
     Deterministic,
@@ -36,9 +39,34 @@ pub enum GameplayCommand {
         spell: u32,
         target: Option<EntityId>,
     },
+    CastOnItem {
+        spell: u32,
+        item_guid: EntityId,
+    },
     MaintainBuff {
         spell: u32,
         target: EntityId,
+    },
+    SummonPet {
+        spell: u32,
+        player: EntityId,
+    },
+    EquipItem {
+        item_guid: EntityId,
+        destination_slot: u8,
+    },
+    PetSetReaction {
+        pet: EntityId,
+        reaction: u8,
+    },
+    PetAttack {
+        pet: EntityId,
+        target: EntityId,
+    },
+    PetSetAutocast {
+        pet: EntityId,
+        spell: u32,
+        enabled: bool,
     },
     Loot(EntityId),
     Gather(EntityId),
@@ -54,6 +82,13 @@ pub enum GameplayCommand {
         spell: u32,
         target: Option<EntityId>,
         cast_count: u8,
+    },
+    UseItemOnItem {
+        item: u32,
+        item_guid: EntityId,
+        backpack_slot: u8,
+        spell: u32,
+        target_item_guid: EntityId,
     },
     QueryQuestGivers,
     QueryQuest {
@@ -92,6 +127,9 @@ pub enum GameplayCommand {
         item: u32,
         item_guid: EntityId,
         count: u32,
+    },
+    RepairEquipment {
+        vendor: EntityId,
     },
     TradeAccept {
         generation: u64,

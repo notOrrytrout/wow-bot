@@ -13,12 +13,63 @@ The system SHALL use current authoritative inventory state for item use, equipme
 - **WHEN** an action references an item that current inventory state no longer contains
 - **THEN** the action is rejected before mutation
 
+### Requirement: Automatic equipment upgrades use authoritative comparisons
+During maintenance, the system SHALL compare usable backpack equipment with the current authoritative equipment state and automatically equip the strongest candidate that improves its destination by at least one percent. It SHALL query missing item metadata before making a comparison and send the equip action through the shared action validation path.
+
+#### Scenario: Backpack contains a usable equipment upgrade
+- **WHEN** authoritative item metadata shows that an owned backpack item is usable and improves an equipment slot by at least one percent
+- **THEN** maintenance equips the item into the best valid slot
+- **AND** it leaves equipment unchanged when no candidate meets the improvement threshold
+
+#### Scenario: Gear metadata is incomplete
+- **WHEN** an owned item or currently equipped item lacks item-template metadata
+- **THEN** the system queries the missing metadata
+- **AND** it does not compare or equip that item until the metadata is authoritative
+
+### Requirement: Equipment repair uses observed durability and repair service
+The system SHALL repair equipment only when observed equipped-item durability shows a broken item or a lowest durability below 25 percent. Unknown durability SHALL NOT authorize repair. A repair action SHALL target a currently observed, interactable unit whose entry is listed as repair-capable in trusted world knowledge, and SHALL pass through the shared action validator. The system SHALL not leave an active group to perform routine repair and SHALL use a bounded wait and retry after sending a repair request.
+
+#### Scenario: Equipped item is broken or below the repair threshold
+- **WHEN** complete authoritative equipment state shows a broken equipped item or a lowest durability below 25 percent
+- **THEN** maintenance may travel to a trusted repair vendor and repair the equipment
+- **AND** the repair request uses the observed vendor GUID and does not use guild-bank funds
+
+#### Scenario: Equipment durability is unknown or healthy
+- **WHEN** equipment state is incomplete or all observed items are at or above 25 percent durability
+- **THEN** the system does not send a repair request
+
+#### Scenario: Group is active
+- **WHEN** authoritative group state marks the group as active
+- **THEN** routine repair does not start a vendor detour
+
+#### Scenario: Repair result is delayed
+- **WHEN** a repair request is sent but equipment durability has not changed
+- **THEN** the lane waits for authoritative durability state and applies a bounded retry delay
+
+### Requirement: Quest reward selection compares authoritative equipment
+When an authoritative quest reward offer contains multiple item choices, the system SHALL use item metadata and current equipment metadata to select the strongest usable upgrade. It SHALL request missing metadata, wait for a bounded interval, and then select from the server's offered choices using available scores. It SHALL use a deterministic value fallback when no offered item is a proven upgrade.
+
+#### Scenario: One offered reward improves current equipment
+- **WHEN** an offered item is usable and improves an equipment slot by at least one percent
+- **THEN** the system selects the offered item with the strongest upgrade
+- **AND** it sends the server's zero-based reward choice through the shared action validation path
+
+#### Scenario: Reward metadata is delayed
+- **WHEN** item metadata needed for reward comparison is not available
+- **THEN** the system requests the missing metadata and waits for a bounded interval
+- **AND** it selects only from the authoritative server offer after the wait expires
+
 ### Requirement: Authoritative loot completion
 The system SHALL not treat an attempted loot action as successful until authoritative state confirms the loot outcome.
 
 #### Scenario: Loot attempt receives no completion evidence
 - **WHEN** loot is attempted but authoritative state does not confirm completion
 - **THEN** the system does not record the target as successfully looted solely from the attempt
+
+#### Scenario: Corpse position is stale after an owned kill
+- **WHEN** the server confirms a player or pet kill and the creature still has a stale spawn position
+- **THEN** the bot approaches the best current corpse position supported by authoritative state and the kill observation
+- **AND** it does not use the stale spawn position when a nearby killer position is available
 
 ### Requirement: Grounded vendor transactions
 The system SHALL require a current valid vendor/service interaction state before committing a vendor transaction.

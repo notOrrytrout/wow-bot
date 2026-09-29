@@ -20,6 +20,7 @@ use wow_state::{ProtocolObservation, Snapshot, reduce};
 struct PendingMovement {
     runtime: crate::movement::MovementRuntime,
     destination: WorldPosition,
+    alternate_destinations: Vec<Vec3>,
     destination_map_known: bool,
     acceptable_range: f32,
     resume: Option<GameplayCommand>,
@@ -43,13 +44,51 @@ struct PendingMovement {
     )>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlayerLifeStatus {
+    Alive,
+    Dead,
+    Ghost,
+    Unknown,
+}
+
+impl PlayerLifeStatus {
+    fn requires_recovery(self) -> bool {
+        matches!(self, Self::Dead | Self::Ghost)
+    }
+}
+
+fn quest_item_gameobject_open_command(target: EntityId) -> GameplayCommand {
+    GameplayCommand::CastGameObject {
+        spell: QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID,
+        target,
+        report_use: true,
+    }
+}
+
+fn group_follow_stop_distance(intent: &MissionIntent) -> f32 {
+    let role = match intent {
+        MissionIntent::Party { role } | MissionIntent::Raid { role } => *role,
+        _ => GroupRole::Auto,
+    };
+    wow_policy::group::follow::role_stop_distance(role)
+}
+
+fn repair_detour_should_continue(
+    condition: wow_state::inventory::EquipmentCondition,
+    group: wow_state::group::GroupLifecycle,
+) -> bool {
+    group != wow_state::group::GroupLifecycle::Active
+        && wow_policy::maintenance::equipment_needs_repair(condition)
+}
+
 struct RoutePlanJob {
     token: crate::movement::ReplanToken,
     stamped: crate::runtime::Stamped<WorldPosition>,
     cancellation: crate::runtime::CancellationToken,
     started_at: Instant,
     deadline_exceeded: bool,
-    task: JoinHandle<Result<wow_navigation::PlannedRoute, wow_navigation::NavigationError>>,
+    task: JoinHandle<Result<(Vec3, wow_navigation::PlannedRoute), wow_navigation::NavigationError>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,9 +113,11 @@ enum MovementPurpose {
     SearchArea,
     ApproachGroundedTarget,
     SurvivalApproach,
+    RepairVendor,
 }
 
 const TURN_IN_SEARCH_RANGE: f32 = 5.0;
+const TURN_IN_SEARCH_RETRY_DISTANCE: f32 = 50.0;
 const QUEST_START_ARRIVAL_RANGE: f32 = 5.0;
 const QUEST_START_EMPTY_LOG_RADIUS_YARDS: f32 = 200.0;
 const QUEST_START_HUB_SWEEP_RADIUS_YARDS: f32 = 40.0;
@@ -169,7 +210,9 @@ pub struct LaneEngine {
     pending_giver_interaction: Option<(EntityId, Instant)>,
     giver_retry_after: BTreeMap<EntityId, (u8, Instant)>,
     pending_turn_in: Option<(u32, Instant, &'static str)>,
+    reward_metadata_waiting: Option<(u32, Instant)>,
     last_turn_in_search_query: Option<(u32, Instant)>,
+    turn_in_search_failures: BTreeMap<u32, (u32, Vec3)>,
     pending_movement: Option<PendingMovement>,
     next_movement: u64,
     route_job: Option<RoutePlanJob>,
@@ -180,6 +223,7 @@ pub struct LaneEngine {
     search_attempts: BTreeMap<(u32, usize, u32), BTreeSet<(u32, u32, u32)>>,
     quest_start_search_attempts: BTreeSet<(u32, u32, u32, u32)>,
     search_retry_after: BTreeMap<(u32, usize, u32), Instant>,
+    combat_target_retry_after: BTreeMap<EntityId, Instant>,
     search_roam_cursor: BTreeMap<(u32, usize, u32), u8>,
     current_work: Option<QuestWorkRuntime>,
     last_wait_reason: Option<String>,
@@ -206,10 +250,13 @@ pub struct LaneEngine {
     behind_retry_after: BTreeMap<(u32, EntityId), Instant>,
     behind_retry_cast_allowed: BTreeSet<(u32, EntityId)>,
     maintenance_retry_after: BTreeMap<(u32, EntityId), Instant>,
+    repair_pending: Option<(wow_state::inventory::EquipmentCondition, Instant)>,
+    repair_retry_after: Option<Instant>,
     last_maintenance_tick: Option<Instant>,
     last_maintenance_status: Option<String>,
     post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
     last_recovery_action: Option<Instant>,
+    last_logged_player_life_status: Option<PlayerLifeStatus>,
     corpse_reclaim_attempts: u8,
     corpse_recovery_generation: u64,
     last_survival_action: Option<(EntityId, Instant)>,
@@ -236,7 +283,9 @@ impl LaneEngine {
             pending_giver_interaction: None,
             giver_retry_after: BTreeMap::new(),
             pending_turn_in: None,
+            reward_metadata_waiting: None,
             last_turn_in_search_query: None,
+            turn_in_search_failures: BTreeMap::new(),
             pending_movement: None,
             next_movement: 1,
             route_job: None,
@@ -247,6 +296,7 @@ impl LaneEngine {
             search_attempts: BTreeMap::new(),
             quest_start_search_attempts: BTreeSet::new(),
             search_retry_after: BTreeMap::new(),
+            combat_target_retry_after: BTreeMap::new(),
             search_roam_cursor: BTreeMap::new(),
             current_work: None,
             last_wait_reason: None,
@@ -273,10 +323,13 @@ impl LaneEngine {
             behind_retry_after: BTreeMap::new(),
             behind_retry_cast_allowed: BTreeSet::new(),
             maintenance_retry_after: BTreeMap::new(),
+            repair_pending: None,
+            repair_retry_after: None,
             last_maintenance_tick: None,
             last_maintenance_status: None,
             post_combat_loot: None,
             last_recovery_action: None,
+            last_logged_player_life_status: None,
             corpse_reclaim_attempts: 0,
             corpse_recovery_generation,
             last_survival_action: None,
@@ -429,10 +482,18 @@ impl LaneEngine {
                     }
                     _ => {}
                 }
-                if let ProtocolObservation::InventoryInstances { items } = &o {
-                    let missing: Vec<u32> = items
-                        .iter()
-                        .map(|instance| instance.item)
+                let item_templates_to_query: Vec<u32> = match &o {
+                    ProtocolObservation::InventoryInstances { items } => {
+                        items.iter().map(|instance| instance.item).collect()
+                    }
+                    ProtocolObservation::EquippedItems {
+                        items: Some(items), ..
+                    } => items.values().copied().collect(),
+                    _ => Vec::new(),
+                };
+                if !item_templates_to_query.is_empty() {
+                    let missing: Vec<u32> = item_templates_to_query
+                        .into_iter()
                         .filter(|item| {
                             *item != 0
                                 && !self
@@ -553,10 +614,18 @@ impl LaneEngine {
                 } = &o
                 {
                     if let Some(target) = target {
-                        self.maintenance_retry_after.insert(
-                            (*spell, *target),
-                            wow_policy::maintenance::retry_deadline(Instant::now()),
-                        );
+                        let retry = if wow_policy::maintenance::is_persistent_pet_summon(*spell) {
+                            Instant::now()
+                                + if self.state.authoritative.pet.control_known {
+                                    Duration::from_secs(15)
+                                } else {
+                                    Duration::from_secs(60)
+                                }
+                        } else {
+                            wow_policy::maintenance::retry_deadline(Instant::now())
+                        };
+                        self.maintenance_retry_after
+                            .insert((*spell, *target), retry);
                         match *reason {
                             47 => {
                                 self.los_blocked.insert(*target);
@@ -732,7 +801,16 @@ impl LaneEngine {
                 if let Some(target) = updated_entity
                     && let Some(entity) = self.state.authoritative.entities.0.get(&target)
                 {
-                    refresh_cached_post_combat_corpse(&mut self.post_combat_loot, target, entity);
+                    let corpse_position = refresh_cached_post_combat_corpse(
+                        &mut self.post_combat_loot,
+                        target,
+                        entity,
+                    );
+                    if let Some(position) = corpse_position
+                        && let Some(entity) = self.state.authoritative.entities.0.get_mut(&target)
+                    {
+                        entity.position = Some(position);
+                    }
                 }
                 if let Some((source, position, client_time, mover)) = movement_position {
                     let source_is_active = match source {
@@ -781,6 +859,7 @@ impl LaneEngine {
                 self.last_quest_step = None;
                 self.pending_accept = None;
                 self.pending_turn_in = None;
+                self.reward_metadata_waiting = None;
                 self.cancel_route_job();
                 self.pending_movement = None;
                 self.pending_facing = None;
@@ -924,7 +1003,27 @@ impl LaneEngine {
             self.waiting("configured world session is not yet authoritative".to_owned());
             return true;
         }
-        if self.player_is_dead() {
+        let life_status = self.player_life_status();
+        if self.last_logged_player_life_status != Some(life_status) {
+            match life_status {
+                PlayerLifeStatus::Dead => {
+                    tracing::warn!(lane=?self.state.lane, "player death detected from authoritative health");
+                }
+                PlayerLifeStatus::Ghost => {
+                    tracing::warn!(lane=?self.state.lane, ghost_aura_spell=wow_state::life::GHOST_AURA_SPELL_ID, "player ghost aura observed; entering death recovery");
+                }
+                PlayerLifeStatus::Alive
+                    if self
+                        .last_logged_player_life_status
+                        .is_some_and(PlayerLifeStatus::requires_recovery) =>
+                {
+                    tracing::info!(lane=?self.state.lane, "player resurrection observed; resuming mission work");
+                }
+                PlayerLifeStatus::Alive | PlayerLifeStatus::Unknown => {}
+            }
+            self.last_logged_player_life_status = Some(life_status);
+        }
+        if life_status.requires_recovery() {
             return self.tick_death_recovery().await;
         }
         self.corpse_reclaim_attempts = 0;
@@ -939,10 +1038,8 @@ impl LaneEngine {
             }
             if self.pending_movement.is_some() {
                 tracing::info!(lane=?self.state.lane, ?attacker, "survival attacker preempted voluntary movement");
-                let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
-                self.cancel_route_job();
-                self.pending_movement = None;
-                self.current_work = None;
+                self.stop_active_movement_for_handoff("survival combat preemption")
+                    .await;
             }
             self.pending_quest_action = None;
             return self.tick_survival(attacker).await;
@@ -953,10 +1050,20 @@ impl LaneEngine {
             .is_some_and(|movement| movement.purpose == MovementPurpose::SurvivalApproach)
         {
             tracing::info!(lane=?self.state.lane, "survival approach ended because no authoritative attacker remains");
-            let _ = self.propose_recovery(GameplayCommand::StopMovement).await;
-            self.cancel_route_job();
-            self.pending_movement = None;
-            self.current_work = None;
+            self.stop_active_movement_for_handoff("survival approach ended")
+                .await;
+        }
+        if self
+            .pending_movement
+            .as_ref()
+            .is_some_and(|movement| movement.purpose == MovementPurpose::RepairVendor)
+            && !repair_detour_should_continue(
+                self.state.authoritative.inventory.equipment_condition,
+                self.state.authoritative.group.lifecycle,
+            )
+        {
+            self.stop_active_movement_for_handoff("repair detour is no longer safe or needed")
+                .await;
         }
         if self.pending_movement.is_some() {
             return true;
@@ -967,6 +1074,9 @@ impl LaneEngine {
             return result;
         }
         if self.maintenance_eligible() {
+            if let Some(result) = self.tick_equipment_repair(&snapshot).await {
+                return result;
+            }
             if let Some(result) = self.tick_maintenance().await {
                 return result;
             }
@@ -1132,14 +1242,38 @@ impl LaneEngine {
             self.waiting("gather mission is not authorized".into());
             return true;
         }
-        let state = &self.state.authoritative;
         if resource.trim().is_empty() {
             self.waiting(
                 "gather mission is waiting for an authorized resource and capability".into(),
             );
             return true;
         }
-        let target = state
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let matching_nodes: Vec<_> = catalog
+            .world()
+            .gather_nodes
+            .iter()
+            .filter(|node| {
+                wow_policy::gathering::targets::normalized_name(&node.name)
+                    == wow_policy::gathering::targets::normalized_name(resource)
+            })
+            .collect();
+        let learned_skill = |node: &&wow_infra::world_knowledge::GatherNode| {
+            let skill = match node.kind {
+                wow_infra::world_knowledge::GatheringKind::Mining => 186,
+                wow_infra::world_knowledge::GatheringKind::Herbalism => 182,
+                wow_infra::world_knowledge::GatheringKind::Fishing => 356,
+            };
+            wow_policy::gathering::capability::has_required_skill(
+                &snapshot,
+                skill,
+                node.required_skill.min(u16::MAX as u32) as u16,
+            )
+        };
+        let target = self
+            .state
+            .authoritative
             .entities
             .0
             .values()
@@ -1148,11 +1282,70 @@ impl LaneEngine {
                     && matches!(entity.kind, wow_state::entities::EntityKind::GameObject)
             })
             .filter(|entity| wow_policy::gathering::targets::matches_resource(entity, resource))
+            .filter(|entity| {
+                matching_nodes
+                    .iter()
+                    .find(|node| node.entry_id == entity.entry)
+                    .is_none_or(|node| learned_skill(node))
+            })
             .min_by_key(|entity| entity.id);
         if let Some(target) = target {
             return self
                 .propose_command(GameplayCommand::Gather(target.id), false)
                 .await;
+        }
+        if !matching_nodes.is_empty() && !self.state.authoritative.professions.known {
+            self.waiting(format!(
+                "gather mission for {resource:?} is waiting for authoritative profession state"
+            ));
+            return true;
+        }
+        if let Some(position) = self.active_mover_position()
+            && let Some(node) = matching_nodes
+                .iter()
+                .filter(|node| learned_skill(node))
+                .find(|node| node.spawns.iter().any(|spawn| spawn.map_id == position.map))
+        {
+            let key = (node.entry_id, usize::MAX, 0);
+            let spawn_points: Vec<Vec3> = matching_nodes
+                .iter()
+                .filter(|candidate| learned_skill(candidate))
+                .flat_map(|candidate| candidate.spawns.iter())
+                .filter(|spawn| spawn.map_id == position.map)
+                .map(|spawn| Vec3::new(spawn.x, spawn.y, spawn.z))
+                .collect();
+            let candidates = bounded_candidates(spawn_points, position.point);
+            let reached = candidates
+                .iter()
+                .copied()
+                .find(|point| quest_search_arrived(position.point, *point));
+            if let Some(destination) = self.next_search_destination(key, &candidates, reached) {
+                let work = self.set_work(QuestWorkKey::TravelToObjective {
+                    quest: 0,
+                    objective: 0,
+                    destination: WorldPosition {
+                        map: position.map,
+                        point: destination,
+                        orientation: 0.0,
+                    },
+                });
+                tracing::info!(lane=?self.state.lane, resource, entry=node.entry_id, x=destination.x, y=destination.y, z=destination.z, "gather mission traveling to a trusted local resource search hint");
+                self.queue_search_movement(destination, work).await;
+                return true;
+            }
+            let roam = self.next_search_roam_destination(key, position.point);
+            let work = self.set_work(QuestWorkKey::TravelToObjective {
+                quest: 0,
+                objective: 0,
+                destination: WorldPosition {
+                    map: position.map,
+                    point: roam,
+                    orientation: 0.0,
+                },
+            });
+            tracing::info!(lane=?self.state.lane, resource, entry=node.entry_id, "gather resource hints exhausted locally; searching a nearby area");
+            self.queue_search_movement(roam, work).await;
+            return true;
         }
         self.waiting(format!("waiting for an observed {resource} resource"));
         true
@@ -1345,7 +1538,7 @@ impl LaneEngine {
         let Some(destination) = wow_policy::group::follow::follow_destination(
             from,
             member,
-            wow_policy::group::follow::GROUP_FOLLOW_STOP_DISTANCE,
+            group_follow_stop_distance(&self.state.mission.intent),
         ) else {
             return true;
         };
@@ -1382,7 +1575,7 @@ impl LaneEngine {
         self.dispatch_combat_target(target, true).await
     }
 
-    fn player_is_dead(&self) -> bool {
+    fn player_life_status(&self) -> PlayerLifeStatus {
         let Some(player) = self
             .state
             .authoritative
@@ -1390,14 +1583,32 @@ impl LaneEngine {
             .character_guid
             .map(EntityId)
         else {
-            return false;
+            return PlayerLifeStatus::Unknown;
         };
-        self.state
+        if self
+            .state
+            .authoritative
+            .auras
+            .has_any(player, &[wow_state::life::GHOST_AURA_SPELL_ID])
+        {
+            return PlayerLifeStatus::Ghost;
+        }
+        match self
+            .state
             .authoritative
             .entities
             .0
             .get(&player)
-            .is_some_and(wow_state::entities::EntityState::is_dead)
+            .and_then(|entity| entity.health)
+        {
+            Some((0, _)) => PlayerLifeStatus::Dead,
+            Some(_) => PlayerLifeStatus::Alive,
+            None => PlayerLifeStatus::Unknown,
+        }
+    }
+
+    fn player_is_dead(&self) -> bool {
+        self.player_life_status().requires_recovery()
     }
 
     async fn tick_death_recovery(&mut self) -> bool {
@@ -1416,6 +1627,12 @@ impl LaneEngine {
         self.last_recovery_action = Some(now);
         self.pending_quest_action = None;
         self.post_combat_loot = None;
+        if self
+            .stop_active_movement_for_handoff("death recovery took control")
+            .await
+        {
+            return true;
+        }
         let Some(player_guid) = self
             .state
             .authoritative
@@ -1491,6 +1708,19 @@ impl LaneEngine {
         .await
     }
 
+    async fn stop_active_movement_for_handoff(&mut self, reason: &'static str) -> bool {
+        if self.pending_movement.is_none() {
+            return false;
+        }
+        tracing::info!(lane=?self.state.lane, reason, "stopped active movement for control handoff");
+        self.cancel_route_job();
+        self.pending_movement = None;
+        self.pending_facing = None;
+        self.current_work = None;
+        self.propose_recovery(GameplayCommand::StopMovement).await;
+        true
+    }
+
     async fn propose_recovery(&mut self, command: GameplayCommand) -> bool {
         let action = ProposedAction {
             id: ActionId(self.next_action),
@@ -1548,13 +1778,159 @@ impl LaneEngine {
                     tracing::info!(lane=?self.state.lane, %family, spell, ?target, "buff maintenance selected missing authoritative aura family");
                     self.last_maintenance_status = Some(status);
                 }
-                self.maintenance_retry_after.insert(
-                    (spell, target),
-                    wow_policy::maintenance::retry_deadline(now),
-                );
+                let retry = if family == "mage_water" || family == "mage_food" {
+                    now + Duration::from_secs(10)
+                } else if family.starts_with("warlock_create_") {
+                    now + Duration::from_secs(15)
+                } else {
+                    wow_policy::maintenance::retry_deadline(now)
+                };
+                self.maintenance_retry_after.insert((spell, target), retry);
                 Some(
                     self.propose_command(GameplayCommand::MaintainBuff { spell, target }, false)
                         .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::SummonPet { spell, player } => {
+                let status = format!("summon_pet:{spell}:{}", player.0);
+                if self.last_maintenance_status.as_deref() != Some(&status) {
+                    tracing::info!(lane=?self.state.lane, spell, ?player, "class pet maintenance selected a summon");
+                    self.last_maintenance_status = Some(status);
+                }
+                let retry = if self.state.authoritative.pet.control_known {
+                    Duration::from_secs(15)
+                } else {
+                    Duration::from_secs(60)
+                };
+                self.maintenance_retry_after
+                    .insert((spell, player), now + retry);
+                Some(
+                    self.propose_command(GameplayCommand::SummonPet { spell, player }, false)
+                        .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::PetReaction { pet, reaction } => {
+                self.last_maintenance_status = Some(format!("pet_reaction:{}:{reaction}", pet.0));
+                self.maintenance_retry_after
+                    .insert((0, pet), now + Duration::from_secs(15));
+                Some(
+                    self.propose_command(GameplayCommand::PetSetReaction { pet, reaction }, false)
+                        .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::PetAutocast {
+                pet,
+                spell,
+                enabled,
+            } => {
+                self.last_maintenance_status =
+                    Some(format!("pet_autocast:{}:{spell}:{enabled}", pet.0));
+                self.maintenance_retry_after
+                    .insert((spell, pet), now + Duration::from_secs(15));
+                Some(
+                    self.propose_command(
+                        GameplayCommand::PetSetAutocast {
+                            pet,
+                            spell,
+                            enabled,
+                        },
+                        false,
+                    )
+                    .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::EquipItem {
+                item,
+                item_guid,
+                destination_slot,
+                player,
+            } => {
+                let status = format!("equip:{item}:{destination_slot}");
+                if self.last_maintenance_status.as_deref() != Some(&status) {
+                    tracing::info!(lane=?self.state.lane, item, ?item_guid, destination_slot, "gear maintenance selected an inventory upgrade");
+                    self.last_maintenance_status = Some(status);
+                }
+                self.maintenance_retry_after
+                    .insert((item, player), now + Duration::from_secs(15));
+                Some(
+                    self.propose_command(
+                        GameplayCommand::EquipItem {
+                            item_guid,
+                            destination_slot,
+                        },
+                        false,
+                    )
+                    .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::UseItemInstance {
+                item,
+                item_guid,
+                backpack_slot,
+                spell,
+                target,
+            } => {
+                let status = format!("use_item:{item}:{spell}:{}", target.0);
+                if self.last_maintenance_status.as_deref() != Some(&status) {
+                    tracing::info!(lane=?self.state.lane, item, ?item_guid, spell, ?target, "warlock maintenance selected Soulstone application");
+                    self.last_maintenance_status = Some(status);
+                }
+                self.maintenance_retry_after
+                    .insert((spell, target), now + Duration::from_secs(30));
+                Some(
+                    self.propose_command(
+                        GameplayCommand::UseItemInstance {
+                            item,
+                            item_guid,
+                            backpack_slot,
+                            spell,
+                            target: Some(target),
+                            cast_count: 0,
+                        },
+                        false,
+                    )
+                    .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::CastOnItem { spell, item_guid } => {
+                let status = format!("imbue:{spell}:{}", item_guid.0);
+                if self.last_maintenance_status.as_deref() != Some(&status) {
+                    tracing::info!(lane=?self.state.lane, spell, ?item_guid, "shaman maintenance selected a weapon imbue");
+                    self.last_maintenance_status = Some(status);
+                }
+                self.maintenance_retry_after
+                    .insert((spell, item_guid), now + Duration::from_secs(20));
+                Some(
+                    self.propose_command(GameplayCommand::CastOnItem { spell, item_guid }, false)
+                        .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::UseItemOnItem {
+                item,
+                item_guid,
+                backpack_slot,
+                spell,
+                target_item_guid,
+            } => {
+                let status = format!("weapon_poison:{item}:{spell}:{}", target_item_guid.0);
+                if self.last_maintenance_status.as_deref() != Some(&status) {
+                    tracing::info!(lane=?self.state.lane, item, spell, ?item_guid, ?target_item_guid, "rogue maintenance selected a weapon poison");
+                    self.last_maintenance_status = Some(status);
+                }
+                self.maintenance_retry_after
+                    .insert((spell, target_item_guid), now + Duration::from_secs(30));
+                Some(
+                    self.propose_command(
+                        GameplayCommand::UseItemOnItem {
+                            item,
+                            item_guid,
+                            backpack_slot,
+                            spell,
+                            target_item_guid,
+                        },
+                        false,
+                    )
+                    .await,
                 )
             }
             wow_policy::maintenance::MaintenanceDecision::Deferred { family, reason } => {
@@ -1573,6 +1949,153 @@ impl LaneEngine {
                 None
             }
         }
+    }
+
+    async fn tick_equipment_repair(&mut self, snapshot: &Snapshot) -> Option<bool> {
+        let condition = snapshot.state.inventory.equipment_condition;
+        if let Some((baseline, started)) = self.repair_pending {
+            let improved = condition.observed
+                && (condition.broken_items < baseline.broken_items
+                    || condition
+                        .lowest_durability_percent
+                        .zip(baseline.lowest_durability_percent)
+                        .is_some_and(|(current, previous)| current > previous));
+            if improved {
+                self.repair_pending = None;
+                self.repair_retry_after = None;
+                self.last_maintenance_status = Some("equipment_repaired".into());
+                return None;
+            } else if !wow_policy::maintenance::equipment_needs_repair(condition) {
+                self.repair_pending = None;
+                self.repair_retry_after = None;
+                return None;
+            } else if started.elapsed() < Duration::from_secs(15) {
+                self.waiting("waiting for authoritative equipment repair state".into());
+                return Some(true);
+            } else {
+                self.repair_pending = None;
+                self.repair_retry_after = Some(Instant::now() + Duration::from_secs(60));
+                self.waiting(
+                    "repair request has no authoritative durability update; retry is delayed"
+                        .into(),
+                );
+                return Some(true);
+            }
+        }
+        if !repair_detour_should_continue(condition, self.state.authoritative.group.lifecycle)
+            || !self
+                .state
+                .mission
+                .permissions
+                .contains(PermissionSet::MAINTENANCE)
+        {
+            return None;
+        }
+        if self
+            .repair_retry_after
+            .is_some_and(|deadline| deadline > Instant::now())
+        {
+            return None;
+        }
+        self.repair_retry_after = None;
+        let Some(position) = snapshot
+            .state
+            .control
+            .active_position(snapshot.state.position.player)
+        else {
+            self.waiting(
+                "equipment needs repair; waiting for authoritative player position".into(),
+            );
+            return Some(true);
+        };
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let Some((vendor_entry, destination)) = catalog.nearest_vendor(
+            wow_infra::world_knowledge::VendorKind::Repair,
+            position.map,
+            position.point,
+        ) else {
+            self.waiting(format!(
+                "equipment needs repair; no known repair vendor is available on map {}",
+                position.map
+            ));
+            return Some(true);
+        };
+        let vendor = snapshot
+            .state
+            .entities
+            .0
+            .values()
+            .filter(|entity| {
+                entity.entry == vendor_entry
+                    && entity.kind == wow_state::entities::EntityKind::Unit
+                    && entity.interactable
+            })
+            .filter_map(|entity| entity.position.map(|target| (entity, target)))
+            .filter(|(_, target)| target.map == position.map)
+            .min_by(|(_, left), (_, right)| {
+                left.point
+                    .distance(position.point)
+                    .total_cmp(&right.point.distance(position.point))
+            })
+            .map(|(entity, target)| (entity.id, target));
+        if let Some((vendor, vendor_position)) = vendor {
+            if vendor_position.point.distance(position.point) > 5.0
+                && !self.state.mission.permissions.contains(PermissionSet::MOVE)
+            {
+                self.waiting(
+                    "equipment needs repair; mission does not allow travel to the repair vendor"
+                        .into(),
+                );
+                return Some(true);
+            }
+            let command = GameplayCommand::RepairEquipment { vendor };
+            let status = format!(
+                "repair:{}:{}",
+                vendor.0,
+                condition.lowest_durability_percent.unwrap_or(0)
+            );
+            if self.last_maintenance_status.as_deref() != Some(&status) {
+                tracing::info!(lane=?self.state.lane, ?vendor, lowest_durability_percent=?condition.lowest_durability_percent, broken_items=condition.broken_items, "equipment repair selected a currently observed repair vendor");
+                self.last_maintenance_status = Some(status);
+            }
+            return Some(self.propose_command(command, false).await);
+        }
+        if position.point.distance(destination) <= 5.0 {
+            self.waiting(format!(
+                "equipment needs repair; waiting for repair vendor entry {vendor_entry} to become visible"
+            ));
+            return Some(true);
+        }
+        if !self.state.mission.permissions.contains(PermissionSet::MOVE) {
+            self.waiting(
+                "equipment needs repair; mission does not allow travel to a repair vendor".into(),
+            );
+            return Some(true);
+        }
+        let work = self.set_work(QuestWorkKey::TravelToObjective {
+            quest: 0,
+            objective: 0,
+            destination: WorldPosition {
+                map: position.map,
+                point: destination,
+                orientation: 0.0,
+            },
+        });
+        self.queue_world_movement(
+            WorldPosition {
+                map: position.map,
+                point: destination,
+                orientation: 0.0,
+            },
+            5.0,
+            None,
+            None,
+            PlanOrigin::SystemPolicy,
+            work,
+            MovementPurpose::RepairVendor,
+        );
+        tracing::info!(lane=?self.state.lane, entry=vendor_entry, x=destination.x, y=destination.y, z=destination.z, "equipment repair selected a trusted local repair vendor hint");
+        Some(true)
     }
 
     fn queue_movement(
@@ -1650,6 +2173,7 @@ impl LaneEngine {
                 waypoint: 0,
             },
             destination,
+            alternate_destinations: Vec::new(),
             destination_map_known: true,
             acceptable_range,
             resume,
@@ -1897,17 +2421,6 @@ impl LaneEngine {
         let Some(mut movement) = self.pending_movement.take() else {
             return true;
         };
-        if should_supersede_search_movement(
-            movement.purpose,
-            self.quest_movement_has_live_target(&movement),
-        ) {
-            tracing::info!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, "live authoritative quest target superseded search-area movement");
-            let _ = self
-                .propose_command(GameplayCommand::StopMovement, false)
-                .await;
-            self.current_work = None;
-            return self.tick_quest().await;
-        }
         if movement
             .last_step
             .is_some_and(|at| at.elapsed() < MOVEMENT_STEP_INTERVAL - MOVEMENT_STEP_EARLY_TOLERANCE)
@@ -1934,17 +2447,10 @@ impl LaneEngine {
             movement.destination_map_known = true;
         }
         if let Some(GameplayCommand::Loot(target)) = movement.resume.as_ref() {
-            let mut snapshot = Snapshot::from_state(&self.state.authoritative);
-            if !snapshot.state.entities.0.contains_key(target)
-                && let Some((queued_target, _, Some(cached_target))) = &self.post_combat_loot
-                && queued_target == target
-            {
-                snapshot
-                    .state
-                    .entities
-                    .0
-                    .insert(*target, cached_target.clone());
-            }
+            let snapshot = self.snapshot_with_post_combat_corpse(
+                Snapshot::from_state(&self.state.authoritative),
+                *target,
+            );
             if let Some((refreshed_destination, acceptable_range)) =
                 current_loot_approach(&snapshot, *target)
             {
@@ -2270,7 +2776,10 @@ impl LaneEngine {
                     && !job.cancellation.is_cancelled()
                 {
                     match result {
-                        Ok(Ok(plan)) => {
+                        Ok(Ok((destination, plan))) => {
+                            movement.destination.point = destination;
+                            movement.runtime.destination.point = destination;
+                            movement.alternate_destinations.clear();
                             let points = plan.points().to_vec();
                             let cost = points
                                 .windows(2)
@@ -2307,9 +2816,15 @@ impl LaneEngine {
                                 }),
                             );
                             if movement.route_failures >= 3 {
-                                self.waiting("movement route planning failed three times; scheduler will re-ground before retry".into());
+                                let deferred =
+                                    self.record_unreachable_combat_approach(&movement, &error);
                                 self.pending_movement = None;
                                 self.current_work = None;
+                                if deferred {
+                                    self.last_wait_reason = None;
+                                    return true;
+                                }
+                                self.waiting("movement route planning failed three times; scheduler will re-ground before retry".into());
                                 return true;
                             }
                             movement.last_step = Some(Instant::now());
@@ -2388,7 +2903,8 @@ impl LaneEngine {
             let worker_token = cancellation.clone();
             let worker_controller = controller.clone();
             let route_start = player;
-            let route_destination = movement.destination.point;
+            let mut route_destinations = vec![movement.destination.point];
+            route_destinations.extend(movement.alternate_destinations.iter().copied());
             let path_straightness = self.runtime_tuning.movement.path_straightness;
             let route_planning_permit = permit;
             let stamped = crate::runtime::Stamped {
@@ -2397,12 +2913,22 @@ impl LaneEngine {
             };
             let task = tokio::task::spawn_blocking(move || {
                 let _permit = route_planning_permit;
-                worker_controller.plan_route_cancellable_with_straightness(
-                    route_start,
-                    route_destination,
-                    path_straightness,
-                    &|| worker_token.is_cancelled(),
-                )
+                let mut last_error = None;
+                for destination in route_destinations {
+                    match worker_controller.plan_route_cancellable_with_straightness(
+                        route_start,
+                        destination,
+                        path_straightness,
+                        &|| worker_token.is_cancelled(),
+                    ) {
+                        Ok(plan) => return Ok((destination, plan)),
+                        Err(error) => last_error = Some(error),
+                    }
+                    if worker_token.is_cancelled() {
+                        return Err(wow_navigation::NavigationError::RoutePlanningCancelled);
+                    }
+                }
+                Err(last_error.unwrap_or(wow_navigation::NavigationError::RoutePlanningCancelled))
             });
             self.route_job = Some(RoutePlanJob {
                 token: crate::movement::ReplanToken {
@@ -2491,9 +3017,22 @@ impl LaneEngine {
                     && movement.route_failures >= 3
                 {
                     self.record_failed_search_destination(&movement);
-                    tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, x=movement.destination.point.x, y=movement.destination.point.y, attempt=movement.route_failures, reason=?error, "search destination path failed after three step attempts; trying another destination");
+                    if matches!(&movement.work.key, QuestWorkKey::TurnIn { .. }) {
+                        tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, x=movement.destination.point.x, y=movement.destination.point.y, attempt=movement.route_failures, reason=?error, "turn-in search hint has no route; waiting for an authoritative giver or a new position");
+                    } else {
+                        tracing::warn!(lane=?self.state.lane, work_id=?movement.work.id, key=?movement.work.key, x=movement.destination.point.x, y=movement.destination.point.y, attempt=movement.route_failures, reason=?error, "search destination path failed after three step attempts; trying another destination");
+                    }
                     self.stop_owned_movement(movement.purpose).await;
                     self.clear_quest_search_focus(movement.work.id);
+                    return true;
+                }
+                if genuine_path_failure
+                    && movement.route_failures >= 3
+                    && self.record_unreachable_combat_approach(&movement, &error)
+                {
+                    self.pending_movement = None;
+                    self.current_work = None;
+                    self.last_wait_reason = None;
                     return true;
                 }
                 self.waiting(format!("movement step rejected: {error:?}"));
@@ -2524,24 +3063,37 @@ impl LaneEngine {
         }
     }
 
-    fn quest_movement_has_live_target(&self, movement: &PendingMovement) -> bool {
-        let quest = match &movement.work.key {
-            QuestWorkKey::TravelToObjective { quest, .. }
-            | QuestWorkKey::CollectItem { quest, .. } => *quest,
-            _ => return false,
+    fn record_unreachable_combat_approach(
+        &mut self,
+        movement: &PendingMovement,
+        error: &wow_navigation::NavigationError,
+    ) -> bool {
+        if movement.purpose != MovementPurpose::ApproachGroundedTarget
+            || !matches!(
+                error,
+                wow_navigation::NavigationError::NoRoute
+                    | wow_navigation::NavigationError::FloorDiscontinuity
+            )
+        {
+            return false;
+        }
+        let Some(target) = movement
+            .resume
+            .as_ref()
+            .and_then(crate::action::spatial::profile)
+            .map(|profile| profile.target)
+        else {
+            return false;
         };
-        let snapshot = Snapshot::from_state(&self.state.authoritative);
-        matches!(
-            resolve_objective(&snapshot, quest),
-            ObjectiveResolution::GroundedCreature { .. }
-                | ObjectiveResolution::GroundedGameObject { .. }
-                | ObjectiveResolution::GroundedItemCreature { .. }
-                | ObjectiveResolution::GroundedItemGameObject { .. }
-                | ObjectiveResolution::GroundedControlledSpell { .. }
-                | ObjectiveResolution::GroundedQuestSpell { .. }
-                | ObjectiveResolution::GroundedScriptedItemUse { .. }
-                | ObjectiveResolution::GroundedQuestTool { .. }
-        )
+        self.combat_target_retry_after
+            .insert(target, Instant::now() + Duration::from_secs(30));
+        tracing::warn!(
+            lane=?self.state.lane,
+            ?target,
+            ?error,
+            "all combat approach routes failed; target deferred while quest search continues"
+        );
+        true
     }
 
     fn next_incomplete_quest(&self) -> Option<u32> {
@@ -2819,6 +3371,14 @@ impl LaneEngine {
                         .then_some((usize::MAX, *target))
                 }),
         );
+        self.combat_target_retry_after
+            .retain(|_, retry_after| *retry_after > now);
+        excluded.extend(
+            self.combat_target_retry_after
+                .keys()
+                .copied()
+                .map(|target| (usize::MAX, target)),
+        );
         match resolve_with_exclusions(&snapshot, quest, &excluded) {
             ObjectiveResolution::WaitingForDefinition => {
                 self.waiting(format!(
@@ -3056,7 +3616,7 @@ impl LaneEngine {
                 let baseline_count = self.quest_item_count(item);
                 return self
                     .dispatch_quest_semantic(
-                        GameplayCommand::UseGameObject(target),
+                        quest_item_gameobject_open_command(target),
                         PendingQuestAction::QuestObjectUse {
                             quest,
                             target,
@@ -3215,15 +3775,53 @@ impl LaneEngine {
                     self.waiting(format!("quest {quest} turn-in dialog reports required items or money are still incomplete"));
                     return true;
                 }
-                wow_state::quests::QuestTurnInStage::OfferReward { reward_choices } => {
-                    tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, reward_choices, "quest turn-in choosing first authoritative reward option");
+                wow_state::quests::QuestTurnInStage::OfferReward { reward_items } => {
+                    let snapshot = Snapshot::from_state(&self.state.authoritative);
+                    if self
+                        .reward_metadata_waiting
+                        .is_none_or(|(pending_quest, _)| pending_quest != quest)
+                    {
+                        self.reward_metadata_waiting = Some((quest, Instant::now()));
+                    }
+                    let missing = wow_policy::questing::rewards::missing_score_metadata(
+                        &snapshot,
+                        &reward_items,
+                    );
+                    let started = self.reward_metadata_waiting.expect("initialized above").1;
+                    let within_wait =
+                        started.elapsed() < wow_policy::questing::rewards::metadata_wait();
+                    if within_wait {
+                        if let Some(item) = missing
+                            .iter()
+                            .copied()
+                            .find(|item| self.queried_item_templates.insert(*item))
+                        {
+                            tracing::debug!(lane=?self.state.lane, quest, item, "requesting item metadata to compare quest rewards");
+                            return self
+                                .propose_command(GameplayCommand::QueryItem { item }, false)
+                                .await;
+                        }
+                        if !missing.is_empty() {
+                            self.waiting(format!(
+                                "quest {quest} is waiting for item metadata to compare reward choices"
+                            ));
+                            return true;
+                        }
+                    }
+                    if !missing.is_empty() {
+                        tracing::warn!(lane=?self.state.lane, quest, missing_items=?missing, "quest reward metadata wait expired; selecting from available scores");
+                    }
+                    let reward =
+                        wow_policy::questing::rewards::best_reward_index(&snapshot, &reward_items);
+                    tracing::info!(lane=?self.state.lane, quest, giver=?dialog.giver, reward, reward_items=?reward_items, "quest turn-in selected a reward from authoritative offer data");
+                    self.reward_metadata_waiting = None;
                     self.pending_turn_in = Some((quest, Instant::now(), "choose-reward"));
                     return self
                         .propose_command(
                             GameplayCommand::ChooseQuestReward {
                                 quest,
                                 giver: dialog.giver,
-                                reward: 0,
+                                reward,
                             },
                             true,
                         )
@@ -3247,6 +3845,23 @@ impl LaneEngine {
                 .await;
         }
         if let Some(player) = self.active_mover_position() {
+            if self.turn_in_search_hint_blocked(quest, player) {
+                self.waiting(format!(
+                    "quest {quest} turn-in search hint has no route from this area; waiting for a live reward giver or a new position"
+                ));
+                if self
+                    .last_turn_in_search_query
+                    .is_none_or(|(queried_quest, at)| {
+                        queried_quest != quest || at.elapsed() >= Duration::from_secs(10)
+                    })
+                {
+                    self.last_turn_in_search_query = Some((quest, Instant::now()));
+                    return self
+                        .propose_command(GameplayCommand::QueryQuestGivers, true)
+                        .await;
+                }
+                return true;
+            }
             if let Some(destination) =
                 wow_policy::questing::static_hints::nearest_turn_in(quest, player.map, player.point)
             {
@@ -3266,7 +3881,7 @@ impl LaneEngine {
                     return true;
                 }
                 let work = self.current_work.clone().expect("turn-in work exists");
-                tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "completed quest using AzerothCore turn-in search hint");
+                tracing::info!(lane=?self.state.lane, quest, work_id=?work.id, x=destination.x, y=destination.y, "quest scheduler using AzerothCore turn-in search hint");
                 self.queue_movement(
                     destination,
                     TURN_IN_SEARCH_RANGE,
@@ -3311,6 +3926,20 @@ impl LaneEngine {
         }
     }
 
+    fn turn_in_search_hint_blocked(&mut self, quest: u32, player: WorldPosition) -> bool {
+        let Some((failed_map, failed_from)) = self.turn_in_search_failures.get(&quest).copied()
+        else {
+            return false;
+        };
+        if failed_map == player.map
+            && failed_from.distance(player.point) < TURN_IN_SEARCH_RETRY_DISTANCE
+        {
+            return true;
+        }
+        self.turn_in_search_failures.remove(&quest);
+        false
+    }
+
     fn record_search_arrival(&mut self, movement: &PendingMovement) {
         if movement.purpose != MovementPurpose::SearchArea {
             return;
@@ -3342,6 +3971,12 @@ impl LaneEngine {
     }
 
     fn record_failed_search_destination(&mut self, movement: &PendingMovement) {
+        if let QuestWorkKey::TurnIn { quest } = &movement.work.key {
+            if let Some(position) = self.active_mover_position() {
+                self.record_turn_in_search_failure(*quest, position);
+            }
+            return;
+        }
         if matches!(
             &movement.work.key,
             QuestWorkKey::AcquireQuest { quest: None }
@@ -3364,6 +3999,11 @@ impl LaneEngine {
             .entry(key)
             .or_default()
             .insert(search_point_key(movement.destination.point));
+    }
+
+    fn record_turn_in_search_failure(&mut self, quest: u32, player: WorldPosition) {
+        self.turn_in_search_failures
+            .insert(quest, (player.map, player.point));
     }
 
     fn defer_quest_giver(&mut self, giver: EntityId) {
@@ -3792,6 +4432,25 @@ impl LaneEngine {
         }
     }
 
+    fn snapshot_with_post_combat_corpse(
+        &self,
+        mut snapshot: Snapshot,
+        target: EntityId,
+    ) -> Snapshot {
+        if let Some((queued_target, _, Some(cached_target))) = &self.post_combat_loot
+            && *queued_target == target
+        {
+            // The cached corpse can contain a kill-site correction. It must
+            // replace a stale spawn position that is still in authoritative state.
+            snapshot
+                .state
+                .entities
+                .0
+                .insert(target, cached_target.clone());
+        }
+        snapshot
+    }
+
     async fn dispatch_combat_target(&mut self, target: EntityId, recovery: bool) -> bool {
         let snapshot = Snapshot::from_state(&self.state.authoritative);
         let selected = match wow_policy::combat::selector::select_action(&snapshot, target) {
@@ -3935,17 +4594,10 @@ impl LaneEngine {
         {
             let corpse_was_ready_to_loot = self.corpses_ready_to_loot.remove(target);
             if !corpse_was_ready_to_loot {
-                let mut snapshot = Snapshot::from_state(&self.state.authoritative);
-                if let Some((post_target, _, Some(cached_target))) = &self.post_combat_loot
-                    && post_target == target
-                {
-                    snapshot
-                        .state
-                        .entities
-                        .0
-                        .entry(*target)
-                        .or_insert_with(|| cached_target.clone());
-                }
+                let snapshot = self.snapshot_with_post_combat_corpse(
+                    Snapshot::from_state(&self.state.authoritative),
+                    *target,
+                );
                 match crate::action::spatial::is_in_range(&snapshot, &command) {
                     Some(true) => {
                         let _ = self
@@ -4044,6 +4696,22 @@ impl LaneEngine {
     }
 
     async fn propose_command(&mut self, command: GameplayCommand, quest_step: bool) -> bool {
+        let pet_attack = match &command {
+            GameplayCommand::Attack(target) => self
+                .state
+                .authoritative
+                .pet
+                .guid
+                .filter(|_| {
+                    self.state
+                        .authoritative
+                        .pet
+                        .has_active_pet(&self.state.authoritative.entities)
+                        == Some(true)
+                })
+                .map(|pet| (pet, *target)),
+            _ => None,
+        };
         let action = ProposedAction {
             id: ActionId(self.next_action),
             task: TaskId(self.next_task),
@@ -4056,7 +4724,47 @@ impl LaneEngine {
         if quest_step {
             self.last_quest_step = Some(Instant::now());
         }
-        self.submit(action).await
+        let sent = self.submit(action).await;
+        if sent && let Some((pet, target)) = pet_attack {
+            let pet_action = ProposedAction {
+                id: ActionId(self.next_action),
+                task: TaskId(self.next_task),
+                origin: PlanOrigin::SystemPolicy,
+                stamp: self.state.stamp(),
+                command: GameplayCommand::PetAttack { pet, target },
+            };
+            self.next_action = self.next_action.wrapping_add(1).max(1);
+            self.next_task = self.next_task.wrapping_add(1).max(1);
+            let _ = self.submit(pet_action).await;
+        }
+        sent
+    }
+
+    fn safe_npc_approach_destination(
+        &self,
+        snapshot: &Snapshot,
+        command: &GameplayCommand,
+        fallback: Vec3,
+    ) -> Option<Vec3> {
+        let Some(target_id) = crate::action::spatial::npc_front_approach_target(command) else {
+            return Some(fallback);
+        };
+        let target = crate::action::spatial::target_position(snapshot, target_id)?;
+        let controller = self.movement_controller.as_ref()?;
+        crate::action::spatial::first_safe_npc_approach_point(
+            target,
+            crate::action::spatial::NPC_FRONT_STANDOFF,
+            |point| {
+                controller
+                    .project_grounded_waypoint(WorldPosition {
+                        map: target.map,
+                        point,
+                        orientation: target.orientation,
+                    })
+                    .ok()
+                    .map(|projected| projected.point)
+            },
+        )
     }
 
     fn defer_spatial_movement(
@@ -4089,6 +4797,10 @@ impl LaneEngine {
         } else {
             MovementPurpose::ApproachGroundedTarget
         };
+        let combat_approach = crate::action::spatial::combat_approach_candidates(
+            &Snapshot::from_state(&self.state.authoritative),
+            &resume,
+        );
         self.queue_movement(
             destination,
             acceptable_range,
@@ -4098,6 +4810,20 @@ impl LaneEngine {
             work,
             purpose,
         );
+        if let Some((candidates, combat_acceptable_range)) = combat_approach
+            && let Some(movement) = self.pending_movement.as_mut()
+        {
+            movement.destination.point = candidates[0];
+            movement.runtime.destination.point = candidates[0];
+            movement.alternate_destinations = candidates.into_iter().skip(1).collect();
+            movement.acceptable_range = combat_acceptable_range;
+            tracing::info!(
+                lane=?self.state.lane,
+                work_id=?movement.work.id,
+                candidates=movement.alternate_destinations.len() + 1,
+                "combat approach will try bounded reachable endpoints"
+            );
+        }
         self.last_dispatch = DispatchOutcome::DeferredMovement;
     }
 
@@ -4148,16 +4874,8 @@ impl LaneEngine {
                 self.assumed_facing = None;
             }
         }
-        if let GameplayCommand::Loot(target) = &original_command
-            && let Some((post_target, _, Some(cached_target))) = &self.post_combat_loot
-            && post_target == target
-        {
-            snapshot
-                .state
-                .entities
-                .0
-                .entry(*target)
-                .or_insert_with(|| cached_target.clone());
+        if let GameplayCommand::Loot(target) = &original_command {
+            snapshot = self.snapshot_with_post_combat_corpse(snapshot, *target);
         }
 
         if let GameplayCommand::Cast { spell, .. } = &original_command
@@ -4354,6 +5072,8 @@ impl LaneEngine {
             action,
         ) {
             ValidationOutcome::Sendable(action) => {
+                let repair_request =
+                    matches!(original_command, GameplayCommand::RepairEquipment { .. });
                 tracing::info!(lane=?self.state.lane, action=?action.id(), command=?action.command(), "validated gameplay action queued for proxy");
                 let sent = self.proxy.send(WorkerToProxy::Action(action)).await.is_ok();
                 self.last_dispatch = if sent {
@@ -4361,11 +5081,29 @@ impl LaneEngine {
                 } else {
                     DispatchOutcome::TransportClosed
                 };
+                if sent && repair_request {
+                    self.repair_pending = Some((
+                        self.state.authoritative.inventory.equipment_condition,
+                        Instant::now(),
+                    ));
+                    self.repair_retry_after = None;
+                }
                 sent
             }
             ValidationOutcome::NeedsMovement(requirement) => {
-                self.defer_spatial_movement(
+                let Some(destination) = self.safe_npc_approach_destination(
+                    &snapshot,
+                    &original_command,
                     requirement.destination,
+                ) else {
+                    self.waiting(
+                        "NPC approach has no navigation-validated safe ground point".to_owned(),
+                    );
+                    self.last_dispatch = DispatchOutcome::DeferredSpatial;
+                    return true;
+                };
+                self.defer_spatial_movement(
+                    destination,
                     requirement.acceptable_range,
                     original_command,
                     action_origin,
@@ -4467,7 +5205,9 @@ impl LaneEngine {
         self.pending_giver_interaction = None;
         self.giver_retry_after.clear();
         self.pending_turn_in = None;
+        self.reward_metadata_waiting = None;
         self.last_turn_in_search_query = None;
+        self.turn_in_search_failures.clear();
         self.cancel_route_job();
         self.pending_movement = None;
         self.pending_facing = None;
@@ -4475,6 +5215,7 @@ impl LaneEngine {
         self.search_attempts.clear();
         self.quest_start_search_attempts.clear();
         self.search_retry_after.clear();
+        self.combat_target_retry_after.clear();
         self.search_roam_cursor.clear();
         self.current_work = None;
         self.last_wait_reason = None;
@@ -4492,10 +5233,13 @@ impl LaneEngine {
         self.behind_retry_after.clear();
         self.behind_retry_cast_allowed.clear();
         self.maintenance_retry_after.clear();
+        self.repair_pending = None;
+        self.repair_retry_after = None;
         self.last_maintenance_tick = None;
         self.last_maintenance_status = None;
         self.post_combat_loot = None;
         self.last_recovery_action = None;
+        self.last_logged_player_life_status = None;
         self.last_survival_action = None;
     }
 }
@@ -4506,19 +5250,34 @@ fn refresh_cached_post_combat_corpse(
     queued: &mut Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
     target: EntityId,
     observed: &wow_state::entities::EntityState,
-) {
+) -> Option<WorldPosition> {
     if observed.health.is_some_and(|(current, _)| current > 0) {
-        return;
+        return None;
     }
     let Some((queued_target, _, cached)) = queued else {
-        return;
+        return None;
     };
     if *queued_target != target {
-        return;
+        return None;
     }
     let mut current = observed.clone();
     current.mark_dead();
+    if let (Some(previous), Some(observed_position)) = (cached.as_ref(), current.position)
+        && ((current.target.is_some() && current.target == previous.target)
+            || (current.target.is_none() && previous.target.is_some()))
+        && let Some(previous_position) = previous.position
+        && previous_position.map == observed_position.map
+        && previous_position.point.distance(observed_position.point) > CORPSE_STALE_TARGET_DISTANCE
+    {
+        // Keep the death-site correction when a later object update restores
+        // the creature's stale spawn position. A death update can also clear
+        // the target field, so an absent target does not invalidate the cached
+        // correction.
+        current.position = Some(previous_position);
+    }
+    let position = current.position;
     *cached = Some(current);
+    position
 }
 
 fn current_loot_approach(snapshot: &Snapshot, target: EntityId) -> Option<(WorldPosition, f32)> {
@@ -4718,10 +5477,6 @@ fn quest_search_arrived(player: Vec3, destination: Vec3) -> bool {
 fn quest_tool_search_arrived(player: Vec3, destination: Vec3) -> bool {
     player.distance(destination) <= QUEST_TOOL_SEARCH_RANGE
 }
-fn should_supersede_search_movement(purpose: MovementPurpose, live_target_available: bool) -> bool {
-    purpose == MovementPurpose::SearchArea && live_target_available
-}
-
 fn is_quest_search_work(movement: &PendingMovement) -> bool {
     movement.purpose == MovementPurpose::SearchArea
         && matches!(
@@ -4734,6 +5489,159 @@ fn is_quest_search_work(movement: &PendingMovement) -> bool {
 mod tests {
     use super::*;
     use crate::activity::ActivityArbiter;
+
+    #[test]
+    fn group_follow_spacing_uses_party_and_raid_roles() {
+        for (intent, expected) in [
+            (
+                MissionIntent::Party {
+                    role: GroupRole::Tank,
+                },
+                4.0,
+            ),
+            (
+                MissionIntent::Raid {
+                    role: GroupRole::Healer,
+                },
+                20.0,
+            ),
+            (
+                MissionIntent::Party {
+                    role: GroupRole::Ranged,
+                },
+                17.0,
+            ),
+            (
+                MissionIntent::Raid {
+                    role: GroupRole::Melee,
+                },
+                5.0,
+            ),
+            (MissionIntent::Idle, 17.0),
+        ] {
+            assert_eq!(group_follow_stop_distance(&intent), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn damaged_equipment_uses_a_live_repair_vendor() {
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let vendor = catalog
+            .world()
+            .vendor_services
+            .iter()
+            .find(|service| service.can_repair && !service.spawns.is_empty())
+            .expect("catalog contains a repair vendor");
+        let spawn = &vendor.spawns[0];
+        let player_position = WorldPosition {
+            map: spawn.map_id,
+            point: Vec3::new(spawn.x, spawn.y, spawn.z),
+            orientation: 0.0,
+        };
+        let player = EntityId(1);
+        let repairer = EntityId(2);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(player_position);
+        authoritative.inventory.equipment_condition = wow_state::inventory::EquipmentCondition {
+            observed: true,
+            lowest_durability_percent: Some(12),
+            broken_items: 0,
+        };
+        authoritative.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                id: player,
+                kind: wow_state::entities::EntityKind::Player,
+                position: Some(player_position),
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            repairer,
+            wow_state::entities::EntityState {
+                id: repairer,
+                kind: wow_state::entities::EntityKind::Unit,
+                entry: vendor.entry_id,
+                interactable: true,
+                position: Some(WorldPosition {
+                    point: Vec3::new(spawn.x + 1.0, spawn.y, spawn.z),
+                    ..player_position
+                }),
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(1)), authoritative);
+
+        assert!(
+            engine
+                .tick_equipment_repair(&Snapshot::from_state(&engine.state.authoritative))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            engine.last_dispatch,
+            DispatchOutcome::Sent,
+            "repair action did not dispatch: {:?}",
+            engine.last_wait_reason
+        );
+        let WorkerToProxy::Action(action) = proxy.try_recv().expect("repair action") else {
+            panic!("expected a repair action")
+        };
+        assert_eq!(
+            action.command(),
+            &GameplayCommand::RepairEquipment { vendor: repairer }
+        );
+        assert!(engine.repair_pending.is_some());
+    }
+
+    #[tokio::test]
+    async fn equipment_repair_does_not_start_a_detour_for_an_active_group() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.inventory.equipment_condition = wow_state::inventory::EquipmentCondition {
+            observed: true,
+            lowest_durability_percent: Some(10),
+            broken_items: 0,
+        };
+        authoritative.group.lifecycle = wow_state::group::GroupLifecycle::Active;
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(1)), authoritative);
+
+        assert!(
+            engine
+                .tick_equipment_repair(&Snapshot::from_state(&engine.state.authoritative))
+                .await
+                .is_none()
+        );
+        assert!(proxy.try_recv().is_err());
+    }
+
+    #[test]
+    fn repair_detour_stops_when_repair_is_complete_or_group_becomes_active() {
+        let damaged = wow_state::inventory::EquipmentCondition {
+            observed: true,
+            lowest_durability_percent: Some(10),
+            broken_items: 0,
+        };
+        let repaired = wow_state::inventory::EquipmentCondition {
+            observed: true,
+            lowest_durability_percent: Some(100),
+            broken_items: 0,
+        };
+        assert!(repair_detour_should_continue(
+            damaged,
+            wow_state::group::GroupLifecycle::Solo
+        ));
+        assert!(!repair_detour_should_continue(
+            repaired,
+            wow_state::group::GroupLifecycle::Solo
+        ));
+        assert!(!repair_detour_should_continue(
+            damaged,
+            wow_state::group::GroupLifecycle::Active
+        ));
+    }
 
     #[test]
     fn quest_confirmation_wait_ends_at_the_shared_deadline() {
@@ -4800,7 +5708,7 @@ mod tests {
     }
 
     #[test]
-    fn later_corpse_position_updates_replace_the_cached_reference() {
+    fn later_corpse_updates_replace_the_cached_position_when_target_is_unknown() {
         let target = EntityId(2);
         let old_position = WorldPosition {
             map: 0,
@@ -4823,9 +5731,73 @@ mod tests {
         };
         let mut queued = Some((target, Instant::now(), Some(old)));
 
-        refresh_cached_post_combat_corpse(&mut queued, target, &observed);
+        let position = refresh_cached_post_combat_corpse(&mut queued, target, &observed);
 
         assert_eq!(queued.unwrap().2.unwrap().position, Some(current_position));
+        assert_eq!(position, Some(current_position));
+    }
+
+    #[test]
+    fn stale_corpse_update_keeps_a_corrected_position_for_the_same_attacker() {
+        let target = EntityId(2);
+        let attacker = EntityId(7);
+        let death_site = WorldPosition {
+            map: 0,
+            point: Vec3::new(10.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let spawn = WorldPosition {
+            point: Vec3::new(0.0, 0.0, 0.0),
+            ..death_site
+        };
+        let old = wow_state::entities::EntityState {
+            id: target,
+            target: Some(attacker),
+            position: Some(death_site),
+            health: Some((0, 100)),
+            ..Default::default()
+        };
+        let observed = wow_state::entities::EntityState {
+            position: Some(spawn),
+            ..old.clone()
+        };
+        let mut queued = Some((target, Instant::now(), Some(old)));
+
+        let position = refresh_cached_post_combat_corpse(&mut queued, target, &observed);
+
+        assert_eq!(queued.unwrap().2.unwrap().position, Some(death_site));
+        assert_eq!(position, Some(death_site));
+    }
+
+    #[test]
+    fn stale_corpse_update_keeps_a_corrected_position_after_target_is_cleared() {
+        let target = EntityId(2);
+        let attacker = EntityId(1);
+        let spawn = WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let death_site = WorldPosition {
+            point: Vec3::new(12.0, 0.0, 0.0),
+            ..spawn
+        };
+        let old = wow_state::entities::EntityState {
+            target: Some(attacker),
+            position: Some(death_site),
+            ..Default::default()
+        };
+        let observed = wow_state::entities::EntityState {
+            target: None,
+            position: Some(spawn),
+            ..old.clone()
+        };
+        let mut queued = Some((target, Instant::now(), Some(old)));
+
+        let position = refresh_cached_post_combat_corpse(&mut queued, target, &observed);
+
+        assert_eq!(queued.unwrap().2.unwrap().position, Some(death_site));
+        assert_eq!(position, Some(death_site));
     }
 
     #[test]
@@ -4866,6 +5838,68 @@ mod tests {
 
         assert_ne!(first.0.point, current.0.point);
         assert_eq!(current.0.map, 0);
+    }
+
+    #[test]
+    fn cached_post_combat_corpse_replaces_stale_world_position_for_loot_approach() {
+        let target = EntityId(2);
+        let stale_position = WorldPosition {
+            map: 0,
+            point: Vec3::new(-6508.82, 300.758, 370.446),
+            orientation: 0.0,
+        };
+        let corpse_position = WorldPosition {
+            map: 0,
+            point: Vec3::new(-6499.8955, 326.72925, 368.62262),
+            orientation: 1.84,
+        };
+        let corpse = wow_state::entities::EntityState {
+            id: target,
+            kind: wow_state::entities::EntityKind::Unit,
+            position: Some(corpse_position),
+            health: Some((0, 100)),
+            ..Default::default()
+        };
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        authoritative.entities.0.insert(
+            target,
+            wow_state::entities::EntityState {
+                id: target,
+                kind: wow_state::entities::EntityKind::Unit,
+                position: Some(stale_position),
+                health: Some((0, 100)),
+                ..Default::default()
+            },
+        );
+        let (mut engine, _) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        engine.post_combat_loot = Some((target, Instant::now(), Some(corpse)));
+
+        let actual_snapshot = engine.snapshot_with_post_combat_corpse(
+            Snapshot::from_state(&engine.state.authoritative),
+            target,
+        );
+        let mut expected_snapshot = Snapshot::from_state(&engine.state.authoritative);
+        expected_snapshot
+            .state
+            .entities
+            .0
+            .get_mut(&target)
+            .unwrap()
+            .position = Some(corpse_position);
+
+        assert_eq!(
+            actual_snapshot.state.entities.0[&target].position,
+            Some(corpse_position)
+        );
+        assert_eq!(
+            current_loot_approach(&actual_snapshot, target),
+            current_loot_approach(&expected_snapshot, target)
+        );
     }
 
     #[tokio::test]
@@ -4956,6 +5990,31 @@ mod tests {
         assert_eq!(corpse.position, Some(corpse_position));
     }
 
+    #[test]
+    fn owned_kill_without_target_evidence_keeps_observed_corpse_position() {
+        let player = EntityId(1);
+        let corpse_position = WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let player_position = WorldPosition {
+            point: Vec3::new(20.0, 0.0, 0.0),
+            ..corpse_position
+        };
+        let mut state = wow_state::AuthoritativeState::default();
+        state.session.character_guid = Some(player.0);
+        state.position.player = Some(player_position);
+        let mut corpse = wow_state::entities::EntityState {
+            target: None,
+            position: Some(corpse_position),
+            ..Default::default()
+        };
+
+        assert!(!relocate_moved_mob_corpse(&state, &mut corpse));
+        assert_eq!(corpse.position, Some(corpse_position));
+    }
+
     fn test_engine(
         mission: Mission,
         authoritative: wow_state::AuthoritativeState,
@@ -4976,6 +6035,167 @@ mod tests {
             activity: ActivityArbiter::default(),
         };
         (LaneEngine::new(state, lane_rx, proxy_tx), proxy_rx)
+    }
+
+    #[tokio::test]
+    async fn quest_turn_in_selects_the_best_authoritative_equipment_reward() {
+        use wow_state::{
+            entities::{EntityKind, EntityState},
+            inventory::ItemTemplateMetadata,
+            quests::{QuestTurnInDialog, QuestTurnInStage},
+        };
+
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.capabilities.class_id = Some(1);
+        authoritative.capabilities.specialization_tree = Some(0);
+        authoritative.entities.0.insert(
+            EntityId(1),
+            EntityState {
+                id: EntityId(1),
+                kind: EntityKind::Player,
+                level: Some(60),
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            EntityId(77),
+            EntityState {
+                id: EntityId(77),
+                kind: EntityKind::Unit,
+                interactable: true,
+                ..Default::default()
+            },
+        );
+        authoritative.quests.active.insert(
+            55,
+            wow_state::quests::QuestProgress {
+                complete: true,
+                objectives: Vec::new(),
+            },
+        );
+        authoritative.inventory.equipped_items.insert(0, 100);
+        let item = |item_level, strength| ItemTemplateMetadata {
+            item_class: 4,
+            subclass: 1,
+            quality: 2,
+            sell_price: item_level,
+            inventory_type: 1,
+            allowable_class: u32::MAX,
+            item_level,
+            required_level: 1,
+            stats: vec![(4, strength)],
+            armor: item_level,
+            ..Default::default()
+        };
+        authoritative
+            .inventory
+            .item_metadata
+            .insert(100, item(10, 1));
+        authoritative
+            .inventory
+            .item_metadata
+            .insert(200, item(18, 10));
+        authoritative
+            .inventory
+            .item_metadata
+            .insert(201, item(20, 15));
+        authoritative.quests.turn_in.insert(
+            55,
+            QuestTurnInDialog {
+                giver: EntityId(77),
+                stage: QuestTurnInStage::OfferReward {
+                    reward_items: vec![200, 201],
+                },
+            },
+        );
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(1)), authoritative);
+
+        assert!(engine.tick_complete_quest(55).await);
+
+        let WorkerToProxy::Action(action) = proxy.try_recv().expect("reward selection action")
+        else {
+            panic!("expected quest reward action")
+        };
+        assert_eq!(
+            action.command(),
+            &GameplayCommand::ChooseQuestReward {
+                quest: 55,
+                giver: EntityId(77),
+                reward: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn quest_reward_waits_for_metadata_then_uses_a_bounded_fallback() {
+        use wow_state::{
+            entities::{EntityKind, EntityState},
+            quests::{QuestTurnInDialog, QuestTurnInStage},
+        };
+
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.entities.0.insert(
+            EntityId(1),
+            EntityState {
+                id: EntityId(1),
+                kind: EntityKind::Player,
+                level: Some(60),
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            EntityId(77),
+            EntityState {
+                id: EntityId(77),
+                kind: EntityKind::Unit,
+                interactable: true,
+                ..Default::default()
+            },
+        );
+        authoritative.quests.active.insert(
+            55,
+            wow_state::quests::QuestProgress {
+                complete: true,
+                objectives: Vec::new(),
+            },
+        );
+        authoritative.quests.turn_in.insert(
+            55,
+            QuestTurnInDialog {
+                giver: EntityId(77),
+                stage: QuestTurnInStage::OfferReward {
+                    reward_items: vec![200, 201],
+                },
+            },
+        );
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(1)), authoritative);
+
+        assert!(engine.tick_complete_quest(55).await);
+        let WorkerToProxy::Action(query) = proxy.try_recv().expect("reward item query") else {
+            panic!("expected reward metadata query")
+        };
+        assert_eq!(query.command(), &GameplayCommand::QueryItem { item: 200 });
+
+        engine.reward_metadata_waiting = Some((
+            55,
+            Instant::now() - wow_policy::questing::rewards::metadata_wait(),
+        ));
+        assert!(engine.tick_complete_quest(55).await);
+        let WorkerToProxy::Action(choice) = proxy.try_recv().expect("reward fallback") else {
+            panic!("expected quest reward selection")
+        };
+        assert_eq!(
+            choice.command(),
+            &GameplayCommand::ChooseQuestReward {
+                quest: 55,
+                giver: EntityId(77),
+                reward: 0,
+            }
+        );
     }
 
     #[tokio::test]
@@ -5109,6 +6329,87 @@ mod tests {
             StateRevision(3),
         );
         assert!(engine.pending_movement.as_ref().unwrap().last_progress_at > stalled_since);
+    }
+
+    #[tokio::test]
+    async fn visible_quest_target_does_not_cancel_search_area_movement() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        authoritative.quests.active.insert(
+            218,
+            wow_state::quests::QuestProgress {
+                complete: false,
+                objectives: vec![0],
+            },
+        );
+        authoritative.quests.definitions.insert(
+            218,
+            wow_state::quests::QuestDefinition {
+                quest: 218,
+                title: "Test cave objective".into(),
+                poi_map: Some(0),
+                poi_x: Some(100.0),
+                poi_y: Some(100.0),
+                targets: vec![wow_state::quests::QuestTargetObjective {
+                    slot: 0,
+                    kind: wow_state::quests::QuestTargetKind::Creature,
+                    entry: 7,
+                    required: 1,
+                    item_drop: 0,
+                    text: "Test target".into(),
+                }],
+                items: vec![],
+            },
+        );
+        authoritative.entities.0.insert(
+            EntityId(9),
+            wow_state::entities::EntityState {
+                id: EntityId(9),
+                entry: 7,
+                kind: wow_state::entities::EntityKind::Unit,
+                hostile: true,
+                position: Some(WorldPosition {
+                    map: 0,
+                    point: Vec3::new(20.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        engine.queue_movement(
+            Vec3::new(100.0, 100.0, 0.0),
+            QUEST_SEARCH_ARRIVAL_RANGE,
+            None,
+            None,
+            PlanOrigin::Deterministic,
+            QuestWorkRuntime {
+                id: QuestWorkId(7),
+                key: QuestWorkKey::TravelToObjective {
+                    quest: 218,
+                    objective: 0,
+                    destination: WorldPosition {
+                        map: 0,
+                        point: Vec3::new(100.0, 100.0, 0.0),
+                        orientation: 0.0,
+                    },
+                },
+            },
+            MovementPurpose::SearchArea,
+        );
+
+        assert!(engine.tick_movement().await);
+        let movement = engine
+            .pending_movement
+            .as_ref()
+            .expect("visible target must not cancel the cave search route");
+        assert_eq!(movement.purpose, MovementPurpose::SearchArea);
+        assert_eq!(movement.destination.point, Vec3::new(100.0, 100.0, 0.0));
     }
 
     fn combat_engine() -> (LaneEngine, mpsc::Receiver<WorkerToProxy>) {
@@ -5793,6 +7094,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gather_mission_searches_trusted_local_spawns_until_a_live_node_appears() {
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let node = catalog
+            .world()
+            .gather_nodes
+            .iter()
+            .find(|node| !node.spawns.is_empty())
+            .expect("embedded catalog contains gathering spawns");
+        let spawn = &node.spawns[0];
+        let skill = match node.kind {
+            wow_infra::world_knowledge::GatheringKind::Mining => 186,
+            wow_infra::world_knowledge::GatheringKind::Herbalism => 182,
+            wow_infra::world_knowledge::GatheringKind::Fishing => 356,
+        };
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.position.player = Some(WorldPosition {
+            map: spawn.map_id,
+            point: Vec3::new(spawn.x + 20.0, spawn.y, spawn.z),
+            orientation: 0.0,
+        });
+        authoritative.professions.known = true;
+        authoritative
+            .professions
+            .skills
+            .insert(skill, (u16::MAX, u16::MAX));
+        let (mut engine, mut proxy) = test_engine(
+            Mission::gather(MissionId(1), node.name.clone()),
+            authoritative,
+        );
+
+        assert!(engine.tick_gather(&node.name).await);
+
+        assert!(
+            proxy.try_recv().is_err(),
+            "a static hint cannot authorize gathering"
+        );
+        let movement = engine
+            .pending_movement
+            .as_ref()
+            .expect("a trusted spawn hint should create search movement");
+        assert_eq!(movement.destination.map, spawn.map_id);
+        assert_eq!(
+            movement.destination.point,
+            Vec3::new(spawn.x, spawn.y, spawn.z)
+        );
+    }
+
+    #[tokio::test]
     async fn gather_authority_and_fishing_capability_gates_prevent_actions() {
         let mut state = wow_state::AuthoritativeState::default();
         state.session.in_world = true;
@@ -6003,6 +7354,85 @@ mod tests {
         assert!(!engine.player_is_dead());
     }
 
+    #[tokio::test]
+    async fn death_recovery_stops_and_clears_active_quest_movement() {
+        let player = EntityId(1);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        authoritative.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                id: player,
+                health: Some((0, 100)),
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(1)), authoritative);
+        engine.queue_movement(
+            Vec3::new(20.0, 0.0, 0.0),
+            1.0,
+            None,
+            None,
+            PlanOrigin::SystemPolicy,
+            QuestWorkRuntime {
+                id: QuestWorkId(7),
+                key: QuestWorkKey::AcquireQuest { quest: None },
+            },
+            MovementPurpose::SearchArea,
+        );
+
+        assert!(engine.tick_mission().await);
+
+        assert!(engine.pending_movement.is_none());
+        assert!(engine.current_work.is_none());
+        let WorkerToProxy::Action(action) = proxy.try_recv().expect("stop movement action") else {
+            panic!("expected a stop movement action")
+        };
+        assert_eq!(action.command(), &GameplayCommand::StopMovement);
+    }
+
+    #[test]
+    fn ghost_aura_triggers_death_recovery_without_zero_health() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.character_guid = Some(1);
+        authoritative.entities.0.insert(
+            EntityId(1),
+            wow_state::entities::EntityState {
+                id: EntityId(1),
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+        authoritative
+            .auras
+            .by_entity
+            .entry(EntityId(1))
+            .or_default()
+            .insert(
+                0,
+                wow_state::auras::AuraInstance {
+                    slot: 0,
+                    spell: wow_state::life::GHOST_AURA_SPELL_ID,
+                    positive: Some(true),
+                    caster: None,
+                    max_duration_ms: None,
+                    remaining_ms: None,
+                    observed_at_ms: None,
+                },
+            );
+
+        let (engine, _) = test_engine(Mission::quest(MissionId(1)), authoritative);
+
+        assert_eq!(engine.player_life_status(), PlayerLifeStatus::Ghost);
+        assert!(engine.player_is_dead());
+    }
+
     #[test]
     fn quest_tool_activation_waits_for_temporary_item_target() {
         let (mut engine, _proxy) = combat_engine();
@@ -6168,22 +7598,6 @@ mod tests {
     }
 
     #[test]
-    fn live_target_only_supersedes_static_search_movement() {
-        assert!(should_supersede_search_movement(
-            MovementPurpose::SearchArea,
-            true
-        ));
-        assert!(!should_supersede_search_movement(
-            MovementPurpose::ApproachGroundedTarget,
-            true
-        ));
-        assert!(!should_supersede_search_movement(
-            MovementPurpose::SearchArea,
-            false
-        ));
-    }
-
-    #[test]
     fn turn_in_search_continues_past_the_old_eighteen_yard_envelope() {
         let destination = Vec3::new(0.0, 0.0, 20.0);
         assert!(!turn_in_search_arrived(
@@ -6198,6 +7612,35 @@ mod tests {
             Vec3::new(2.0, 0.0, 17.0),
             destination
         ));
+    }
+
+    #[test]
+    fn unreachable_turn_in_hint_stays_blocked_until_player_moves_or_changes_map() {
+        let (mut engine, _proxy_rx) = test_engine(Mission::quest(MissionId(9)), Default::default());
+        let failed_area = WorldPosition {
+            map: 0,
+            point: Vec3::new(-5732.0, -367.0, 366.0),
+            orientation: 0.0,
+        };
+        engine.record_turn_in_search_failure(5541, failed_area);
+
+        assert!(engine.turn_in_search_hint_blocked(5541, failed_area));
+        assert!(engine.turn_in_search_failures.contains_key(&5541));
+
+        let moved = WorldPosition {
+            point: Vec3::new(-5670.0, -367.0, 366.0),
+            ..failed_area
+        };
+        assert!(!engine.turn_in_search_hint_blocked(5541, moved));
+        assert!(!engine.turn_in_search_failures.contains_key(&5541));
+
+        engine.record_turn_in_search_failure(5541, failed_area);
+        let other_map = WorldPosition {
+            map: 1,
+            ..failed_area
+        };
+        assert!(!engine.turn_in_search_hint_blocked(5541, other_map));
+        assert!(!engine.turn_in_search_failures.contains_key(&5541));
     }
 
     #[test]
@@ -6283,6 +7726,19 @@ mod tests {
         );
 
         assert_eq!(engine.next_incomplete_quest(), Some(3361));
+    }
+
+    #[test]
+    fn quest_item_gameobject_uses_the_captured_open_command() {
+        let target = EntityId(0xF110_0244_1300_0C92);
+        assert_eq!(
+            quest_item_gameobject_open_command(target),
+            GameplayCommand::CastGameObject {
+                spell: QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID,
+                target,
+                report_use: true,
+            }
+        );
     }
 
     #[test]
