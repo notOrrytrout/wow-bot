@@ -69,9 +69,7 @@ pub fn select_player_recovery_item(snapshot: &Snapshot) -> Option<PlayerRecovery
     if !snapshot.state.session.in_world
         || !snapshot.state.inventory.instances_authoritative
         || !snapshot.state.auras.by_entity.contains_key(&player)
-        || snapshot.state.control.mover.is_some()
-        || snapshot.state.position.moving
-        || snapshot.state.transport.attached == Some(true)
+        || !crate::safety::player_can_do_stationary_work(snapshot)
     {
         return None;
     }
@@ -1773,9 +1771,7 @@ pub fn vendor_gear_purchase_allowed(snapshot: &Snapshot, player: EntityId) -> bo
     inventory.instances_authoritative
         && inventory.free_slots > 0
         && inventory.equipment_slots_authoritative
-        && snapshot.state.control.mover.is_none()
-        && !snapshot.state.position.moving
-        && snapshot.state.transport.attached != Some(true)
+        && crate::safety::player_can_do_stationary_work(snapshot)
         && !snapshot
             .state
             .entities

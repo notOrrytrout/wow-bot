@@ -10,6 +10,7 @@ pub mod maintenance;
 pub mod missions;
 pub mod questing;
 pub mod risk;
+pub(crate) mod safety;
 pub mod travel;
 
 pub(crate) mod selection;

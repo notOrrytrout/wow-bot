@@ -23,9 +23,7 @@ pub fn bank_work_allowed(snapshot: &Snapshot) -> bool {
         return false;
     };
     snapshot.state.session.in_world
-        && !snapshot.state.position.moving
-        && snapshot.state.control.mover.is_none()
-        && snapshot.state.transport.attached != Some(true)
+        && crate::safety::player_can_do_stationary_work(snapshot)
         && !snapshot.state.active_casts.contains_key(&player)
         && entity.health.is_some_and(|(current, _)| current > 0)
         && entity.in_combat() != Some(true)
