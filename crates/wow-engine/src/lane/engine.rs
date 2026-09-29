@@ -82,40 +82,44 @@ fn repair_detour_should_continue(
         && wow_policy::maintenance::equipment_needs_repair(condition)
 }
 
+fn nearest_interactable_unit<F>(
+    entities: &BTreeMap<EntityId, wow_state::entities::EntityState>,
+    from: WorldPosition,
+    max_distance: Option<f32>,
+    mut eligible: F,
+) -> Option<(EntityId, WorldPosition)>
+where
+    F: FnMut(&wow_state::entities::EntityState) -> bool,
+{
+    entities
+        .values()
+        .filter(|entity| {
+            entity.kind == wow_state::entities::EntityKind::Unit
+                && entity.interactable
+                && eligible(entity)
+        })
+        .filter_map(|entity| entity.position.map(|position| (entity.id, position)))
+        .filter(|(_, position)| {
+            position.map == from.map
+                && max_distance.is_none_or(|limit| position.point.distance(from.point) <= limit)
+        })
+        .min_by(|(_, left), (_, right)| {
+            left.point
+                .distance(from.point)
+                .total_cmp(&right.point.distance(from.point))
+        })
+}
+
 fn nearby_sell_vendor(snapshot: &Snapshot) -> Option<EntityId> {
     let position = snapshot
         .state
         .control
         .active_position(snapshot.state.position.player)?;
     let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
-    snapshot
-        .state
-        .entities
-        .0
-        .values()
-        .filter(|entity| {
-            entity.kind == wow_state::entities::EntityKind::Unit
-                && entity.interactable
-                && catalog.vendor_offers_service(
-                    entity.entry,
-                    wow_infra::world_knowledge::VendorKind::Sell,
-                )
-        })
-        .filter_map(|entity| {
-            entity
-                .position
-                .map(|vendor_position| (entity, vendor_position))
-        })
-        .filter(|(_, vendor_position)| {
-            vendor_position.map == position.map
-                && vendor_position.point.distance(position.point) <= 5.0
-        })
-        .min_by(|(_, left), (_, right)| {
-            left.point
-                .distance(position.point)
-                .total_cmp(&right.point.distance(position.point))
-        })
-        .map(|(entity, _)| entity.id)
+    nearest_interactable_unit(&snapshot.state.entities.0, position, Some(5.0), |entity| {
+        catalog.vendor_offers_service(entity.entry, wow_infra::world_knowledge::VendorKind::Sell)
+    })
+    .map(|(vendor, _)| vendor)
 }
 
 fn nearby_class_trainer(snapshot: &Snapshot) -> Option<EntityId> {
@@ -1843,25 +1847,10 @@ impl LaneEngine {
             return Some(true);
         };
 
-        if let Some(vendor) = self
-            .state
-            .authoritative
-            .entities
-            .0
-            .values()
-            .filter(|entity| {
+        if let Some((vendor, _)) =
+            nearest_interactable_unit(&snapshot.state.entities.0, position, Some(5.0), |entity| {
                 entity.entry == vendor_entry
-                    && entity.kind == wow_state::entities::EntityKind::Unit
-                    && entity.interactable
             })
-            .filter_map(|entity| entity.position.map(|p| (entity, p)))
-            .filter(|(_, p)| p.map == position.map && p.point.distance(position.point) <= 5.0)
-            .min_by(|(_, a), (_, b)| {
-                a.point
-                    .distance(position.point)
-                    .total_cmp(&b.point.distance(position.point))
-            })
-            .map(|(entity, _)| entity.id)
         {
             if snapshot.state.inventory.vendor != Some(vendor) {
                 if !self.bag_relief_list_pending {
@@ -4011,24 +4000,10 @@ impl LaneEngine {
             ));
             return Some(true);
         };
-        let vendor = snapshot
-            .state
-            .entities
-            .0
-            .values()
-            .filter(|entity| {
+        let vendor =
+            nearest_interactable_unit(&snapshot.state.entities.0, position, None, |entity| {
                 entity.entry == vendor_entry
-                    && entity.kind == wow_state::entities::EntityKind::Unit
-                    && entity.interactable
-            })
-            .filter_map(|entity| entity.position.map(|target| (entity, target)))
-            .filter(|(_, target)| target.map == position.map)
-            .min_by(|(_, left), (_, right)| {
-                left.point
-                    .distance(position.point)
-                    .total_cmp(&right.point.distance(position.point))
-            })
-            .map(|(entity, target)| (entity.id, target));
+            });
         if let Some((vendor, vendor_position)) = vendor {
             if vendor_position.point.distance(position.point) > 5.0
                 && !self.state.mission.permissions.contains(PermissionSet::MOVE)
