@@ -150,21 +150,19 @@ pub fn select_emergency_health_item(
 
 fn emergency_player(snapshot: &Snapshot, target: EntityId) -> Option<EntityId> {
     let player = EntityId(snapshot.state.session.character_guid?);
-    (snapshot.state.session.in_world
-        && snapshot.state.entities.0.contains_key(&player)
-        && snapshot.state.entities.0.contains_key(&target)
-        && !spirit_of_redemption_active(snapshot, player))
-    .then_some(player)
-}
-
-fn spirit_of_redemption_active(snapshot: &Snapshot, player: EntityId) -> bool {
-    snapshot.state.capabilities.class_id == Some(5)
-        && snapshot
-            .state
-            .auras
-            .by_entity
-            .get(&player)
-            .is_some_and(|auras| auras.values().any(|aura| aura.spell == 27_827))
+    if !snapshot.state.session.in_world
+        || !snapshot.state.entities.0.contains_key(&player)
+        || !snapshot.state.entities.0.contains_key(&target)
+    {
+        return None;
+    }
+    if snapshot.state.capabilities.class_id == Some(5) {
+        let auras = snapshot.state.auras.by_entity.get(&player)?;
+        if auras.values().any(|aura| aura.spell == 27_827) {
+            return None;
+        }
+    }
+    Some(player)
 }
 
 fn player_health_percent(snapshot: &Snapshot, player: EntityId) -> Option<u32> {
@@ -309,6 +307,18 @@ mod tests {
                 observed_at_ms: None,
             },
         );
+        let snapshot = Snapshot::from_state(&state);
+        assert!(select_emergency_healthstone(&snapshot, target).is_none());
+        assert!(select_emergency_health_item(&snapshot, target, false).is_none());
+    }
+
+    #[test]
+    fn priest_emergency_health_items_require_observed_aura_state() {
+        let (mut state, target) = potion_state();
+        state.capabilities.class_id = Some(5);
+        add_backpack_use_item(&mut state, 12, 102, "Minor Healthstone");
+        add_backpack_use_item(&mut state, 13, 103, "Whipper Root Tuber");
+        state.auras.by_entity.remove(&EntityId(1));
         let snapshot = Snapshot::from_state(&state);
         assert!(select_emergency_healthstone(&snapshot, target).is_none());
         assert!(select_emergency_health_item(&snapshot, target, false).is_none());

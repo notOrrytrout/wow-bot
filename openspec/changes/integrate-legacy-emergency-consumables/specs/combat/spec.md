@@ -23,3 +23,7 @@ During confirmed combat, the system SHALL use an authoritative healthstone insta
 #### Scenario: Spirit of Redemption is active
 - **WHEN** the player is a Priest with authoritative Spirit of Redemption aura state
 - **THEN** the lane does not spend a healthstone, Whipper Root Tuber, or Night Dragon's Breath to preserve the temporary 1-health state
+
+#### Scenario: Priest aura state is unknown
+- **WHEN** the player is a Priest and no authoritative aura map is available for the player
+- **THEN** the lane does not use a healthstone, Whipper Root Tuber, or Night Dragon's Breath
