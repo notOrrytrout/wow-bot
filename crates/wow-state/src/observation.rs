@@ -125,6 +125,16 @@ pub enum ProtocolObservation {
     VendorOpened {
         vendor: EntityId,
     },
+    VendorInventory {
+        vendor: EntityId,
+        offers: Vec<crate::inventory::VendorOffer>,
+    },
+    VendorStockUpdated {
+        vendor: EntityId,
+        slot: u32,
+        stock: Option<u32>,
+        purchased_lots: u32,
+    },
     VendorClosed,
     Trade(crate::inventory::TradeState),
     Auction(crate::inventory::AuctionState),

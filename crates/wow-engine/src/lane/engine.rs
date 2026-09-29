@@ -82,6 +82,46 @@ fn repair_detour_should_continue(
         && wow_policy::maintenance::equipment_needs_repair(condition)
 }
 
+fn nearby_sell_vendor(snapshot: &Snapshot) -> Option<EntityId> {
+    let position = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player)?;
+    let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+    let sell_entries: BTreeSet<u32> = catalog
+        .world()
+        .vendor_services
+        .iter()
+        .filter(|service| service.can_sell)
+        .map(|service| service.entry_id)
+        .collect();
+    snapshot
+        .state
+        .entities
+        .0
+        .values()
+        .filter(|entity| {
+            entity.kind == wow_state::entities::EntityKind::Unit
+                && entity.interactable
+                && sell_entries.contains(&entity.entry)
+        })
+        .filter_map(|entity| {
+            entity
+                .position
+                .map(|vendor_position| (entity, vendor_position))
+        })
+        .filter(|(_, vendor_position)| {
+            vendor_position.map == position.map
+                && vendor_position.point.distance(position.point) <= 5.0
+        })
+        .min_by(|(_, left), (_, right)| {
+            left.point
+                .distance(position.point)
+                .total_cmp(&right.point.distance(position.point))
+        })
+        .map(|(entity, _)| entity.id)
+}
+
 struct RoutePlanJob {
     token: crate::movement::ReplanToken,
     stamped: crate::runtime::Stamped<WorldPosition>,
@@ -604,7 +644,13 @@ impl LaneEngine {
                     self.bag_relief_sale_pending = None;
                     self.bag_relief_rejected_sales.clear();
                 }
-                if matches!(o, ProtocolObservation::VendorOpened { .. }) {
+                let vendor_listed = match &o {
+                    ProtocolObservation::VendorOpened { vendor }
+                    | ProtocolObservation::VendorInventory { vendor, .. } => Some(*vendor),
+                    _ => None,
+                };
+                if let Some(vendor) = vendor_listed {
+                    self.maintenance_retry_after.remove(&(0, vendor));
                     self.bag_relief_list_pending = false;
                 }
                 if let ProtocolObservation::CastFailed {
@@ -1762,11 +1808,13 @@ impl LaneEngine {
         self.maintenance_retry_after
             .retain(|_, deadline| *deadline > now);
         let snapshot = Snapshot::from_state(&self.state.authoritative);
-        match wow_policy::maintenance::decide_next(
+        let nearby_sell_vendor = nearby_sell_vendor(&snapshot);
+        match wow_policy::maintenance::decide_next_with_nearby_vendor(
             &snapshot,
             &self.maintenance_retry_after,
             now,
             true,
+            nearby_sell_vendor,
         ) {
             wow_policy::maintenance::MaintenanceDecision::Cast {
                 family,
@@ -1931,6 +1979,46 @@ impl LaneEngine {
                         false,
                     )
                     .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::VendorList { vendor } => {
+                self.last_maintenance_status = Some(format!("poison_vendor_list:{}", vendor.0));
+                self.maintenance_retry_after
+                    .insert((0, vendor), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(GameplayCommand::VendorList { vendor }, false)
+                        .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::VendorBuy {
+                vendor,
+                item,
+                slot,
+                lots,
+            } => {
+                self.last_maintenance_status =
+                    Some(format!("poison_vendor_buy:{item}:{slot}:{}", vendor.0));
+                self.maintenance_retry_after
+                    .insert((u32::MAX, vendor), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(
+                        GameplayCommand::VendorBuy {
+                            vendor,
+                            item,
+                            slot,
+                            count: lots,
+                        },
+                        false,
+                    )
+                    .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::QueryItem { item } => {
+                self.maintenance_retry_after
+                    .insert((item, EntityId(0)), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(GameplayCommand::QueryItem { item }, false)
+                        .await,
                 )
             }
             wow_policy::maintenance::MaintenanceDecision::Deferred { family, reason } => {
@@ -5521,6 +5609,48 @@ mod tests {
         ] {
             assert_eq!(group_follow_stop_distance(&intent), expected);
         }
+    }
+
+    #[test]
+    fn rogue_restock_vendor_must_be_a_live_cataloged_seller_within_interaction_range() {
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let seller = catalog
+            .world()
+            .vendor_services
+            .iter()
+            .find(|service| service.can_sell && !service.spawns.is_empty())
+            .expect("catalog contains a seller");
+        let spawn = &seller.spawns[0];
+        let position = WorldPosition {
+            map: spawn.map_id,
+            point: Vec3::new(spawn.x, spawn.y, spawn.z),
+            orientation: 0.0,
+        };
+        let mut state = wow_state::AuthoritativeState::default();
+        state.session.character_guid = Some(7);
+        state.position.player = Some(position);
+        let vendor = EntityId(55);
+        state.entities.0.insert(
+            vendor,
+            wow_state::entities::EntityState {
+                id: vendor,
+                entry: seller.entry_id,
+                kind: wow_state::entities::EntityKind::Unit,
+                interactable: true,
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            nearby_sell_vendor(&Snapshot::from_state(&state)),
+            Some(vendor)
+        );
+
+        state.entities.0.get_mut(&vendor).unwrap().position = Some(WorldPosition {
+            point: Vec3::new(position.point.x + 6.0, position.point.y, position.point.z),
+            ..position
+        });
+        assert_eq!(nearby_sell_vendor(&Snapshot::from_state(&state)), None);
     }
 
     #[tokio::test]

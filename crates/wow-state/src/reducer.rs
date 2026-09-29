@@ -46,6 +46,7 @@ fn clear_world_transients(state: &mut AuthoritativeState) {
     state.inventory.current_loot = None;
     state.inventory.current_loot_owner = None;
     state.inventory.vendor = None;
+    state.inventory.vendor_inventory = None;
     state.inventory.equipment_condition = Default::default();
     state.inventory.trade = Default::default();
     state.inventory.auction = Default::default();
@@ -245,6 +246,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.active_casts.remove(&entity);
             if state.inventory.vendor == Some(entity) {
                 state.inventory.vendor = None;
+                state.inventory.vendor_inventory = None;
             }
             if state.inventory.current_loot == Some(entity) {
                 state.inventory.current_loot = None;
@@ -319,11 +321,38 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::VendorOpened { vendor } => {
+            if state.inventory.vendor != Some(vendor) {
+                state.inventory.vendor_inventory = None;
+            }
             state.inventory.vendor = Some(vendor);
             delta.changed.push("inventory".into());
         }
+        ProtocolObservation::VendorInventory { vendor, offers } => {
+            state.inventory.vendor = Some(vendor);
+            state.inventory.vendor_inventory =
+                Some(crate::inventory::VendorInventory { vendor, offers });
+            delta.changed.push("inventory".into());
+        }
+        ProtocolObservation::VendorStockUpdated {
+            vendor,
+            slot,
+            stock,
+            purchased_lots: _,
+        } => {
+            if let Some(inventory) = state
+                .inventory
+                .vendor_inventory
+                .as_mut()
+                .filter(|inventory| inventory.vendor == vendor)
+                && let Some(offer) = inventory.offers.iter_mut().find(|offer| offer.slot == slot)
+            {
+                offer.stock = stock;
+                delta.changed.push("inventory".into());
+            }
+        }
         ProtocolObservation::VendorClosed => {
             state.inventory.vendor = None;
+            state.inventory.vendor_inventory = None;
             delta.changed.push("inventory".into());
         }
         ProtocolObservation::Trade(trade) => {
@@ -971,6 +1000,61 @@ mod tests {
             state.inventory.equipment_condition,
             crate::inventory::EquipmentCondition::default()
         );
+    }
+
+    #[test]
+    fn vendor_offer_inventory_updates_only_from_matching_authoritative_vendor() {
+        let mut state = AuthoritativeState::default();
+        let vendor = EntityId(55);
+        let offer = crate::inventory::VendorOffer {
+            slot: 3,
+            item: 6947,
+            stock: Some(5),
+            price_copper: 100,
+            buy_count: 5,
+            extended_cost: 0,
+        };
+        reduce(
+            &mut state,
+            ProtocolObservation::VendorInventory {
+                vendor,
+                offers: vec![offer.clone()],
+            },
+        );
+        assert_eq!(state.inventory.vendor, Some(vendor));
+        assert_eq!(
+            state.inventory.vendor_inventory.as_ref().unwrap().offers,
+            vec![offer]
+        );
+
+        reduce(
+            &mut state,
+            ProtocolObservation::VendorStockUpdated {
+                vendor: EntityId(56),
+                slot: 3,
+                stock: Some(4),
+                purchased_lots: 1,
+            },
+        );
+        assert_eq!(
+            state.inventory.vendor_inventory.as_ref().unwrap().offers[0].stock,
+            Some(5)
+        );
+        reduce(
+            &mut state,
+            ProtocolObservation::VendorStockUpdated {
+                vendor,
+                slot: 3,
+                stock: Some(4),
+                purchased_lots: 1,
+            },
+        );
+        assert_eq!(
+            state.inventory.vendor_inventory.as_ref().unwrap().offers[0].stock,
+            Some(4)
+        );
+        reduce(&mut state, ProtocolObservation::VendorClosed);
+        assert!(state.inventory.vendor_inventory.is_none());
     }
 
     #[test]

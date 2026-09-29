@@ -514,6 +514,78 @@ fn validate_economy_command(
                 true,
             ));
         }
+        GameplayCommand::VendorBuy {
+            vendor,
+            item,
+            slot,
+            count,
+        } => {
+            let offer = snapshot
+                .state
+                .inventory
+                .vendor_inventory
+                .as_ref()
+                .filter(|inventory| inventory.vendor == *vendor)
+                .and_then(|inventory| inventory.offers.iter().find(|offer| offer.slot == *slot));
+            let valid = offer.is_some_and(|offer| {
+                offer.item == *item
+                    && *count > 0
+                    && offer.buy_count > 0
+                    && offer.extended_cost == 0
+                    && offer
+                        .stock
+                        .is_none_or(|stock| stock >= offer.buy_count.saturating_mul(*count))
+                    && u64::from(offer.price_copper)
+                        .saturating_mul(u64::from(*count))
+                        .saturating_add(MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
+                        <= snapshot.state.inventory.money
+            });
+            let poison = snapshot
+                .state
+                .inventory
+                .item_metadata
+                .get(item)
+                .is_some_and(|metadata| {
+                    metadata.item_class == 0
+                        && metadata.subclass == 6
+                        && {
+                            let name = metadata.name.to_ascii_lowercase();
+                            name.contains("instant poison") || name.contains("deadly poison")
+                        }
+                        && metadata.required_level
+                            <= snapshot
+                                .state
+                                .session
+                                .character_guid
+                                .map(EntityId)
+                                .and_then(|player| snapshot.state.entities.0.get(&player))
+                                .and_then(|player| player.level)
+                                .unwrap_or(0)
+                        && (metadata.allowable_class == 0
+                            || metadata.allowable_class == u32::MAX
+                            || metadata.allowable_class & (1 << (4 - 1)) != 0)
+                });
+            let trusted_seller = snapshot.state.entities.0.get(vendor).is_some_and(|entity| {
+                entity.kind == wow_state::entities::EntityKind::Unit
+                    && entity.interactable
+                    && wow_infra::world_knowledge::embedded_azerothcore_catalog()
+                        .world()
+                        .vendor_services
+                        .iter()
+                        .any(|service| service.entry_id == entity.entry && service.can_sell)
+            });
+            if snapshot.state.capabilities.class_id != Some(4)
+                || !valid
+                || !poison
+                || !trusted_seller
+            {
+                return Err(reject(
+                    "invalid_vendor_offer",
+                    "purchase does not match an affordable, observed vendor offer",
+                    true,
+                ));
+            }
+        }
         GameplayCommand::VendorSell {
             item,
             item_guid,
@@ -702,9 +774,10 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
         | GameplayCommand::RequestQuestReward { .. }
         | GameplayCommand::ChooseQuestReward { .. } => PermissionSet::QUEST,
         GameplayCommand::QueryItem { .. } => PermissionSet::empty(),
-        GameplayCommand::VendorList { .. }
-        | GameplayCommand::VendorBuy { .. }
-        | GameplayCommand::VendorSell { .. } => PermissionSet::ECONOMY,
+        GameplayCommand::VendorList { .. } | GameplayCommand::VendorBuy { .. } => {
+            PermissionSet::MAINTENANCE
+        }
+        GameplayCommand::VendorSell { .. } => PermissionSet::ECONOMY,
         GameplayCommand::TradeAccept { .. }
         | GameplayCommand::AuctionBuy { .. }
         | GameplayCommand::MailTake { .. } => {
@@ -729,6 +802,8 @@ fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
             | GameplayCommand::PetSetAutocast { .. }
             | GameplayCommand::CastOnItem { .. }
             | GameplayCommand::UseItemOnItem { .. }
+            | GameplayCommand::VendorList { .. }
+            | GameplayCommand::VendorBuy { .. }
             | GameplayCommand::PetAttack { .. }
     ) && !matches!(origin, PlanOrigin::SystemPolicy | PlanOrigin::Operator)
     {
@@ -753,6 +828,9 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::PetSetAutocast { .. }
                 | GameplayCommand::CastOnItem { .. }
                 | GameplayCommand::UseItemOnItem { .. }
+                | GameplayCommand::VendorList { .. }
+                | GameplayCommand::VendorBuy { .. }
+                | GameplayCommand::QueryItem { .. }
         ),
         ActivationStage::Move => matches!(
             command,
@@ -767,6 +845,9 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::PetSetAutocast { .. }
                 | GameplayCommand::CastOnItem { .. }
                 | GameplayCommand::UseItemOnItem { .. }
+                | GameplayCommand::VendorList { .. }
+                | GameplayCommand::VendorBuy { .. }
+                | GameplayCommand::QueryItem { .. }
                 | GameplayCommand::MoveTo(_)
                 | GameplayCommand::FaceDirection { .. }
                 | GameplayCommand::StopMovement
@@ -1016,6 +1097,77 @@ mod tests {
         assert!(
             matches!(validate(12, 1), ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "stale_item_instance")
         );
+    }
+
+    #[test]
+    fn vendor_buy_requires_matching_safe_offer_and_preserves_money_reserve() {
+        let vendor = EntityId(55);
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(4);
+        state.inventory.vendor = Some(vendor);
+        state.inventory.money = 1_120;
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![wow_state::inventory::VendorOffer {
+                slot: 3,
+                item: 6947,
+                stock: Some(5),
+                price_copper: 120,
+                buy_count: 5,
+                extended_cost: 0,
+            }],
+        });
+        state.inventory.item_metadata.insert(
+            6947,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Instant Poison IX".into(),
+                item_class: 0,
+                subclass: 6,
+                allowable_class: 1 << 3,
+                required_level: 60,
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            EntityId(7),
+            wow_state::entities::EntityState {
+                id: EntityId(7),
+                level: Some(80),
+                ..Default::default()
+            },
+        );
+        let seller_entry = wow_infra::world_knowledge::embedded_azerothcore_catalog()
+            .world()
+            .vendor_services
+            .iter()
+            .find(|service| service.can_sell)
+            .expect("catalog has a seller")
+            .entry_id;
+        state.entities.0.insert(
+            vendor,
+            wow_state::entities::EntityState {
+                id: vendor,
+                entry: seller_entry,
+                kind: wow_state::entities::EntityKind::Unit,
+                interactable: true,
+                ..Default::default()
+            },
+        );
+        let command = GameplayCommand::VendorBuy {
+            vendor,
+            item: 6947,
+            slot: 3,
+            count: 1,
+        };
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_ok());
+
+        state.inventory.money = 1_119;
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
+        state.inventory.money = 2_000;
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].stock = Some(4);
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
     }
 
     #[test]

@@ -105,6 +105,18 @@ pub enum MaintenanceDecision {
         spell: u32,
         target_item_guid: EntityId,
     },
+    VendorList {
+        vendor: EntityId,
+    },
+    VendorBuy {
+        vendor: EntityId,
+        item: u32,
+        slot: u32,
+        lots: u32,
+    },
+    QueryItem {
+        item: u32,
+    },
     PetReaction {
         pet: EntityId,
         reaction: u8,
@@ -125,6 +137,16 @@ pub fn decide_next(
     retry_after: &BTreeMap<(u32, EntityId), Instant>,
     now: Instant,
     include_party: bool,
+) -> MaintenanceDecision {
+    decide_next_with_nearby_vendor(snapshot, retry_after, now, include_party, None)
+}
+
+pub fn decide_next_with_nearby_vendor(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+    include_party: bool,
+    nearby_sell_vendor: Option<EntityId>,
 ) -> MaintenanceDecision {
     let Some(class_id) = snapshot.state.capabilities.class_id else {
         return MaintenanceDecision::Deferred {
@@ -203,6 +225,11 @@ pub fn decide_next(
     }
     if class_id == 4
         && let Some(decision) = rogue_weapon_poison(snapshot, retry_after, now)
+    {
+        return decision;
+    }
+    if class_id == 4
+        && let Some(decision) = rogue_poison_restock(snapshot, retry_after, now, nearby_sell_vendor)
     {
         return decision;
     }
@@ -634,6 +661,139 @@ fn poison_name_rank(name: &str, family: &str) -> Option<u8> {
         "ix" => Some(9),
         _ => None,
     }
+}
+
+fn rogue_poison_restock(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+    nearby_sell_vendor: Option<EntityId>,
+) -> Option<MaintenanceDecision> {
+    const MINIMUM_POISON_COUNT: u32 = 5;
+    let main_count = poison_count(snapshot, "instant poison");
+    let off_count = poison_count(snapshot, "deadly poison");
+    if main_count >= MINIMUM_POISON_COUNT && off_count >= MINIMUM_POISON_COUNT {
+        return None;
+    }
+
+    let vendor = nearby_sell_vendor?;
+    if snapshot.state.inventory.vendor != Some(vendor) {
+        if retry_after
+            .get(&(0, vendor))
+            .is_some_and(|deadline| *deadline > now)
+        {
+            return None;
+        }
+        return Some(MaintenanceDecision::VendorList { vendor });
+    }
+
+    let inventory = snapshot
+        .state
+        .inventory
+        .vendor_inventory
+        .as_ref()
+        .filter(|inventory| inventory.vendor == vendor);
+    let Some(inventory) = inventory else {
+        if retry_after
+            .get(&(0, vendor))
+            .is_some_and(|deadline| *deadline > now)
+        {
+            return None;
+        }
+        return Some(MaintenanceDecision::VendorList { vendor });
+    };
+
+    if let Some(offer) = inventory
+        .offers
+        .iter()
+        .take(4)
+        .filter(|offer| offer.extended_cost == 0)
+        .find(|offer| {
+            !snapshot
+                .state
+                .inventory
+                .item_metadata
+                .contains_key(&offer.item)
+                && !retry_after
+                    .get(&(offer.item, EntityId(0)))
+                    .is_some_and(|deadline| *deadline > now)
+        })
+    {
+        return Some(MaintenanceDecision::QueryItem { item: offer.item });
+    }
+
+    let level = snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|player| snapshot.state.entities.0.get(&player))
+        .and_then(|player| player.level)
+        .unwrap_or(0);
+    let class_id = u32::from(snapshot.state.capabilities.class_id.unwrap_or_default());
+    let spendable = snapshot
+        .state
+        .inventory
+        .money
+        .saturating_sub(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER);
+    let mut needed = [("instant poison", main_count), ("deadly poison", off_count)];
+    needed.sort_by_key(|(_, count)| *count);
+    for (family, count) in needed {
+        if count >= MINIMUM_POISON_COUNT {
+            continue;
+        }
+        let candidate = inventory
+            .offers
+            .iter()
+            .filter(|offer| offer.extended_cost == 0 && offer.buy_count > 0)
+            .filter(|offer| offer.stock.is_none_or(|stock| stock >= offer.buy_count))
+            .filter(|offer| u64::from(offer.price_copper) <= spendable)
+            .filter(|_| {
+                !retry_after
+                    .get(&(u32::MAX, vendor))
+                    .is_some_and(|deadline| *deadline > now)
+            })
+            .filter_map(|offer| {
+                let metadata = snapshot.state.inventory.item_metadata.get(&offer.item)?;
+                let rank = poison_name_rank(&metadata.name.to_ascii_lowercase(), family)?;
+                let class_allowed = metadata.allowable_class == 0
+                    || metadata.allowable_class == u32::MAX
+                    || ((1..=32).contains(&class_id)
+                        && metadata.allowable_class & (1 << (class_id - 1)) != 0);
+                (metadata.item_class == 0
+                    && metadata.subclass == 6
+                    && metadata.required_level <= level
+                    && class_allowed)
+                    .then_some((rank, metadata.required_level, offer.item, offer))
+            })
+            .max_by_key(|(rank, required_level, item, _)| (*rank, *required_level, *item));
+        if let Some((_, _, item, offer)) = candidate {
+            return Some(MaintenanceDecision::VendorBuy {
+                vendor,
+                item,
+                slot: offer.slot,
+                lots: 1,
+            });
+        }
+    }
+    None
+}
+
+fn poison_count(snapshot: &Snapshot, family: &str) -> u32 {
+    snapshot
+        .state
+        .inventory
+        .instances
+        .values()
+        .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
+        .filter_map(|instance| {
+            let metadata = snapshot.state.inventory.item_metadata.get(&instance.item)?;
+            (metadata.item_class == 0
+                && metadata.subclass == 6
+                && poison_name_rank(&metadata.name.to_ascii_lowercase(), family).is_some())
+            .then_some(instance.count)
+        })
+        .fold(0_u32, u32::saturating_add)
 }
 
 /// Apply the old pet defaults after SMSG_PET_SPELLS confirms a control bar.
@@ -1261,6 +1421,123 @@ mod tests {
                 backpack_slot: 25,
                 spell: 5102,
                 target_item_guid: EntityId(20),
+            }
+        );
+    }
+
+    #[test]
+    fn rogue_poison_restock_lists_queries_and_buys_only_safe_observed_offers() {
+        let vendor = EntityId(55);
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(4);
+        state.inventory.money = 1_500;
+        state.entities.0.insert(
+            EntityId(7),
+            EntityState {
+                id: EntityId(7),
+                level: Some(80),
+                ..Default::default()
+            },
+        );
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+        let now = Instant::now();
+
+        assert_eq!(
+            decide_next_with_nearby_vendor(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                now,
+                false,
+                Some(vendor),
+            ),
+            MaintenanceDecision::VendorList { vendor }
+        );
+
+        state.inventory.vendor = Some(vendor);
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![wow_state::inventory::VendorOffer {
+                slot: 3,
+                item: 6947,
+                stock: Some(20),
+                price_copper: 120,
+                buy_count: 5,
+                extended_cost: 0,
+            }],
+        });
+        assert_eq!(
+            decide_next_with_nearby_vendor(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                now,
+                false,
+                Some(vendor),
+            ),
+            MaintenanceDecision::QueryItem { item: 6947 }
+        );
+
+        state.inventory.item_metadata.insert(
+            6947,
+            ItemTemplateMetadata {
+                name: "Instant Poison IX".into(),
+                item_class: 0,
+                subclass: 6,
+                allowable_class: 1 << 3,
+                required_level: 60,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            decide_next_with_nearby_vendor(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                now,
+                false,
+                Some(vendor),
+            ),
+            MaintenanceDecision::VendorBuy {
+                vendor,
+                item: 6947,
+                slot: 3,
+                lots: 1,
+            }
+        );
+
+        let retry = [((u32::MAX, vendor), now + Duration::from_secs(10))]
+            .into_iter()
+            .collect();
+        assert_ne!(
+            decide_next_with_nearby_vendor(
+                &Snapshot::from_state(&state),
+                &retry,
+                now,
+                false,
+                Some(vendor),
+            ),
+            MaintenanceDecision::VendorBuy {
+                vendor,
+                item: 6947,
+                slot: 3,
+                lots: 1,
+            }
+        );
+
+        state.inventory.money = 1_119;
+        assert_ne!(
+            decide_next_with_nearby_vendor(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                now,
+                false,
+                Some(vendor),
+            ),
+            MaintenanceDecision::VendorBuy {
+                vendor,
+                item: 6947,
+                slot: 3,
+                lots: 1,
             }
         );
     }

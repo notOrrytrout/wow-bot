@@ -467,6 +467,7 @@ pub(super) fn encode_gameplay_command(
     const CMSG_QUEST_QUERY: u32 = 0x005C;
     const CMSG_ITEM_QUERY_SINGLE: u32 = 0x0056;
     const CMSG_LIST_INVENTORY: u32 = 0x019E;
+    const CMSG_BUY_ITEM: u32 = 0x01A2;
     const CMSG_SELL_ITEM: u32 = 0x01A0;
     const CMSG_REPAIR_ITEM: u32 = 0x02A8;
     match command {
@@ -503,6 +504,25 @@ pub(super) fn encode_gameplay_command(
             },
             None,
         ))),
+        GameplayCommand::VendorBuy {
+            vendor,
+            item,
+            slot,
+            count,
+        } => {
+            let mut body = raw_guid_body(vendor);
+            body.extend_from_slice(&item.to_le_bytes());
+            body.extend_from_slice(&slot.to_le_bytes());
+            body.extend_from_slice(&count.to_le_bytes());
+            body.push(0); // inventory bag
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_BUY_ITEM,
+                    body,
+                },
+                None,
+            )))
+        }
         GameplayCommand::VendorSell {
             vendor,
             item_guid,
@@ -1416,6 +1436,33 @@ mod movement_clock_tests {
         assert_eq!(&packet.body[..8], &vendor.0.to_le_bytes());
         assert_eq!(&packet.body[8..16], &0_u64.to_le_bytes());
         assert_eq!(packet.body[16], 0);
+    }
+
+    #[test]
+    fn vendor_purchase_uses_observed_slot_item_and_one_lot_count() {
+        let mut clock = MovementClock::default();
+        let vendor = EntityId(0x1122334455667788);
+        let (packet, _) = encode_gameplay_command(
+            GameplayCommand::VendorBuy {
+                vendor,
+                item: 6947,
+                slot: 3,
+                count: 1,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(packet.opcode, 0x01a2);
+        assert_eq!(&packet.body[..8], &vendor.0.to_le_bytes());
+        assert_eq!(&packet.body[8..12], &6947_u32.to_le_bytes());
+        assert_eq!(&packet.body[12..16], &3_u32.to_le_bytes());
+        assert_eq!(&packet.body[16..20], &1_u32.to_le_bytes());
+        assert_eq!(packet.body[20], 0);
     }
 
     #[test]

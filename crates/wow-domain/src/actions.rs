@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 /// Spell used by the captured WotLK client to open quest-item game objects.
 pub const QUEST_ITEM_GAMEOBJECT_OPEN_SPELL_ID: u32 = 6_478;
+/// Keep this amount of copper after an automatic maintenance purchase.
+pub const MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PlanOrigin {
@@ -117,6 +119,7 @@ pub enum GameplayCommand {
     VendorBuy {
         vendor: EntityId,
         item: u32,
+        slot: u32,
         count: u32,
     },
     VendorList {

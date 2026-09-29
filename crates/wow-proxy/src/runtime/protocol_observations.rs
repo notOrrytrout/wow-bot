@@ -65,6 +65,50 @@ mod tests {
         assert_eq!(metadata.use_spell_id, 1234);
     }
 
+    #[test]
+    fn vendor_list_and_buy_packets_preserve_observed_offer_fields() {
+        let vendor = 0x1122_3344_5566_7788_u64;
+        let mut packet = vendor.to_le_bytes().to_vec();
+        packet.push(2);
+        for (slot, item, stock, price, buy_count, extended_cost) in [
+            (1_u32, 6947_u32, -1_i32, 120_u32, 5_u32, 0_u32),
+            (2, 2892, 7, 200, 5, 0),
+        ] {
+            for value in [slot, item, 0] {
+                packet.extend_from_slice(&value.to_le_bytes());
+            }
+            packet.extend_from_slice(&stock.to_le_bytes());
+            for value in [price, 0, buy_count, extended_cost] {
+                packet.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let ProtocolObservation::VendorInventory {
+            vendor: observed,
+            offers,
+        } = parse_vendor_list(&packet).expect("valid vendor list")
+        else {
+            panic!("vendor inventory observation expected")
+        };
+        assert_eq!(observed, EntityId(vendor));
+        assert_eq!(offers.len(), 2);
+        assert_eq!(offers[0].stock, None);
+        assert_eq!(offers[0].buy_count, 5);
+        assert_eq!(offers[1].stock, Some(7));
+        assert_eq!(offers[1].price_copper, 200);
+        assert!(parse_vendor_list(&packet[..packet.len() - 1]).is_none());
+
+        let mut bought = vendor.to_le_bytes().to_vec();
+        bought.extend_from_slice(&2_u32.to_le_bytes());
+        bought.extend_from_slice(&2_i32.to_le_bytes());
+        bought.extend_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            parse_vendor_buy_response(&bought),
+            Some(ProtocolObservation::VendorStockUpdated {
+                vendor: EntityId(guid), slot: 2, stock: Some(2), purchased_lots: 1,
+            }) if guid == vendor
+        ));
+    }
+
     fn value_u32(value: u32) -> [u8; 4] {
         value.to_le_bytes()
     }
@@ -281,9 +325,11 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
     const SMSG_PARTYKILLLOG: u32 = 0x01F5;
     const SMSG_ITEM_QUERY_SINGLE_RESPONSE: u32 = 0x0058;
     const SMSG_LIST_INVENTORY: u32 = 0x019F;
+    const SMSG_BUY_ITEM: u32 = 0x01A4;
     match opcode {
         SMSG_ITEM_QUERY_SINGLE_RESPONSE => parse_item_template(body).into_iter().collect(),
         SMSG_LIST_INVENTORY => parse_vendor_list(body).into_iter().collect(),
+        SMSG_BUY_ITEM => parse_vendor_buy_response(body).into_iter().collect(),
         SMSG_INITIAL_SPELLS => parse_initial_spells(body),
         SMSG_LEARNED_SPELL => body
             .get(0..4)
@@ -312,9 +358,47 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
 }
 
 fn parse_vendor_list(body: &[u8]) -> Option<ProtocolObservation> {
-    let vendor = u64_le_at(body, 0)?;
-    (vendor != 0).then_some(ProtocolObservation::VendorOpened {
-        vendor: EntityId(vendor),
+    let vendor = EntityId(u64_le_at(body, 0)?);
+    if vendor.0 == 0 {
+        return None;
+    }
+    let count = usize::from(*body.get(8)?);
+    let mut cursor = 9;
+    let mut offers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let slot = read_u32(body, &mut cursor)?;
+        let item = read_u32(body, &mut cursor)?;
+        let _display_id = read_u32(body, &mut cursor)?;
+        let stock_raw = read_u32(body, &mut cursor)? as i32;
+        let price_copper = read_u32(body, &mut cursor)?;
+        let _max_durability = read_u32(body, &mut cursor)?;
+        let buy_count = read_u32(body, &mut cursor)?;
+        let extended_cost = read_u32(body, &mut cursor)?;
+        if slot == 0 || item == 0 || buy_count == 0 {
+            continue;
+        }
+        offers.push(wow_state::inventory::VendorOffer {
+            slot,
+            item,
+            stock: (stock_raw >= 0).then_some(stock_raw as u32),
+            price_copper,
+            buy_count,
+            extended_cost,
+        });
+    }
+    Some(ProtocolObservation::VendorInventory { vendor, offers })
+}
+
+fn parse_vendor_buy_response(body: &[u8]) -> Option<ProtocolObservation> {
+    let vendor = EntityId(u64_le_at(body, 0)?);
+    let slot = u32_le_at(body, 8)?;
+    let stock_raw = i32::from_le_bytes(body.get(12..16)?.try_into().ok()?);
+    let purchased_lots = u32_le_at(body, 16)?;
+    (vendor.0 != 0).then_some(ProtocolObservation::VendorStockUpdated {
+        vendor,
+        slot,
+        stock: (stock_raw >= 0).then_some(stock_raw as u32),
+        purchased_lots,
     })
 }
 

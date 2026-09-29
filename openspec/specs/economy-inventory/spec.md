@@ -131,3 +131,16 @@ A semantic loot action SHALL execute through one shared deterministic loot runti
 
 ### Requirement: Bot-owned loot completion SHALL be causally attributable
 A bot loot action SHALL only be considered successfully completed from a loot transaction that was initiated by the bot. Player-initiated `CMSG_LOOT` for the same corpse SHALL supersede any pending bot ownership claim, SHALL be represented as player-owned/external loot state, and SHALL NOT advance the bot-owned loot completion generation. A pending bot loot action superseded by player loot SHALL be cancelled as externally resolved rather than credited as bot success.
+
+### Requirement: Vendor offers are authoritative and purchases are bounded
+The system SHALL derive vendor offers from the server's current inventory response. A purchase SHALL match the observed vendor, slot, item, stock, lot size, and price. Automatic Rogue poison restocking SHALL use only a nearby cataloged seller, buy one lot per attempt, require authoritative item metadata and class/level eligibility, and preserve the configured maintenance money reserve.
+
+#### Scenario: Rogue poison stock is below the reserve target
+- **WHEN** the Rogue is near an observed cataloged seller and poison stock is below its target
+- **THEN** maintenance requests the seller's inventory and queries unknown offer templates
+- **AND** it buys one affordable offer lot only when the observed item is an eligible Instant or Deadly Poison
+- **AND** it keeps at least 1,000 copper after the purchase
+
+#### Scenario: Offer data changes before purchase
+- **WHEN** the vendor, offer slot, item, stock, or funds no longer match the observation
+- **THEN** final validation rejects the purchase

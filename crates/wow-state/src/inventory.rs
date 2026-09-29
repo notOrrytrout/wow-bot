@@ -70,6 +70,23 @@ pub struct EquipmentCondition {
     pub broken_items: u8,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VendorOffer {
+    pub slot: u32,
+    pub item: u32,
+    pub stock: Option<u32>,
+    pub price_copper: u32,
+    /// Number of items granted by one purchase lot.
+    pub buy_count: u32,
+    pub extended_cost: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VendorInventory {
+    pub vendor: EntityId,
+    pub offers: Vec<VendorOffer>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TradeState {
     pub generation: u64,
@@ -129,6 +146,8 @@ pub struct InventoryState {
     pub current_loot: Option<EntityId>,
     pub current_loot_owner: Option<crate::observation::LootOwnership>,
     pub vendor: Option<EntityId>,
+    #[serde(default)]
+    pub vendor_inventory: Option<VendorInventory>,
     pub trade: TradeState,
     pub auction: AuctionState,
     pub mailbox: MailboxState,
