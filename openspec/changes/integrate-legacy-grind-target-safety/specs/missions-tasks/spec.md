@@ -1,3 +1,5 @@
+## ADDED Requirements
+
 ### Requirement: Named Grind selects a safe nearby exact target
 When a named Grind mission selects a voluntary target, it SHALL select only a live hostile unit whose trimmed name matches the mission name exactly without regard to case. It SHALL use a current finite same-map position within the legacy 400-yard observation horizon and choose the nearest candidate, breaking equal-distance ties by entity ID. It SHALL reject a target more than two levels above the player only when both levels are known. It SHALL NOT reject a target solely because target level is unknown.
 

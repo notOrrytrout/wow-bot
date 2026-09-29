@@ -8312,8 +8312,29 @@ mod tests {
                 id: EntityId(22),
                 kind: wow_state::entities::EntityKind::Unit,
                 name: Some("Wolf".into()),
+                position: Some(WorldPosition {
+                    map: 0,
+                    point: Vec3::new(2.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
                 hostile: true,
                 health: Some((10, 10)),
+                ..Default::default()
+            },
+        );
+        state.session.character_guid = Some(1);
+        state.position.player = Some(WorldPosition {
+            map: 0,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.entities.0.insert(
+            EntityId(1),
+            wow_state::entities::EntityState {
+                id: EntityId(1),
+                kind: wow_state::entities::EntityKind::Player,
+                health: Some((100, 100)),
+                level: Some(10),
                 ..Default::default()
             },
         );
