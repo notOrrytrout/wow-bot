@@ -1774,33 +1774,21 @@ impl LaneEngine {
             self.waiting("grind mission is not authorized".into());
             return true;
         }
-        let state = &self.state.authoritative;
         if creature.trim().is_empty() || self.player_is_dead() {
             self.waiting("grind mission is waiting for a valid living-player target".into());
             return true;
         }
-        let target = state
-            .entities
-            .0
-            .values()
-            .filter(|entity| {
-                entity.hostile
-                    && !entity.is_dead()
-                    && matches!(entity.kind, wow_state::entities::EntityKind::Unit)
-            })
-            .filter(|entity| {
-                entity
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.trim().eq_ignore_ascii_case(creature.trim()))
-            })
-            .min_by_key(|entity| entity.id);
-        if let Some(target) = target {
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        if let Some(target) =
+            wow_policy::missions::grind::select_named_grind_target(&snapshot, creature)
+        {
             return self
-                .propose_command(GameplayCommand::Attack(target.id), false)
+                .propose_command(GameplayCommand::Attack(target), false)
                 .await;
         }
-        self.waiting(format!("waiting for an observed {creature} target"));
+        self.waiting(format!(
+            "waiting for a safe nearby observed {creature} target with current position and survival evidence"
+        ));
         true
     }
 
