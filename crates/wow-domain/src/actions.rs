@@ -125,6 +125,13 @@ pub enum GameplayCommand {
     VendorList {
         vendor: EntityId,
     },
+    TrainerList {
+        trainer: EntityId,
+    },
+    TrainerBuy {
+        trainer: EntityId,
+        spell: u32,
+    },
     VendorSell {
         vendor: EntityId,
         item: u32,

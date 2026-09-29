@@ -136,6 +136,11 @@ pub enum ProtocolObservation {
         purchased_lots: u32,
     },
     VendorClosed,
+    TrainerList {
+        trainer: EntityId,
+        trainer_type: i32,
+        offers: Vec<crate::trainer::TrainerSpellOffer>,
+    },
     Trade(crate::inventory::TradeState),
     Auction(crate::inventory::AuctionState),
     Mailbox(crate::inventory::MailboxState),

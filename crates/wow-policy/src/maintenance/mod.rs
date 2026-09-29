@@ -114,6 +114,13 @@ pub enum MaintenanceDecision {
         slot: u32,
         lots: u32,
     },
+    TrainerList {
+        trainer: EntityId,
+    },
+    TrainerBuy {
+        trainer: EntityId,
+        spell: u32,
+    },
     QueryItem {
         item: u32,
     },
@@ -138,7 +145,7 @@ pub fn decide_next(
     now: Instant,
     include_party: bool,
 ) -> MaintenanceDecision {
-    decide_next_with_nearby_vendor(snapshot, retry_after, now, include_party, None)
+    decide_next_with_nearby_services(snapshot, retry_after, now, include_party, None, None)
 }
 
 pub fn decide_next_with_nearby_vendor(
@@ -147,6 +154,24 @@ pub fn decide_next_with_nearby_vendor(
     now: Instant,
     include_party: bool,
     nearby_sell_vendor: Option<EntityId>,
+) -> MaintenanceDecision {
+    decide_next_with_nearby_services(
+        snapshot,
+        retry_after,
+        now,
+        include_party,
+        nearby_sell_vendor,
+        None,
+    )
+}
+
+pub fn decide_next_with_nearby_services(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+    include_party: bool,
+    nearby_sell_vendor: Option<EntityId>,
+    nearby_class_trainer: Option<EntityId>,
 ) -> MaintenanceDecision {
     let Some(class_id) = snapshot.state.capabilities.class_id else {
         return MaintenanceDecision::Deferred {
@@ -286,7 +311,86 @@ pub fn decide_next_with_nearby_vendor(
             }
         }
     }
+    if let Some(decision) = class_training(snapshot, retry_after, now, nearby_class_trainer) {
+        return decision;
+    }
     MaintenanceDecision::Satisfied
+}
+
+fn class_training(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+    nearby_trainer: Option<EntityId>,
+) -> Option<MaintenanceDecision> {
+    let trainer = nearby_trainer?;
+    let entity = snapshot.state.entities.0.get(&trainer)?;
+    if entity.kind != wow_state::entities::EntityKind::Unit
+        || !entity.interactable
+        || !entity.npc_flags.is_some_and(is_class_trainer_flags)
+    {
+        return None;
+    }
+    let list_matches = snapshot.state.trainer.trainer == Some(trainer);
+    if !list_matches {
+        return (!retry_after
+            .get(&(0, trainer))
+            .is_some_and(|deadline| *deadline > now))
+        .then_some(MaintenanceDecision::TrainerList { trainer });
+    }
+    if snapshot.state.trainer.trainer_type != Some(0) {
+        return None;
+    }
+    if retry_after
+        .get(&(u32::MAX, trainer))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    let player_level = snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|player| snapshot.state.entities.0.get(&player))
+        .and_then(|player| player.level)?;
+    let mut offers = snapshot
+        .state
+        .trainer
+        .offers
+        .iter()
+        .filter(|offer| {
+            offer.usable == 0
+                && offer.spell != 0
+                && u32::from(offer.required_level) <= player_level
+                && !snapshot.state.capabilities.spells.contains(&offer.spell)
+                && u64::from(offer.cost_copper)
+                    .saturating_add(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
+                    <= snapshot.state.inventory.money
+                && (offer.required_skill_line == 0
+                    || (snapshot.state.professions.known
+                        && u32::from(snapshot.state.professions.skill(offer.required_skill_line))
+                            >= offer.required_skill_rank))
+                && !retry_after
+                    .get(&(offer.spell, trainer))
+                    .is_some_and(|deadline| *deadline > now)
+        })
+        .collect::<Vec<_>>();
+    offers.sort_by_key(|offer| {
+        (
+            std::cmp::Reverse(offer.required_level),
+            offer.cost_copper,
+            offer.spell,
+        )
+    });
+    offers.first().map(|offer| MaintenanceDecision::TrainerBuy {
+        trainer,
+        spell: offer.spell,
+    })
+}
+
+fn is_class_trainer_flags(flags: u32) -> bool {
+    flags & 0x20 != 0 || (flags & 0x10 != 0 && flags & 0x40 == 0)
 }
 
 /// Keep the Mage's old ten item reserve using current inventory and spell state.
@@ -1539,6 +1643,117 @@ mod tests {
                 slot: 3,
                 lots: 1,
             }
+        );
+    }
+
+    #[test]
+    fn class_training_queries_nearby_trainer_then_buys_one_eligible_spell() {
+        let trainer = EntityId(55);
+        let position = wow_domain::WorldPosition {
+            map: 1,
+            point: wow_domain::Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(8);
+        state.inventory.money = 50_000;
+        state.position.player = Some(position);
+        state.auras.by_entity.entry(EntityId(7)).or_default();
+        state.entities.0.insert(
+            EntityId(7),
+            EntityState {
+                id: EntityId(7),
+                level: Some(40),
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            trainer,
+            EntityState {
+                id: trainer,
+                kind: wow_state::entities::EntityKind::Unit,
+                interactable: true,
+                npc_flags: Some(0x30),
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        let now = Instant::now();
+        let decide = |state: &AuthoritativeState, retry: &BTreeMap<(u32, EntityId), Instant>| {
+            decide_next_with_nearby_services(
+                &Snapshot::from_state(state),
+                retry,
+                now,
+                false,
+                None,
+                Some(trainer),
+            )
+        };
+        assert_eq!(
+            decide(&state, &BTreeMap::new()),
+            MaintenanceDecision::TrainerList { trainer }
+        );
+
+        state.trainer = wow_state::trainer::TrainerState {
+            trainer: Some(trainer),
+            trainer_type: Some(0),
+            offers: vec![
+                wow_state::trainer::TrainerSpellOffer {
+                    spell: 100,
+                    usable: 0,
+                    cost_copper: 1_000,
+                    required_level: 20,
+                    required_skill_line: 0,
+                    required_skill_rank: 0,
+                },
+                wow_state::trainer::TrainerSpellOffer {
+                    spell: 200,
+                    usable: 0,
+                    cost_copper: 15_000,
+                    required_level: 40,
+                    required_skill_line: 0,
+                    required_skill_rank: 0,
+                },
+                wow_state::trainer::TrainerSpellOffer {
+                    spell: 300,
+                    usable: 1,
+                    cost_copper: 1,
+                    required_level: 1,
+                    required_skill_line: 0,
+                    required_skill_rank: 0,
+                },
+            ],
+        };
+        assert_eq!(
+            decide(&state, &BTreeMap::new()),
+            MaintenanceDecision::TrainerBuy {
+                trainer,
+                spell: 200,
+            }
+        );
+        let purchase_pending = [(u32::MAX, trainer)]
+            .into_iter()
+            .map(|key| (key, now + Duration::from_secs(10)))
+            .collect();
+        assert_eq!(
+            decide(&state, &purchase_pending),
+            MaintenanceDecision::Satisfied
+        );
+
+        state.capabilities.spells.insert(200);
+        state.inventory.money = 1_999;
+        assert_eq!(
+            decide(&state, &BTreeMap::new()),
+            MaintenanceDecision::Satisfied
+        );
+        state.inventory.money = 50_000;
+        state.trainer.trainer_type = Some(2);
+        assert_eq!(
+            decide(&state, &BTreeMap::new()),
+            MaintenanceDecision::Satisfied
         );
     }
     use wow_state::{

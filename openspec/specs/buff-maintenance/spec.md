@@ -194,3 +194,20 @@ Rogue maintenance SHALL apply the highest ranked matching poison from authoritat
 - **WHEN** an authoritative backpack item matches the configured poison family and contains a use spell
 - **AND** the main-hand instance is observed without a temporary enchant
 - **THEN** maintenance issues a typed item-on-item command for those exact item GUIDs
+
+### Requirement: Local class training uses current trainer offers
+Maintenance SHALL learn at most one class spell at a time from an observed class trainer within interaction range. It SHALL use the current authoritative trainer list, skip known spells and offers that are unavailable, above the player's level, or require an unverified skill rank, and preserve at least 1,000 copper. A sent purchase SHALL NOT count as learned until the server updates the known-spell state. Profession trainers SHALL remain under profession policy.
+
+#### Scenario: Nearby class trainer offers an affordable spell
+- **WHEN** a trainer NPC is observed within five yards and its current list offers an unknown eligible class spell
+- **THEN** maintenance requests the list if needed
+- **AND** buys one spell only when its cost preserves the maintenance reserve
+- **AND** waits for authoritative spellbook state before selecting that spell again
+
+#### Scenario: Trainer offer is stale or unaffordable
+- **WHEN** the trainer, offer, level, skill rank, known-spell state, or money no longer matches the observation
+- **THEN** final validation rejects the purchase
+
+#### Scenario: Profession trainer is nearby
+- **WHEN** the trainer is marked as a profession trainer or the offer list is a profession list
+- **THEN** class training does not buy from that list

@@ -122,6 +122,36 @@ fn nearby_sell_vendor(snapshot: &Snapshot) -> Option<EntityId> {
         .map(|(entity, _)| entity.id)
 }
 
+fn nearby_class_trainer(snapshot: &Snapshot) -> Option<EntityId> {
+    let position = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player)?;
+    snapshot
+        .state
+        .entities
+        .0
+        .values()
+        .filter(|entity| {
+            entity.kind == wow_state::entities::EntityKind::Unit
+                && entity.interactable
+                && entity.npc_flags.is_some_and(|flags| {
+                    flags & 0x20 != 0 || (flags & 0x10 != 0 && flags & 0x40 == 0)
+                })
+        })
+        .filter_map(|entity| entity.position.map(|point| (entity, point)))
+        .filter(|(_, trainer_position)| {
+            trainer_position.map == position.map
+                && trainer_position.point.distance(position.point) <= 5.0
+        })
+        .min_by(|(_, left), (_, right)| {
+            left.point
+                .distance(position.point)
+                .total_cmp(&right.point.distance(position.point))
+        })
+        .map(|(entity, _)| entity.id)
+}
+
 struct RoutePlanJob {
     token: crate::movement::ReplanToken,
     stamped: crate::runtime::Stamped<WorldPosition>,
@@ -652,6 +682,22 @@ impl LaneEngine {
                 if let Some(vendor) = vendor_listed {
                     self.maintenance_retry_after.remove(&(0, vendor));
                     self.bag_relief_list_pending = false;
+                }
+                if let ProtocolObservation::TrainerList { trainer, .. } = &o {
+                    self.maintenance_retry_after.remove(&(0, *trainer));
+                }
+                if let ProtocolObservation::SpellKnown { spell } = &o
+                    && let Some(trainer) = self.state.authoritative.trainer.trainer
+                    && self
+                        .state
+                        .authoritative
+                        .trainer
+                        .offers
+                        .iter()
+                        .any(|offer| offer.spell == *spell)
+                {
+                    self.maintenance_retry_after.remove(&(*spell, trainer));
+                    self.maintenance_retry_after.remove(&(u32::MAX, trainer));
                 }
                 if let ProtocolObservation::CastFailed {
                     spell,
@@ -1809,12 +1855,13 @@ impl LaneEngine {
             .retain(|_, deadline| *deadline > now);
         let snapshot = Snapshot::from_state(&self.state.authoritative);
         let nearby_sell_vendor = nearby_sell_vendor(&snapshot);
-        match wow_policy::maintenance::decide_next_with_nearby_vendor(
+        match wow_policy::maintenance::decide_next_with_nearby_services(
             &snapshot,
             &self.maintenance_retry_after,
             now,
             true,
             nearby_sell_vendor,
+            nearby_class_trainer(&snapshot),
         ) {
             wow_policy::maintenance::MaintenanceDecision::Cast {
                 family,
@@ -2011,6 +2058,27 @@ impl LaneEngine {
                         false,
                     )
                     .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::TrainerList { trainer } => {
+                self.last_maintenance_status = Some(format!("class_trainer_list:{}", trainer.0));
+                self.maintenance_retry_after
+                    .insert((0, trainer), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(GameplayCommand::TrainerList { trainer }, false)
+                        .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::TrainerBuy { trainer, spell } => {
+                self.last_maintenance_status =
+                    Some(format!("class_trainer_buy:{spell}:{}", trainer.0));
+                self.maintenance_retry_after
+                    .insert((spell, trainer), now + Duration::from_secs(10));
+                self.maintenance_retry_after
+                    .insert((u32::MAX, trainer), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(GameplayCommand::TrainerBuy { trainer, spell }, false)
+                        .await,
                 )
             }
             wow_policy::maintenance::MaintenanceDecision::QueryItem { item } => {
@@ -5651,6 +5719,42 @@ mod tests {
             ..position
         });
         assert_eq!(nearby_sell_vendor(&Snapshot::from_state(&state)), None);
+    }
+
+    #[test]
+    fn class_trainer_selection_requires_observed_class_service_flags_and_range() {
+        let position = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let trainer = EntityId(55);
+        let mut state = wow_state::AuthoritativeState::default();
+        state.position.player = Some(position);
+        state.entities.0.insert(
+            trainer,
+            wow_state::entities::EntityState {
+                id: trainer,
+                kind: wow_state::entities::EntityKind::Unit,
+                interactable: true,
+                npc_flags: Some(0x30),
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            nearby_class_trainer(&Snapshot::from_state(&state)),
+            Some(trainer)
+        );
+
+        state.entities.0.get_mut(&trainer).unwrap().npc_flags = Some(0x50);
+        assert_eq!(nearby_class_trainer(&Snapshot::from_state(&state)), None);
+        state.entities.0.get_mut(&trainer).unwrap().npc_flags = Some(0x30);
+        state.entities.0.get_mut(&trainer).unwrap().position = Some(WorldPosition {
+            point: Vec3::new(6.0, 0.0, 0.0),
+            ..position
+        });
+        assert_eq!(nearby_class_trainer(&Snapshot::from_state(&state)), None);
     }
 
     #[tokio::test]

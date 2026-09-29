@@ -192,6 +192,10 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::CastGameObject { target, .. }
         | GameplayCommand::VendorBuy { vendor: target, .. }
         | GameplayCommand::VendorList { vendor: target }
+        | GameplayCommand::TrainerList { trainer: target }
+        | GameplayCommand::TrainerBuy {
+            trainer: target, ..
+        }
         | GameplayCommand::VendorSell { vendor: target, .. }
         | GameplayCommand::RepairEquipment { vendor: target } => Some(*target),
         GameplayCommand::Cast {

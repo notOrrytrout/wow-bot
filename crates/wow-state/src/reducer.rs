@@ -39,6 +39,7 @@ fn clear_world_transients(state: &mut AuthoritativeState) {
     state.transport = Default::default();
     state.control = Default::default();
     state.pet = Default::default();
+    state.trainer = Default::default();
     state.active_casts.clear();
     state.quests.giver_status.clear();
     state.quests.offers.clear();
@@ -77,6 +78,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                         "active_casts",
                         "quests",
                         "inventory",
+                        "trainer",
                     ]
                     .map(str::to_owned),
                 );
@@ -109,6 +111,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                     "active_casts",
                     "quests",
                     "inventory",
+                    "trainer",
                 ]
                 .map(str::to_owned),
             );
@@ -126,6 +129,7 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                     "life",
                     "quests",
                     "professions",
+                    "trainer",
                     "group",
                     "capabilities",
                     "control",
@@ -238,7 +242,19 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
         }
         ProtocolObservation::EntityUpsert { entity } => {
             let entity_id = entity.id;
+            let player_leveled = state.session.character_guid == Some(entity_id.0)
+                && state
+                    .entities
+                    .0
+                    .get(&entity_id)
+                    .and_then(|old| old.level)
+                    .zip(entity.level)
+                    .is_some_and(|(old, new)| new > old);
             state.entities.0.insert(entity_id, entity);
+            if player_leveled {
+                state.trainer = Default::default();
+                delta.changed.push("trainer".into());
+            }
             mark_entity_changed(&mut delta, entity_id, &["entities"]);
         }
         ProtocolObservation::EntityRemoved { entity } => {
@@ -257,7 +273,15 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
                 state.inventory.trade.open = false;
                 state.inventory.trade.generation = state.inventory.trade.generation.wrapping_add(1);
             }
-            mark_entity_changed(&mut delta, entity, &["entities", "inventory"]);
+            let trainer_removed = state.trainer.trainer == Some(entity);
+            if trainer_removed {
+                state.trainer = Default::default();
+            }
+            if trainer_removed {
+                mark_entity_changed(&mut delta, entity, &["entities", "inventory", "trainer"]);
+            } else {
+                mark_entity_changed(&mut delta, entity, &["entities", "inventory"]);
+            }
         }
         ProtocolObservation::CreatureKilled { victim, .. } => {
             if let Some(entity) = state.entities.0.get_mut(&victim) {
@@ -354,6 +378,18 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             state.inventory.vendor = None;
             state.inventory.vendor_inventory = None;
             delta.changed.push("inventory".into());
+        }
+        ProtocolObservation::TrainerList {
+            trainer,
+            trainer_type,
+            offers,
+        } => {
+            state.trainer = crate::trainer::TrainerState {
+                trainer: Some(trainer),
+                trainer_type: Some(trainer_type),
+                offers,
+            };
+            delta.changed.push("trainer".into());
         }
         ProtocolObservation::Trade(trade) => {
             state.inventory.trade = trade;
@@ -1000,6 +1036,72 @@ mod tests {
             state.inventory.equipment_condition,
             crate::inventory::EquipmentCondition::default()
         );
+    }
+
+    #[test]
+    fn trainer_offers_are_authoritative_and_clear_with_the_trainer_entity() {
+        let mut state = AuthoritativeState::default();
+        let trainer = EntityId(77);
+        let offer = crate::trainer::TrainerSpellOffer {
+            spell: 1234,
+            usable: 0,
+            cost_copper: 100,
+            required_level: 10,
+            required_skill_line: 0,
+            required_skill_rank: 0,
+        };
+        reduce(
+            &mut state,
+            ProtocolObservation::TrainerList {
+                trainer,
+                trainer_type: 0,
+                offers: vec![offer.clone()],
+            },
+        );
+        assert_eq!(state.trainer.trainer, Some(trainer));
+        assert_eq!(state.trainer.offers, vec![offer]);
+
+        reduce(
+            &mut state,
+            ProtocolObservation::EntityRemoved { entity: trainer },
+        );
+        assert_eq!(state.trainer, crate::trainer::TrainerState::default());
+    }
+
+    #[test]
+    fn trainer_offers_are_refreshed_after_an_authoritative_level_up() {
+        let trainer = EntityId(77);
+        let player = EntityId(7);
+        let mut state = AuthoritativeState::default();
+        state.session.character_guid = Some(player.0);
+        state.entities.0.insert(
+            player,
+            crate::entities::EntityState {
+                id: player,
+                level: Some(10),
+                ..Default::default()
+            },
+        );
+        state.trainer = crate::trainer::TrainerState {
+            trainer: Some(trainer),
+            trainer_type: Some(0),
+            offers: vec![crate::trainer::TrainerSpellOffer {
+                spell: 1234,
+                ..Default::default()
+            }],
+        };
+
+        reduce(
+            &mut state,
+            ProtocolObservation::EntityUpsert {
+                entity: crate::entities::EntityState {
+                    id: player,
+                    level: Some(11),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(state.trainer, crate::trainer::TrainerState::default());
     }
 
     #[test]

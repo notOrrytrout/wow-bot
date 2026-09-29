@@ -514,6 +514,55 @@ fn validate_economy_command(
                 true,
             ));
         }
+        GameplayCommand::TrainerList { trainer } => {
+            if !is_nearby_class_trainer(snapshot, *trainer) {
+                return Err(reject(
+                    "trainer_not_available",
+                    "class trainer is not currently observed and in interaction range",
+                    true,
+                ));
+            }
+        }
+        GameplayCommand::TrainerBuy { trainer, spell } => {
+            let offer = snapshot
+                .state
+                .trainer
+                .offers
+                .iter()
+                .find(|offer| offer.spell == *spell);
+            let player_level = snapshot
+                .state
+                .session
+                .character_guid
+                .map(EntityId)
+                .and_then(|player| snapshot.state.entities.0.get(&player))
+                .and_then(|player| player.level);
+            let required_skill_is_known = offer.is_some_and(|offer| {
+                offer.required_skill_line == 0
+                    || (snapshot.state.professions.known
+                        && u32::from(snapshot.state.professions.skill(offer.required_skill_line))
+                            >= offer.required_skill_rank)
+            });
+            let valid = snapshot.state.trainer.trainer == Some(*trainer)
+                && snapshot.state.trainer.trainer_type == Some(0)
+                && is_nearby_class_trainer(snapshot, *trainer)
+                && offer.is_some_and(|offer| {
+                    offer.usable == 0
+                        && player_level.is_some_and(|level| offer.required_level as u32 <= level)
+                        && !snapshot.state.capabilities.spells.contains(&offer.spell)
+                        && u64::from(offer.cost_copper)
+                            .saturating_add(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
+                            <= snapshot.state.inventory.money
+                })
+                && required_skill_is_known;
+            if !valid {
+                return Err(reject(
+                    "invalid_trainer_offer",
+                    "training purchase is not in the current affordable and eligible trainer list",
+                    true,
+                ));
+            }
+        }
         GameplayCommand::VendorBuy {
             vendor,
             item,
@@ -718,6 +767,25 @@ fn has_entity(snapshot: &Snapshot, entity: EntityId) -> bool {
     snapshot.state.entities.0.contains_key(&entity)
 }
 
+fn is_nearby_class_trainer(snapshot: &Snapshot, trainer: EntityId) -> bool {
+    let Some(entity) = snapshot.state.entities.0.get(&trainer) else {
+        return false;
+    };
+    let Some(position) = entity.position else {
+        return false;
+    };
+    let Some(player_position) = snapshot.state.position.player else {
+        return false;
+    };
+    entity.kind == wow_state::entities::EntityKind::Unit
+        && entity.interactable
+        && entity
+            .npc_flags
+            .is_some_and(|flags| flags & 0x20 != 0 || (flags & 0x10 != 0 && flags & 0x40 == 0))
+        && position.map == player_position.map
+        && position.point.distance(player_position.point) <= 5.0
+}
+
 fn attack_authorized(snapshot: &Snapshot, target: EntityId) -> bool {
     snapshot
         .state
@@ -774,9 +842,10 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
         | GameplayCommand::RequestQuestReward { .. }
         | GameplayCommand::ChooseQuestReward { .. } => PermissionSet::QUEST,
         GameplayCommand::QueryItem { .. } => PermissionSet::empty(),
-        GameplayCommand::VendorList { .. } | GameplayCommand::VendorBuy { .. } => {
-            PermissionSet::MAINTENANCE
-        }
+        GameplayCommand::VendorList { .. }
+        | GameplayCommand::VendorBuy { .. }
+        | GameplayCommand::TrainerList { .. }
+        | GameplayCommand::TrainerBuy { .. } => PermissionSet::MAINTENANCE,
         GameplayCommand::VendorSell { .. } => PermissionSet::ECONOMY,
         GameplayCommand::TradeAccept { .. }
         | GameplayCommand::AuctionBuy { .. }
@@ -804,6 +873,8 @@ fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
             | GameplayCommand::UseItemOnItem { .. }
             | GameplayCommand::VendorList { .. }
             | GameplayCommand::VendorBuy { .. }
+            | GameplayCommand::TrainerList { .. }
+            | GameplayCommand::TrainerBuy { .. }
             | GameplayCommand::PetAttack { .. }
     ) && !matches!(origin, PlanOrigin::SystemPolicy | PlanOrigin::Operator)
     {
@@ -830,6 +901,8 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::UseItemOnItem { .. }
                 | GameplayCommand::VendorList { .. }
                 | GameplayCommand::VendorBuy { .. }
+                | GameplayCommand::TrainerList { .. }
+                | GameplayCommand::TrainerBuy { .. }
                 | GameplayCommand::QueryItem { .. }
         ),
         ActivationStage::Move => matches!(
@@ -847,6 +920,8 @@ fn stage_allows(stage: ActivationStage, command: &GameplayCommand) -> bool {
                 | GameplayCommand::UseItemOnItem { .. }
                 | GameplayCommand::VendorList { .. }
                 | GameplayCommand::VendorBuy { .. }
+                | GameplayCommand::TrainerList { .. }
+                | GameplayCommand::TrainerBuy { .. }
                 | GameplayCommand::QueryItem { .. }
                 | GameplayCommand::MoveTo(_)
                 | GameplayCommand::FaceDirection { .. }
@@ -917,7 +992,10 @@ fn reject(code: &str, message: &str, retryable: bool) -> ValidationOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wow_state::AuthoritativeState;
+    use wow_state::{
+        AuthoritativeState,
+        entities::{EntityKind, EntityState},
+    };
 
     fn base_stamp() -> ValidityStamp {
         ValidityStamp {
@@ -986,6 +1064,71 @@ mod tests {
         assert!(
             matches!(outcome, ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "unknown_spell")
         );
+    }
+
+    #[test]
+    fn trainer_purchase_requires_a_current_nearby_affordable_class_offer() {
+        let trainer = EntityId(22);
+        let player_position = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.position.player = Some(player_position);
+        state.inventory.money = 2_000;
+        state.entities.0.insert(
+            EntityId(7),
+            EntityState {
+                id: EntityId(7),
+                level: Some(20),
+                position: Some(player_position),
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            trainer,
+            EntityState {
+                id: trainer,
+                kind: EntityKind::Unit,
+                npc_flags: Some(0x30),
+                interactable: true,
+                position: Some(player_position),
+                ..Default::default()
+            },
+        );
+        state.trainer = wow_state::trainer::TrainerState {
+            trainer: Some(trainer),
+            trainer_type: Some(0),
+            offers: vec![wow_state::trainer::TrainerSpellOffer {
+                spell: 1234,
+                usable: 0,
+                cost_copper: 1_000,
+                required_level: 20,
+                required_skill_line: 0,
+                required_skill_rank: 0,
+            }],
+        };
+        let command = GameplayCommand::TrainerBuy {
+            trainer,
+            spell: 1234,
+        };
+        let snapshot = Snapshot::from_state(&state);
+        assert!(validate_command(&snapshot, &command).is_ok());
+
+        state.inventory.money = 1_999;
+        assert!(validate_command(&Snapshot::from_state(&state), &command).is_err());
+        state.inventory.money = 2_000;
+        state.capabilities.spells.insert(1234);
+        assert!(validate_command(&Snapshot::from_state(&state), &command).is_err());
+        state.capabilities.spells.clear();
+        state.entities.0.get_mut(&trainer).unwrap().position = Some(WorldPosition {
+            point: Vec3::new(6.0, 0.0, 0.0),
+            ..player_position
+        });
+        assert!(validate_command(&Snapshot::from_state(&state), &command).is_err());
     }
 
     #[test]

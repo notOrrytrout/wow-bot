@@ -470,6 +470,8 @@ pub(super) fn encode_gameplay_command(
     const CMSG_BUY_ITEM: u32 = 0x01A2;
     const CMSG_SELL_ITEM: u32 = 0x01A0;
     const CMSG_REPAIR_ITEM: u32 = 0x02A8;
+    const CMSG_TRAINER_LIST: u32 = 0x01B0;
+    const CMSG_TRAINER_BUY_SPELL: u32 = 0x01B2;
     match command {
         GameplayCommand::Raw { opcode, body } => Ok(Some((ClientFrame { opcode, body }, None))),
         GameplayCommand::QueryQuestGivers => Ok(Some((
@@ -504,6 +506,24 @@ pub(super) fn encode_gameplay_command(
             },
             None,
         ))),
+        GameplayCommand::TrainerList { trainer } => Ok(Some((
+            ClientFrame {
+                opcode: CMSG_TRAINER_LIST,
+                body: raw_guid_body(trainer),
+            },
+            None,
+        ))),
+        GameplayCommand::TrainerBuy { trainer, spell } => {
+            let mut body = raw_guid_body(trainer);
+            body.extend_from_slice(&spell.to_le_bytes());
+            Ok(Some((
+                ClientFrame {
+                    opcode: CMSG_TRAINER_BUY_SPELL,
+                    body,
+                },
+                None,
+            )))
+        }
         GameplayCommand::VendorBuy {
             vendor,
             item,
@@ -1463,6 +1483,39 @@ mod movement_clock_tests {
         assert_eq!(&packet.body[12..16], &3_u32.to_le_bytes());
         assert_eq!(&packet.body[16..20], &1_u32.to_le_bytes());
         assert_eq!(packet.body[20], 0);
+    }
+
+    #[test]
+    fn trainer_list_and_buy_use_wrath_guid_and_spell_layouts() {
+        let mut clock = MovementClock::default();
+        let trainer = EntityId(0x1122334455667788);
+        let (list, _) = encode_gameplay_command(
+            GameplayCommand::TrainerList { trainer },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(list.opcode, 0x01b0);
+        assert_eq!(list.body, trainer.0.to_le_bytes());
+
+        let (buy, _) = encode_gameplay_command(
+            GameplayCommand::TrainerBuy {
+                trainer,
+                spell: 1234,
+            },
+            Some(EntityId(7)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(buy.opcode, 0x01b2);
+        assert_eq!(&buy.body[..8], &trainer.0.to_le_bytes());
+        assert_eq!(&buy.body[8..], &1234_u32.to_le_bytes());
     }
 
     #[test]

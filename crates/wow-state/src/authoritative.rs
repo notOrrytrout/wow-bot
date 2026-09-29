@@ -2,7 +2,7 @@ use crate::{
     auras::AuraState, capabilities::CapabilityState, control::ControlState, desync::DesyncState,
     entities::Entities, group::GroupState, inventory::InventoryState, life::LifeState,
     pets::PetState, position::PositionState, professions::ProfessionState, quests::QuestState,
-    session::SessionState, transport::TransportState,
+    session::SessionState, trainer::TrainerState, transport::TransportState,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -28,6 +28,8 @@ pub struct AuthoritativeState {
     pub life: LifeState,
     pub quests: QuestState,
     pub professions: ProfessionState,
+    #[serde(default)]
+    pub trainer: TrainerState,
     pub pet: PetState,
     pub group: GroupState,
     pub capabilities: CapabilityState,

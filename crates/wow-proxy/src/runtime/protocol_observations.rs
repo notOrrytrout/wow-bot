@@ -109,6 +109,45 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn trainer_list_keeps_authoritative_spell_cost_and_requirements() {
+        let trainer = 0x1122_3344_5566_7788_u64;
+        let mut packet = trainer.to_le_bytes().to_vec();
+        packet.extend_from_slice(&0_i32.to_le_bytes()); // class trainer
+        packet.extend_from_slice(&1_u32.to_le_bytes());
+        packet.extend_from_slice(&1234_u32.to_le_bytes());
+        packet.push(0); // available
+        packet.extend_from_slice(&25_000_u32.to_le_bytes());
+        packet.extend_from_slice(&[0; 8]); // point costs
+        packet.push(20); // required level
+        packet.extend_from_slice(&164_u32.to_le_bytes()); // skill line
+        packet.extend_from_slice(&75_u32.to_le_bytes()); // skill rank
+        packet.extend_from_slice(&[0; 12]); // prerequisite spells
+        packet.extend_from_slice(b"Trainer\0");
+
+        let Some(ProtocolObservation::TrainerList {
+            trainer: observed,
+            trainer_type,
+            offers,
+        }) = parse_trainer_list(&packet)
+        else {
+            panic!("trainer list observation expected")
+        };
+        assert_eq!(observed, EntityId(trainer));
+        assert_eq!(trainer_type, 0);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].spell, 1234);
+        assert_eq!(offers[0].cost_copper, 25_000);
+        assert_eq!(offers[0].required_level, 20);
+        assert_eq!(offers[0].required_skill_line, 164);
+        assert_eq!(offers[0].required_skill_rank, 75);
+        assert!(matches!(
+            maintenance_observations(0x01b1, &packet).as_slice(),
+            [ProtocolObservation::TrainerList { trainer: found, .. }] if *found == EntityId(trainer)
+        ));
+        assert!(parse_trainer_list(&packet[..packet.len() - 9]).is_none());
+    }
+
     fn value_u32(value: u32) -> [u8; 4] {
         value.to_le_bytes()
     }
@@ -326,10 +365,12 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
     const SMSG_ITEM_QUERY_SINGLE_RESPONSE: u32 = 0x0058;
     const SMSG_LIST_INVENTORY: u32 = 0x019F;
     const SMSG_BUY_ITEM: u32 = 0x01A4;
+    const SMSG_TRAINER_LIST: u32 = 0x01B1;
     match opcode {
         SMSG_ITEM_QUERY_SINGLE_RESPONSE => parse_item_template(body).into_iter().collect(),
         SMSG_LIST_INVENTORY => parse_vendor_list(body).into_iter().collect(),
         SMSG_BUY_ITEM => parse_vendor_buy_response(body).into_iter().collect(),
+        SMSG_TRAINER_LIST => parse_trainer_list(body).into_iter().collect(),
         SMSG_INITIAL_SPELLS => parse_initial_spells(body),
         SMSG_LEARNED_SPELL => body
             .get(0..4)
@@ -355,6 +396,49 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_PARTYKILLLOG => parse_creature_killed(body).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn parse_trainer_list(body: &[u8]) -> Option<ProtocolObservation> {
+    const MAX_TRAINER_OFFERS: usize = 1024;
+    let trainer = EntityId(u64_le_at(body, 0)?);
+    if trainer.0 == 0 {
+        return None;
+    }
+    let trainer_type = u32_le_at(body, 8)? as i32;
+    let count = usize::try_from(u32_le_at(body, 12)?).ok()?;
+    if count > MAX_TRAINER_OFFERS {
+        return None;
+    }
+    let mut cursor = 16;
+    let mut offers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let spell = read_u32(body, &mut cursor)?;
+        let usable = *body.get(cursor)?;
+        cursor += 1;
+        let cost_copper = read_u32(body, &mut cursor)?;
+        cursor = cursor.checked_add(8)?; // talent and profession point costs
+        let required_level = *body.get(cursor)?;
+        cursor += 1;
+        let required_skill_line = read_u32(body, &mut cursor)?;
+        let required_skill_rank = read_u32(body, &mut cursor)?;
+        cursor = cursor.checked_add(12)?; // three prerequisite abilities
+        if cursor > body.len() || spell == 0 {
+            return None;
+        }
+        offers.push(wow_state::trainer::TrainerSpellOffer {
+            spell,
+            usable,
+            cost_copper,
+            required_level,
+            required_skill_line,
+            required_skill_rank,
+        });
+    }
+    Some(ProtocolObservation::TrainerList {
+        trainer,
+        trainer_type,
+        offers,
+    })
 }
 
 fn parse_vendor_list(body: &[u8]) -> Option<ProtocolObservation> {

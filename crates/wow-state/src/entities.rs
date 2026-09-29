@@ -33,6 +33,9 @@ pub struct EntityState {
     /// Server-owned UnitField mount display identifier. Zero means unmounted.
     #[serde(default)]
     pub mount_display_id: Option<u32>,
+    /// Server-owned NPC service flags. Missing means no authoritative NPC update.
+    #[serde(default)]
+    pub npc_flags: Option<u32>,
     /// Movement flags from a server UPDATE_OBJECT movement block.
     #[serde(default)]
     pub movement_flags: Option<u32>,

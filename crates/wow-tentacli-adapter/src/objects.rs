@@ -66,6 +66,10 @@ pub fn object_to_entity(
     let mount_display_id = unit_integer(object, UnitField::MountDisplayId)
         .and_then(|value| u32::try_from(value).ok())
         .or_else(|| (object.object_type_id() == ObjectTypeId::Player).then_some(0));
+    let npc_flags = object
+        .as_unit()
+        .and_then(|unit| unit.npc_flags())
+        .map(|flags| flags as u32);
     let movement_flags = object
         .movement
         .as_ref()
@@ -113,6 +117,7 @@ pub fn object_to_entity(
         aura_state,
         unit_flags,
         mount_display_id,
+        npc_flags,
         movement_flags,
         target,
         hostile: false,
@@ -342,6 +347,18 @@ mod tests {
         let entity = object_to_entity(&object(ObjectTypeId::Unit, None), None, 0);
 
         assert_eq!(entity.shapeshift_form, None);
+    }
+
+    #[test]
+    fn observed_npc_flags_are_preserved_for_service_validation() {
+        let mut unit = object(ObjectTypeId::Unit, None);
+        unit.unit_fields
+            .insert(UnitField::NpcFlags, FieldValue::Integer(0x30));
+
+        let entity = object_to_entity(&unit, None, 0);
+
+        assert_eq!(entity.npc_flags, Some(0x30));
+        assert!(entity.interactable);
     }
 
     #[test]
