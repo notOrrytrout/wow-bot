@@ -4741,6 +4741,27 @@ impl LaneEngine {
                     self.waiting(format!("quest {quest} needs usable item {item} for scripted objective, but no authoritative backpack slot/GUID is known"));
                     return true;
                 };
+                match wow_policy::questing::objectives::item_use_metadata_status(
+                    &snapshot, item, spell,
+                ) {
+                    wow_policy::questing::objectives::ItemUseMetadataStatus::Missing => {
+                        if self.queried_item_templates.insert(item) {
+                            tracing::info!(lane=?self.state.lane, quest, item, spell, "requesting item metadata before quest item use");
+                            return self
+                                .propose_command(GameplayCommand::QueryItem { item }, false)
+                                .await;
+                        }
+                        self.waiting(format!("quest {quest} is waiting for authoritative metadata for item {item} before use"));
+                        return true;
+                    }
+                    wow_policy::questing::objectives::ItemUseMetadataStatus::Mismatch {
+                        observed_spell,
+                    } => {
+                        self.waiting(format!("quest {quest} will not use item {item}: authoritative template spell {observed_spell} does not match grounded quest spell {spell}"));
+                        return true;
+                    }
+                    wow_policy::questing::objectives::ItemUseMetadataStatus::Matches => {}
+                }
                 tracing::info!(lane=?self.state.lane, quest, objective, ?target, item, spell, slot=instance.backpack_slot, "quest scheduler using scripted targeted quest item");
                 return self
                     .dispatch_quest_semantic(
@@ -9685,6 +9706,136 @@ mod tests {
         };
         assert_eq!(action.command(), &GameplayCommand::QueryQuest { quest: 42 });
         assert_eq!(action.origin(), PlanOrigin::SystemPolicy);
+    }
+
+    #[tokio::test]
+    async fn inoculation_waits_for_item_spell_metadata_before_shared_targeted_use() {
+        use wow_state::{
+            inventory::{InventoryItemInstance, ItemTemplateMetadata},
+            quests::{
+                QuestDefinition, QuestItemObjective, QuestProgress, QuestTargetKind,
+                QuestTargetObjective,
+            },
+        };
+
+        let position = WorldPosition {
+            map: 530,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.position.player = Some(position);
+        authoritative.quests.active.insert(
+            9303,
+            QuestProgress {
+                complete: false,
+                objectives: vec![0],
+            },
+        );
+        authoritative.quests.definitions.insert(
+            9303,
+            QuestDefinition {
+                quest: 9303,
+                title: "Inoculation".into(),
+                poi_map: None,
+                poi_x: None,
+                poi_y: None,
+                targets: vec![QuestTargetObjective {
+                    slot: 0,
+                    kind: QuestTargetKind::Creature,
+                    entry: 16534,
+                    required: 6,
+                    item_drop: 0,
+                    text: "Nestlewood Owlkin inoculated".into(),
+                }],
+                items: vec![QuestItemObjective {
+                    item: 22962,
+                    required: 1,
+                }],
+            },
+        );
+        authoritative.inventory.instances_authoritative = true;
+        authoritative.inventory.instances.insert(
+            EntityId(92),
+            InventoryItemInstance {
+                item: 22962,
+                guid: EntityId(92),
+                backpack_slot: 23,
+                count: 1,
+            },
+        );
+        authoritative.entities.0.insert(
+            EntityId(93),
+            wow_state::entities::EntityState {
+                id: EntityId(93),
+                entry: 16518,
+                kind: wow_state::entities::EntityKind::Unit,
+                position: Some(WorldPosition {
+                    point: Vec3::new(4.0, 0.0, 0.0),
+                    ..position
+                }),
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+        let (mut engine, mut proxy) = test_engine(Mission::quest(MissionId(93)), authoritative);
+
+        assert!(engine.tick_incomplete_quest(9303).await);
+        let WorkerToProxy::Action(query) = proxy.recv().await.unwrap() else {
+            panic!("missing item metadata must request the item template")
+        };
+        assert_eq!(query.command(), &GameplayCommand::QueryItem { item: 22962 });
+
+        engine.state.authoritative.inventory.item_metadata.insert(
+            22962,
+            ItemTemplateMetadata {
+                use_spell_id: 29529,
+                ..Default::default()
+            },
+        );
+        assert!(engine.tick_incomplete_quest(9303).await);
+        assert!(proxy.try_recv().is_err());
+        assert!(
+            engine
+                .last_wait_reason
+                .as_deref()
+                .is_some_and(|reason| { reason.contains("does not match grounded quest spell") })
+        );
+
+        engine
+            .state
+            .authoritative
+            .inventory
+            .item_metadata
+            .get_mut(&22962)
+            .unwrap()
+            .use_spell_id = 29528;
+        assert!(engine.tick_incomplete_quest(9303).await);
+        let WorkerToProxy::Action(use_item) = proxy.recv().await.unwrap() else {
+            panic!("matching authoritative template should allow shared item use")
+        };
+        assert_eq!(
+            use_item.command(),
+            &GameplayCommand::UseItemInstance {
+                item: 22962,
+                item_guid: EntityId(92),
+                backpack_slot: 23,
+                spell: 29528,
+                target: Some(EntityId(93)),
+                cast_count: 1,
+            }
+        );
+        assert!(matches!(
+            engine.pending_quest_action,
+            Some(PendingQuestAction::QuestCredit {
+                quest: 9303,
+                objective: 0,
+                target: EntityId(93),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

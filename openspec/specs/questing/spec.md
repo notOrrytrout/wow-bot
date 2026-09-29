@@ -238,13 +238,28 @@ After quest work emits a state-changing semantic action such as combat start, lo
 - **AND** after loot is initiated, it waits for authoritative inventory, loot-release, or despawn evidence before another loot attempt
 
 ### Requirement: Scripted targeted quest-item use waits for authoritative quest credit
-When a quest objective requires using an item-provided spell on a live target, questing SHALL resolve that objective to the shared targeted item-use mechanic using the authoritative item GUID and backpack slot. After the action is sent, the scheduler SHALL gate retries on authoritative quest-objective progress rather than target presence or a fixed short delay.
+When a quest objective requires using an item-provided spell on a live target, questing SHALL resolve that objective to the shared targeted item-use mechanic using the authoritative item GUID and backpack slot. After the action is sent, the scheduler SHALL gate retries on authoritative quest-objective progress rather than target presence or a fixed short delay. Before sending the action, questing SHALL confirm that authoritative item-template metadata reports the same use spell as the grounded quest-item rule. If metadata is missing, it SHALL request the item template and wait. If metadata reports a different spell, questing SHALL not use the item.
 
 #### Scenario: Lazy Peons objective
 - **WHEN** quest 5441 is active, a living Lazy Peon is authoritative, and the Foreman's Blackjack item instance is authoritative
 - **THEN** questing uses the shared targeted item-use path instead of combat
 - **AND** out-of-range use transitions through shared movement work
 - **AND** after use the scheduler waits for the authoritative objective counter to advance before selecting another peon or retrying
+
+#### Scenario: Inoculation objective targets a creature different from its credit entry
+- **GIVEN** quest 9303 is active with an incomplete objective for entry 16534
+- **AND** live creature entry 16518 is authoritative
+- **AND** item 22962 is present in an authoritative backpack slot and its authoritative template reports use spell 29528
+- **WHEN** the objective is selected
+- **THEN** questing uses item 22962 with spell 29528 on live entry 16518 through the shared targeted item-use action
+- **AND** after use the scheduler waits for authoritative progress on the entry 16534 objective
+
+#### Scenario: Quest item template metadata is missing or conflicts with the quest rule
+- **GIVEN** a grounded quest-item rule requires item 22962 and use spell 29528
+- **WHEN** authoritative item-template metadata is missing
+- **THEN** questing requests the item template and waits without using the item
+- **WHEN** authoritative item-template metadata reports another use spell
+- **THEN** questing refuses the item-use action
 
 ### Requirement: Quest control-object activation waits for controlled-mover authority
 When a scripted quest control object requires a spell-targeted activation transaction, questing SHALL use the shared game-object spell action and SHALL emit any required game-object report-use frame through the proxy encoder. After activation, the scheduler SHALL wait for authoritative controlled-mover state before proceeding with controlled movement or abilities.

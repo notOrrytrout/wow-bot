@@ -72,6 +72,30 @@ pub enum ObjectiveResolution {
     NoSupportedObjective,
 }
 
+/// Status of authoritative item-template metadata for a grounded quest item rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemUseMetadataStatus {
+    Missing,
+    Matches,
+    Mismatch { observed_spell: u32 },
+}
+
+/// Check that the live item template still describes the item-use spell captured by
+/// the quest rule. Possession alone cannot authorize an item-use action.
+pub fn item_use_metadata_status(
+    snapshot: &Snapshot,
+    item: u32,
+    expected_spell: u32,
+) -> ItemUseMetadataStatus {
+    match snapshot.state.inventory.item_metadata.get(&item) {
+        None => ItemUseMetadataStatus::Missing,
+        Some(metadata) if metadata.use_spell_id == expected_spell => ItemUseMetadataStatus::Matches,
+        Some(metadata) => ItemUseMetadataStatus::Mismatch {
+            observed_spell: metadata.use_spell_id,
+        },
+    }
+}
+
 pub fn resolve(snapshot: &Snapshot, quest: u32) -> ObjectiveResolution {
     resolve_with_exclusions(snapshot, quest, &BTreeSet::new())
 }
@@ -773,6 +797,107 @@ mod tests {
                 spell: 19938,
                 cast_count: 1
             }
+        );
+    }
+
+    #[test]
+    fn inoculation_uses_grounded_item_rule_for_authoritative_live_target() {
+        let mut state = AuthoritativeState::default();
+        state.position.player = Some(WorldPosition {
+            map: 530,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.quests.active.insert(
+            9303,
+            QuestProgress {
+                complete: false,
+                objectives: vec![0],
+            },
+        );
+        state.quests.definitions.insert(
+            9303,
+            QuestDefinition {
+                quest: 9303,
+                title: "Inoculation".into(),
+                poi_map: None,
+                poi_x: None,
+                poi_y: None,
+                targets: vec![QuestTargetObjective {
+                    slot: 0,
+                    kind: QuestTargetKind::Creature,
+                    entry: 16534,
+                    required: 6,
+                    item_drop: 0,
+                    text: "Nestlewood Owlkin inoculated".into(),
+                }],
+                items: vec![],
+            },
+        );
+        state.entities.0.insert(
+            EntityId(93),
+            EntityState {
+                id: EntityId(93),
+                entry: 16518,
+                kind: EntityKind::Unit,
+                position: Some(WorldPosition {
+                    map: 530,
+                    point: Vec3::new(4.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                health: Some((100, 100)),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            resolve(&Snapshot::from_state(&state), 9303),
+            ObjectiveResolution::GroundedScriptedItemUse {
+                objective: 0,
+                target: EntityId(93),
+                item: 22962,
+                spell: 29528,
+                cast_count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn quest_item_use_requires_matching_authoritative_template_spell() {
+        use wow_state::inventory::ItemTemplateMetadata;
+
+        let mut state = AuthoritativeState::default();
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(
+            item_use_metadata_status(&snapshot, 22962, 29528),
+            ItemUseMetadataStatus::Missing
+        );
+
+        state.inventory.item_metadata.insert(
+            22962,
+            ItemTemplateMetadata {
+                use_spell_id: 29529,
+                ..Default::default()
+            },
+        );
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(
+            item_use_metadata_status(&snapshot, 22962, 29528),
+            ItemUseMetadataStatus::Mismatch {
+                observed_spell: 29529
+            }
+        );
+
+        state
+            .inventory
+            .item_metadata
+            .get_mut(&22962)
+            .unwrap()
+            .use_spell_id = 29528;
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(
+            item_use_metadata_status(&snapshot, 22962, 29528),
+            ItemUseMetadataStatus::Matches
         );
     }
 

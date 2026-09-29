@@ -1,0 +1,5 @@
+- [x] Resolve legacy Inoculation through its grounded target-entry and credit-entry rule.
+- [x] Require authoritative item-template spell agreement before sending targeted quest item use.
+- [x] Add regression coverage for Inoculation and missing/mismatched/matching metadata.
+- [x] Update questing behavior requirements and traceability notes.
+- [ ] Verify all catalog rules against live server captures and runtime scenarios.

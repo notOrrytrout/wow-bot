@@ -109,6 +109,8 @@ For the Death Knight Eye of Acherus quest path, verify that the log shows the qu
 
 For the Power Converters quest (10584), verify the setup object is activated first, the lane waits until an authoritative Electromental is visible, then uses the observed Protovoltaic Magneto Collector item instance on that creature. With no live target, it must not send item use. After item use, it must wait for authoritative quest progress before repeating.
 
+For Inoculation (9303), verify the incomplete objective credit entry 16534 resolves to live target entry 16518 only through its grounded catalog rule. The lane must request missing item 22962 metadata and wait, use the authoritative item instance only when its template reports spell 29528, and refuse use when the observed template spell conflicts. After use, it must wait for objective progress on entry 16534.
+
 Unresolved quest-item-use candidates remain negative tests: the scheduler must not infer an item action from item possession or static spawn data alone. It needs a grounded quest-item rule, a matching incomplete objective, a live target, and an authoritative item instance.
 ## Deterministic reuse acceptance checks
 
