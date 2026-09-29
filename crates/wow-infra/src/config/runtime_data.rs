@@ -84,6 +84,26 @@ pub struct MaintenanceTuning {
 pub struct GroupTuning {
     /// Time a non-tank waits after a group target is observed engaged.
     pub threat_delay_ms: u64,
+    pub loot: GroupLootTuning,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GroupLootTuning {
+    /// Need only for a usable item with authoritative evidence that it improves equipment.
+    pub need_usable_upgrades: bool,
+    /// Greed on known non-upgrades when the server allows it.
+    pub greed_non_upgrades: bool,
+    /// Disenchant known non-upgrades when the server allows it.
+    pub disenchant_non_upgrades: bool,
+    /// Highest item quality for automatic need votes.
+    pub max_need_quality: u32,
+}
+
+impl GroupLootTuning {
+    pub fn max_need_quality(&self) -> u32 {
+        self.max_need_quality.min(7)
+    }
 }
 
 impl GroupTuning {
@@ -132,6 +152,18 @@ impl Default for GroupTuning {
     fn default() -> Self {
         Self {
             threat_delay_ms: 1_500,
+            loot: GroupLootTuning::default(),
+        }
+    }
+}
+
+impl Default for GroupLootTuning {
+    fn default() -> Self {
+        Self {
+            need_usable_upgrades: false,
+            greed_non_upgrades: false,
+            disenchant_non_upgrades: false,
+            max_need_quality: 4,
         }
     }
 }
@@ -200,5 +232,27 @@ mod tests {
 
         let too_long: GroupTuning = serde_json::from_str(r#"{"threat_delay_ms":60000}"#).unwrap();
         assert_eq!(too_long.threat_delay_ms(), 30_000);
+    }
+
+    #[test]
+    fn group_loot_choices_require_explicit_configuration_and_bound_quality() {
+        let default = GroupLootTuning::default();
+        assert!(!default.need_usable_upgrades);
+        assert!(!default.greed_non_upgrades);
+        assert!(!default.disenchant_non_upgrades);
+        assert_eq!(default.max_need_quality(), 4);
+
+        let configured: GroupLootTuning = serde_json::from_str(
+            r#"{
+                "need_usable_upgrades": true,
+                "greed_non_upgrades": true,
+                "disenchant_non_upgrades": false,
+                "max_need_quality": 99
+            }"#,
+        )
+        .unwrap();
+        assert!(configured.need_usable_upgrades);
+        assert!(configured.greed_non_upgrades);
+        assert_eq!(configured.max_need_quality(), 7);
     }
 }

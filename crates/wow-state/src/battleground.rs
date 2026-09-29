@@ -45,6 +45,15 @@ pub struct BattlegroundState {
     /// Latest status by client queue slot. A `None` status removes its slot.
     #[serde(default)]
     pub queues: BTreeMap<u32, BattlegroundQueueState>,
+    /// Latest server world-state values, keyed by the WotLK variable ID.
+    #[serde(default)]
+    pub world_states: BTreeMap<u32, i32>,
+    #[serde(default)]
+    pub map_id: Option<u32>,
+    #[serde(default)]
+    pub zone_id: Option<u32>,
+    #[serde(default)]
+    pub area_id: Option<u32>,
 }
 
 #[cfg(test)]

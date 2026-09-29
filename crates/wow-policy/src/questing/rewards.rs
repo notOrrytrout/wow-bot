@@ -1,5 +1,4 @@
-use wow_domain::EntityId;
-use wow_state::{Snapshot, inventory::ItemTemplateMetadata};
+use wow_state::Snapshot;
 
 const REWARD_METADATA_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
@@ -40,11 +39,6 @@ pub fn best_reward_index(snapshot: &Snapshot, reward_items: &[u32]) -> u32 {
         return 0;
     }
     let inventory = &snapshot.state.inventory;
-    let player_id = snapshot.state.session.character_guid.map(EntityId);
-    let player = player_id.and_then(|id| snapshot.state.entities.0.get(&id));
-    let class = snapshot.state.capabilities.class_id.unwrap_or_default();
-    let level = player.and_then(|entity| entity.level).unwrap_or_default();
-    let spec = snapshot.state.capabilities.specialization_tree;
     let mut best_upgrade: Option<(usize, f32)> = None;
     let mut best_fallback: Option<(usize, f32)> = None;
 
@@ -56,14 +50,9 @@ pub fn best_reward_index(snapshot: &Snapshot, reward_items: &[u32]) -> u32 {
         if best_fallback.is_none_or(|(_, score)| fallback > score) {
             best_fallback = Some((index, fallback));
         }
-        if class == 0
-            || level == 0
-            || !crate::gear::player_can_use(metadata, class, level.min(255) as u8)
-        {
-            continue;
-        }
-        let new_score = crate::gear::item_score_with_spec(metadata, class, spec);
-        let Some(current_score) = current_score(snapshot, metadata, class, spec) else {
+        let Some((current_score, new_score)) =
+            crate::gear::equipment_score_comparison(snapshot, item_id)
+        else {
             continue;
         };
         let delta = new_score - current_score;
@@ -79,36 +68,6 @@ pub fn best_reward_index(snapshot: &Snapshot, reward_items: &[u32]) -> u32 {
         .map_or(0, |(index, _)| index as u32)
 }
 
-fn current_score(
-    snapshot: &Snapshot,
-    reward: &ItemTemplateMetadata,
-    class: u8,
-    spec: Option<u8>,
-) -> Option<f32> {
-    let inventory = &snapshot.state.inventory;
-    let slots = crate::gear::destination_slots(reward);
-    if slots.is_empty() {
-        return None;
-    }
-    slots
-        .iter()
-        .filter_map(|slot| {
-            let item = inventory.equipped_items.get(slot)?;
-            let metadata = inventory.item_metadata.get(item)?;
-            let mut score = crate::gear::item_score_with_spec(metadata, class, spec);
-            if reward.inventory_type == 17
-                && *slot == 15
-                && let Some(offhand) = inventory.equipped_items.get(&16)
-                && let Some(offhand_metadata) = inventory.item_metadata.get(offhand)
-            {
-                score += crate::gear::item_score_with_spec(offhand_metadata, class, spec);
-            }
-            Some(score)
-        })
-        .min_by(f32::total_cmp)
-        .or(Some(0.0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +75,7 @@ mod tests {
     use wow_state::{
         AuthoritativeState,
         entities::{EntityKind, EntityState},
+        inventory::ItemTemplateMetadata,
     };
 
     fn metadata(item_level: u32, stat_value: i32) -> ItemTemplateMetadata {
@@ -139,6 +99,8 @@ mod tests {
         state.session.character_guid = Some(1);
         state.capabilities.class_id = Some(1);
         state.capabilities.specialization_tree = Some(0);
+        state.inventory.equipment_authoritative = true;
+        state.inventory.equipment_slots_authoritative = true;
         state.entities.0.insert(
             EntityId(1),
             EntityState {

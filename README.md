@@ -26,6 +26,7 @@ Cargo fetches the Tentacli Git revision specified in `Cargo.toml` and the other 
 ## Quick start
 
 Keep `config.toml` and `bots.toml` beside the `wow-bot/` directory. The supervisor reads the TOML files directly; it does not require users to edit JSON.
+See [runtime behavior settings](docs/CONFIGURATION.md) for group loot vote defaults and opt-in choices.
 
 Run these commands from the repository root:
 

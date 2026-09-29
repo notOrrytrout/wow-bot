@@ -11,6 +11,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn battleground_world_state_packets_decode_full_snapshots_and_updates() {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&30_i32.to_le_bytes());
+        packet.extend_from_slice(&1377_i32.to_le_bytes());
+        packet.extend_from_slice(&0_i32.to_le_bytes());
+        packet.extend_from_slice(&2_u16.to_le_bytes());
+        for (variable, value) in [(4247_i32, 1_i32), (1601, -1)] {
+            packet.extend_from_slice(&variable.to_le_bytes());
+            packet.extend_from_slice(&value.to_le_bytes());
+        }
+        assert!(matches!(
+            maintenance_observations(0x02C2, &packet).as_slice(),
+            [ProtocolObservation::BattlegroundWorldStatesInitialized {
+                map_id: 30, zone_id: 1377, area_id: 0, states,
+            }] if states == &vec![(4247, 1), (1601, -1)]
+        ));
+        assert!(maintenance_observations(0x02C2, &packet[..packet.len() - 1]).is_empty());
+
+        let mut update = 4247_i32.to_le_bytes().to_vec();
+        update.extend_from_slice(&0_i32.to_le_bytes());
+        assert!(matches!(
+            maintenance_observations(0x02C3, &update).as_slice(),
+            [ProtocolObservation::BattlegroundWorldStateUpdated {
+                variable: 4247,
+                value: 0
+            }]
+        ));
+        assert!(maintenance_observations(0x02C3, &update[..7]).is_empty());
+    }
+
+    #[test]
     fn show_bank_observation_keeps_the_authoritative_banker_guid() {
         let banker = 0x1122_3344_5566_7788_u64;
         let body = banker.to_le_bytes();
@@ -416,6 +447,8 @@ mod tests {
 }
 
 pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<ProtocolObservation> {
+    const SMSG_INIT_WORLD_STATES: u32 = 0x02C2;
+    const SMSG_UPDATE_WORLD_STATE: u32 = 0x02C3;
     const SMSG_INITIAL_SPELLS: u32 = 0x012A;
     const SMSG_LEARNED_SPELL: u32 = 0x012B;
     const SMSG_AURA_UPDATE_ALL: u32 = 0x0495;
@@ -441,6 +474,8 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
     const SMSG_GROUP_LIST: u32 = 0x007D;
     const SMSG_LOOT_START_ROLL: u32 = 0x02A1;
     match opcode {
+        SMSG_INIT_WORLD_STATES => parse_initial_world_states(body).into_iter().collect(),
+        SMSG_UPDATE_WORLD_STATE => parse_world_state_update(body).into_iter().collect(),
         SMSG_GROUP_LIST => parse_group_loot_method(body).into_iter().collect(),
         SMSG_GROUP_UNINVITE | SMSG_GROUP_DESTROYED => {
             vec![ProtocolObservation::GroupLootMethod(None)]
@@ -477,6 +512,38 @@ pub(super) fn maintenance_observations(opcode: u32, body: &[u8]) -> Vec<Protocol
         SMSG_PARTYKILLLOG => parse_creature_killed(body).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn parse_initial_world_states(body: &[u8]) -> Option<ProtocolObservation> {
+    let map_id = i32::from_le_bytes(body.get(0..4)?.try_into().ok()?) as u32;
+    let zone_id = i32::from_le_bytes(body.get(4..8)?.try_into().ok()?) as u32;
+    let area_id = i32::from_le_bytes(body.get(8..12)?.try_into().ok()?) as u32;
+    let count = u16::from_le_bytes(body.get(12..14)?.try_into().ok()?) as usize;
+    if count > 4096 || body.len() < 14 + count * 8 {
+        return None;
+    }
+    let states = (0..count)
+        .map(|index| {
+            let offset = 14 + index * 8;
+            let variable =
+                i32::from_le_bytes(body.get(offset..offset + 4)?.try_into().ok()?) as u32;
+            let value = i32::from_le_bytes(body.get(offset + 4..offset + 8)?.try_into().ok()?);
+            Some((variable, value))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ProtocolObservation::BattlegroundWorldStatesInitialized {
+        map_id,
+        zone_id,
+        area_id,
+        states,
+    })
+}
+
+fn parse_world_state_update(body: &[u8]) -> Option<ProtocolObservation> {
+    Some(ProtocolObservation::BattlegroundWorldStateUpdated {
+        variable: i32::from_le_bytes(body.get(0..4)?.try_into().ok()?) as u32,
+        value: i32::from_le_bytes(body.get(4..8)?.try_into().ok()?),
+    })
 }
 
 fn parse_group_loot_method(body: &[u8]) -> Option<ProtocolObservation> {

@@ -242,6 +242,7 @@ fn choice_is_grounded(command: &GameplayCommand, state: &ControllerStateView) ->
         | GameplayCommand::BattlegroundStatus
         | GameplayCommand::BattlegroundPort { .. }
         | GameplayCommand::BattlegroundLeave { .. }
+        | GameplayCommand::LootRollVote { .. }
         | GameplayCommand::Chat { .. }
         | GameplayCommand::Raw { .. } => return true,
     };

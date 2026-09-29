@@ -654,6 +654,22 @@ pub fn reduce(state: &mut AuthoritativeState, observation: ProtocolObservation) 
             }
             delta.changed.push("battleground".into());
         }
+        ProtocolObservation::BattlegroundWorldStatesInitialized {
+            map_id,
+            zone_id,
+            area_id,
+            states,
+        } => {
+            state.battleground.map_id = Some(map_id);
+            state.battleground.zone_id = Some(zone_id);
+            state.battleground.area_id = Some(area_id);
+            state.battleground.world_states = states.into_iter().collect();
+            delta.changed.push("battleground".into());
+        }
+        ProtocolObservation::BattlegroundWorldStateUpdated { variable, value } => {
+            state.battleground.world_states.insert(variable, value);
+            delta.changed.push("battleground".into());
+        }
         ProtocolObservation::Desync { reason } => {
             state.desync.suspect = true;
             state.desync.reasons.push(reason);

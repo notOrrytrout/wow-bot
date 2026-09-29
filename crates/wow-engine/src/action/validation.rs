@@ -9,6 +9,8 @@ pub struct ValidationContext {
     pub permissions: PermissionSet,
     pub bank_keep_item_ids: Vec<u32>,
     pub auto_professions_enabled: bool,
+    pub battleground_pvp_authorized: bool,
+    pub fresh_group_loot_rolls: Vec<(EntityId, u32)>,
 }
 
 pub struct ActionValidator;
@@ -90,7 +92,12 @@ impl ActionValidator {
             );
         }
 
-        if let Err(outcome) = validate_command(snapshot, &action.command) {
+        if let Err(outcome) = validate_command_with_battleground(
+            snapshot,
+            &action.command,
+            context.battleground_pvp_authorized,
+            &context.fresh_group_loot_rolls,
+        ) {
             return outcome;
         }
         if let Err(outcome) =
@@ -134,8 +141,18 @@ fn validate_command(
     snapshot: &Snapshot,
     command: &GameplayCommand,
 ) -> Result<(), ValidationOutcome> {
-    validate_spatial_command(snapshot, command)?;
+    validate_command_with_battleground(snapshot, command, false, &[])
+}
+
+fn validate_command_with_battleground(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+    battleground_pvp_authorized: bool,
+    fresh_group_loot_rolls: &[(EntityId, u32)],
+) -> Result<(), ValidationOutcome> {
+    validate_spatial_command(snapshot, command, battleground_pvp_authorized)?;
     validate_battleground_command(snapshot, command)?;
+    validate_group_loot_command(snapshot, command, fresh_group_loot_rolls)?;
     validate_quest_command(snapshot, command)?;
     validate_economy_command(snapshot, command)
 }
@@ -182,6 +199,40 @@ fn validate_battleground_command(
     Ok(())
 }
 
+fn validate_group_loot_command(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+    fresh_rolls: &[(EntityId, u32)],
+) -> Result<(), ValidationOutcome> {
+    let GameplayCommand::LootRollVote {
+        item,
+        item_slot,
+        choice,
+    } = command
+    else {
+        return Ok(());
+    };
+    let choice = choice.wire_value();
+    let method_allows_roll = matches!(
+        snapshot.state.group.loot_method,
+        Some(
+            wow_state::group::GroupLootMethod::GroupLoot
+                | wow_state::group::GroupLootMethod::NeedBeforeGreed
+        )
+    );
+    let request_allows_vote = snapshot.state.group.loot_rolls.iter().any(|request| {
+        request.item == *item && request.item_slot == *item_slot && request.allows(choice)
+    });
+    if !method_allows_roll || !request_allows_vote || !fresh_rolls.contains(&(*item, *item_slot)) {
+        return Err(reject(
+            "group_loot_roll_state",
+            "vote does not match a fresh, active server roll request",
+            true,
+        ));
+    }
+    Ok(())
+}
+
 fn has_unique_nearby_trusted_mailbox(snapshot: &Snapshot, mailbox: EntityId) -> bool {
     let Some(player) = snapshot
         .state
@@ -207,6 +258,7 @@ fn has_unique_nearby_trusted_mailbox(snapshot: &Snapshot, mailbox: EntityId) -> 
 fn validate_spatial_command(
     snapshot: &Snapshot,
     command: &GameplayCommand,
+    battleground_pvp_authorized: bool,
 ) -> Result<(), ValidationOutcome> {
     match command {
         GameplayCommand::MoveTo(point) if !point.is_finite() => {
@@ -223,7 +275,9 @@ fn validate_spatial_command(
                 false,
             ));
         }
-        GameplayCommand::Attack(entity) if !attack_authorized(snapshot, *entity) => {
+        GameplayCommand::Attack(entity)
+            if !attack_authorized(snapshot, *entity, battleground_pvp_authorized) =>
+        {
             return Err(reject(
                 "combat_authority",
                 "target is not an authoritative hostile, active quest target, or engaged survival attacker",
@@ -246,7 +300,7 @@ fn validate_spatial_command(
                     true,
                 ));
             }
-            if !attack_authorized(snapshot, *target) {
+            if !attack_authorized(snapshot, *target, battleground_pvp_authorized) {
                 return Err(reject(
                     "combat_authority",
                     "target is not authorized for pet attack",
@@ -283,7 +337,18 @@ fn validate_spatial_command(
                 "unknown_entity",
                 "spell target is not authoritative",
             )?;
+            if let Some(target) = target {
+                validate_hostile_player_spell_target(
+                    snapshot,
+                    *target,
+                    battleground_pvp_authorized,
+                )?;
+            }
         }
+        GameplayCommand::VehicleCast {
+            target: Some(target),
+            ..
+        } => validate_hostile_player_spell_target(snapshot, *target, battleground_pvp_authorized)?,
         GameplayCommand::CastOnItem { spell, item_guid } => {
             if snapshot.state.capabilities.class_id != Some(7)
                 || !snapshot.state.capabilities.spells.contains(spell)
@@ -1084,17 +1149,53 @@ fn is_nearby_class_trainer(snapshot: &Snapshot, trainer: EntityId) -> bool {
         && position.point.distance(player_position.point) <= 5.0
 }
 
-fn attack_authorized(snapshot: &Snapshot, target: EntityId) -> bool {
+fn attack_authorized(
+    snapshot: &Snapshot,
+    target: EntityId,
+    battleground_pvp_authorized: bool,
+) -> bool {
     snapshot
         .state
         .entities
         .0
         .get(&target)
         .is_some_and(|entity| {
-            entity.hostile
-                || active_quest_authorizes_attack(snapshot, entity.entry)
-                || wow_policy::combat::engagement::is_attacking_player_or_group(snapshot, target)
+            let engaged =
+                wow_policy::combat::engagement::is_attacking_player_or_group(snapshot, target);
+            if entity.kind == wow_state::entities::EntityKind::Player {
+                return engaged
+                    || (battleground_pvp_authorized
+                        && entity.hostile
+                        && snapshot.state.position.player.is_some_and(|position| {
+                            wow_policy::battleground::is_wotlk_battleground_map(position.map)
+                        }));
+            }
+            entity.hostile || active_quest_authorizes_attack(snapshot, entity.entry) || engaged
         })
+}
+
+fn validate_hostile_player_spell_target(
+    snapshot: &Snapshot,
+    target: EntityId,
+    battleground_pvp_authorized: bool,
+) -> Result<(), ValidationOutcome> {
+    if snapshot
+        .state
+        .entities
+        .0
+        .get(&target)
+        .is_some_and(|entity| {
+            entity.kind == wow_state::entities::EntityKind::Player && entity.hostile
+        })
+        && !attack_authorized(snapshot, target, battleground_pvp_authorized)
+    {
+        return Err(reject(
+            "combat_authority",
+            "hostile player spell target is not authorized for battleground combat",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn send(action: ProposedAction) -> ValidationOutcome {
@@ -1161,6 +1262,7 @@ fn required_permission(command: &GameplayCommand) -> PermissionSet {
         | GameplayCommand::BattlegroundStatus
         | GameplayCommand::BattlegroundPort { .. }
         | GameplayCommand::BattlegroundLeave { .. } => PermissionSet::GROUP,
+        GameplayCommand::LootRollVote { .. } => PermissionSet::GROUP,
         GameplayCommand::Chat { .. } => PermissionSet::CHAT,
         GameplayCommand::Raw { .. } => PermissionSet::SERVER_COMMAND,
         GameplayCommand::Interact(_)
@@ -1195,6 +1297,7 @@ fn origin_authorized(origin: PlanOrigin, command: &GameplayCommand) -> bool {
             | GameplayCommand::BattlegroundStatus
             | GameplayCommand::BattlegroundPort { .. }
             | GameplayCommand::BattlegroundLeave { .. }
+            | GameplayCommand::LootRollVote { .. }
             | GameplayCommand::PetAttack { .. }
     ) && !matches!(origin, PlanOrigin::SystemPolicy | PlanOrigin::Operator)
     {
@@ -1440,6 +1543,134 @@ mod tests {
     }
 
     #[test]
+    fn proactive_player_attacks_require_authorized_battleground_context() {
+        let mut state = AuthoritativeState::default();
+        state.revision = StateRevision(7);
+        state.session.in_world = true;
+        state.position.player = Some(WorldPosition {
+            map: 489,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        state.entities.0.insert(
+            EntityId(44),
+            EntityState {
+                id: EntityId(44),
+                kind: EntityKind::Player,
+                hostile: true,
+                position: Some(WorldPosition {
+                    map: 489,
+                    point: Vec3::new(2.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                ..EntityState::default()
+            },
+        );
+        let snapshot = Snapshot::from_state(&state);
+        let action = ProposedAction {
+            id: ActionId(1),
+            task: TaskId(1),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: base_stamp(),
+            command: GameplayCommand::Attack(EntityId(44)),
+        };
+        let context = |battleground_pvp_authorized| ValidationContext {
+            current: base_stamp(),
+            stage: ActivationStage::Act,
+            bank_keep_item_ids: Vec::new(),
+            auto_professions_enabled: true,
+            battleground_pvp_authorized,
+            fresh_group_loot_rolls: Vec::new(),
+            permissions: PermissionSet::COMBAT,
+        };
+        assert!(matches!(
+            ActionValidator::validate(&snapshot, context(false), action.clone()),
+            ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "combat_authority"
+        ));
+        assert!(matches!(
+            ActionValidator::validate(&snapshot, context(true), action.clone()),
+            ValidationOutcome::Sendable(_)
+        ));
+
+        let mut arena = state;
+        arena.position.player.as_mut().unwrap().map = 559;
+        arena
+            .entities
+            .0
+            .get_mut(&EntityId(44))
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap()
+            .map = 559;
+        assert!(matches!(
+            ActionValidator::validate(&Snapshot::from_state(&arena), context(true), action),
+            ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "combat_authority"
+        ));
+    }
+
+    #[test]
+    fn group_loot_vote_requires_a_fresh_server_request_and_allowed_choice() {
+        let mut state = AuthoritativeState::default();
+        state.revision = StateRevision(7);
+        state.session.in_world = true;
+        state.group.loot_method = Some(wow_state::group::GroupLootMethod::NeedBeforeGreed);
+        state
+            .group
+            .loot_rolls
+            .push(wow_state::group::GroupLootRollRequest {
+                item: EntityId(77),
+                map_id: 571,
+                item_slot: 2,
+                item_id: 123,
+                item_count: 1,
+                countdown_ms: 30_000,
+                vote_mask: 0b1001,
+            });
+        let snapshot = Snapshot::from_state(&state);
+        let action = ProposedAction {
+            id: ActionId(1),
+            task: TaskId(1),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: base_stamp(),
+            command: GameplayCommand::LootRollVote {
+                item: EntityId(77),
+                item_slot: 2,
+                choice: LootRollChoice::Pass,
+            },
+        };
+        let context = |fresh_group_loot_rolls| ValidationContext {
+            current: base_stamp(),
+            stage: ActivationStage::Act,
+            bank_keep_item_ids: Vec::new(),
+            auto_professions_enabled: true,
+            battleground_pvp_authorized: false,
+            fresh_group_loot_rolls,
+            permissions: PermissionSet::GROUP,
+        };
+        assert!(matches!(
+            ActionValidator::validate(&snapshot, context(vec![(EntityId(77), 2)]), action.clone()),
+            ValidationOutcome::Sendable(_)
+        ));
+        assert!(matches!(
+            ActionValidator::validate(&snapshot, context(Vec::new()), action.clone()),
+            ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "group_loot_roll_state"
+        ));
+        let invalid_choice = ProposedAction {
+            command: GameplayCommand::LootRollVote {
+                item: EntityId(77),
+                item_slot: 2,
+                choice: LootRollChoice::Need,
+            },
+            ..action
+        };
+        assert!(matches!(
+            ActionValidator::validate(&snapshot, context(vec![(EntityId(77), 2)]), invalid_choice),
+            ValidationOutcome::Rejected(ActionFailure { code, .. }) if code == "group_loot_roll_state"
+        ));
+    }
+
+    #[test]
     fn battleground_commands_require_group_permission_and_system_policy_origin() {
         assert_eq!(
             required_permission(&GameplayCommand::BattlegroundJoinRandom),
@@ -1583,6 +1814,8 @@ mod tests {
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
                 auto_professions_enabled: true,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
                 permissions: PermissionSet::ALL,
             },
             action,
@@ -1611,6 +1844,8 @@ mod tests {
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
                 auto_professions_enabled: true,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
                 permissions: PermissionSet::ALL,
             },
             action,
@@ -1800,6 +2035,8 @@ mod tests {
                 permissions: PermissionSet::MAINTENANCE,
                 bank_keep_item_ids: vec![2589],
                 auto_professions_enabled: true,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
             },
             action,
         );
@@ -1832,6 +2069,8 @@ mod tests {
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
                 auto_professions_enabled: true,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
                 permissions: PermissionSet::ECONOMY,
             },
             action.clone(),
@@ -1848,6 +2087,8 @@ mod tests {
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
                 auto_professions_enabled: true,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
                 permissions: PermissionSet::ECONOMY | PermissionSet::ASSET_TRANSFER,
             },
             action,
@@ -2003,6 +2244,8 @@ mod tests {
                 permissions: PermissionSet::MAINTENANCE,
                 bank_keep_item_ids: Vec::new(),
                 auto_professions_enabled: false,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
             },
             action,
         );
@@ -2072,6 +2315,8 @@ mod tests {
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
                 auto_professions_enabled: true,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
                 permissions: PermissionSet::MAINTENANCE,
             },
             action,
@@ -2108,6 +2353,8 @@ mod tests {
                     stage: ActivationStage::Act,
                     bank_keep_item_ids: Vec::new(),
                     auto_professions_enabled: true,
+                    battleground_pvp_authorized: false,
+                    fresh_group_loot_rolls: Vec::new(),
                     permissions: PermissionSet::ALL,
                 },
                 ProposedAction {
@@ -2380,6 +2627,8 @@ mod tests {
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
                 auto_professions_enabled: true,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
                 permissions: PermissionSet::empty(),
             },
             action,
@@ -2449,6 +2698,8 @@ mod tests {
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
                 auto_professions_enabled: true,
+                battleground_pvp_authorized: false,
+                fresh_group_loot_rolls: Vec::new(),
                 permissions: PermissionSet::ALL,
             },
             action,
@@ -2489,6 +2740,8 @@ mod tests {
             stage: ActivationStage::Act,
             bank_keep_item_ids: Vec::new(),
             auto_professions_enabled: true,
+            battleground_pvp_authorized: false,
+            fresh_group_loot_rolls: Vec::new(),
             permissions: PermissionSet::MOVE,
         };
         assert!(matches!(
@@ -2499,6 +2752,8 @@ mod tests {
                     stage: ActivationStage::Act,
                     bank_keep_item_ids: Vec::new(),
                     auto_professions_enabled: true,
+                    battleground_pvp_authorized: false,
+                    fresh_group_loot_rolls: Vec::new(),
                     permissions: PermissionSet::MOVE,
                 },
                 system_action,

@@ -25,7 +25,13 @@
         "bank_keep_item_ids": []
       },
       "group": {
-        "threat_delay_ms": 1500
+        "threat_delay_ms": 1500,
+        "loot": {
+          "need_usable_upgrades": false,
+          "greed_non_upgrades": false,
+          "disenchant_non_upgrades": false,
+          "max_need_quality": 4
+        }
       }
     }
   },

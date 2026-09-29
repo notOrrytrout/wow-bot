@@ -394,6 +394,12 @@ mount_min_travel_yards = 80
 
 [runtime_tuning.group]
 threat_delay_ms = 4200
+
+[runtime_tuning.group.loot]
+need_usable_upgrades = true
+greed_non_upgrades = true
+disenchant_non_upgrades = false
+max_need_quality = 3
 "#,
         )
         .unwrap();
@@ -441,6 +447,27 @@ character = "Test Character"
         );
         assert!(config.runtime.runtime_tuning.maintenance.auto_mount_enabled);
         assert_eq!(config.runtime.runtime_tuning.group.threat_delay_ms(), 4_200);
+        assert!(
+            config
+                .runtime
+                .runtime_tuning
+                .group
+                .loot
+                .need_usable_upgrades
+        );
+        assert!(config.runtime.runtime_tuning.group.loot.greed_non_upgrades);
+        assert!(
+            !config
+                .runtime
+                .runtime_tuning
+                .group
+                .loot
+                .disenchant_non_upgrades
+        );
+        assert_eq!(
+            config.runtime.runtime_tuning.group.loot.max_need_quality(),
+            3
+        );
         assert_eq!(
             config
                 .runtime

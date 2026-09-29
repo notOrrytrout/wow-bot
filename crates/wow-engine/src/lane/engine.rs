@@ -556,6 +556,8 @@ pub struct LaneEngine {
     battleground_queue_retry_after: Option<Instant>,
     battleground_port_retry_after: Option<Instant>,
     battleground_exit_retry_after: Option<Instant>,
+    group_loot_roll_observed_at: BTreeMap<EntityId, Instant>,
+    group_loot_votes_sent: std::collections::BTreeSet<EntityId>,
     last_recovery_action: Option<Instant>,
     last_logged_player_life_status: Option<PlayerLifeStatus>,
     corpse_reclaim_attempts: u8,
@@ -656,6 +658,8 @@ impl LaneEngine {
             battleground_queue_retry_after: None,
             battleground_port_retry_after: None,
             battleground_exit_retry_after: None,
+            group_loot_roll_observed_at: BTreeMap::new(),
+            group_loot_votes_sent: std::collections::BTreeSet::new(),
             last_recovery_action: None,
             last_logged_player_life_status: None,
             corpse_reclaim_attempts: 0,
@@ -971,6 +975,26 @@ impl LaneEngine {
                     ProtocolObservation::EquippedItems {
                         items: Some(items), ..
                     } => items.values().copied().collect(),
+                    ProtocolObservation::GroupLootRollStarted(request) => {
+                        wow_policy::questing::rewards::missing_score_metadata(
+                            &Snapshot::from_state(&self.state.authoritative),
+                            &[request.item_id],
+                        )
+                    }
+                    ProtocolObservation::ItemTemplate { item, .. }
+                        if self
+                            .state
+                            .authoritative
+                            .group
+                            .loot_rolls
+                            .iter()
+                            .any(|request| request.item_id == *item) =>
+                    {
+                        wow_policy::questing::rewards::missing_score_metadata(
+                            &Snapshot::from_state(&self.state.authoritative),
+                            &[*item],
+                        )
+                    }
                     _ => Vec::new(),
                 };
                 if !item_templates_to_query.is_empty() {
@@ -1314,7 +1338,28 @@ impl LaneEngine {
                     .character_guid
                     .and_then(|guid| self.state.authoritative.entities.0.get(&EntityId(guid)))
                     .and_then(|player| player.level);
+                let group_roll_started = match &o {
+                    ProtocolObservation::GroupLootRollStarted(request) => Some(request.item),
+                    _ => None,
+                };
                 let delta = reduce(&mut self.state.authoritative, o);
+                let active_roll_items: std::collections::BTreeSet<_> = self
+                    .state
+                    .authoritative
+                    .group
+                    .loot_rolls
+                    .iter()
+                    .map(|request| request.item)
+                    .collect();
+                self.group_loot_roll_observed_at
+                    .retain(|item, _| active_roll_items.contains(item));
+                self.group_loot_votes_sent
+                    .retain(|item| active_roll_items.contains(item));
+                if let Some(item) = group_roll_started {
+                    self.group_loot_roll_observed_at
+                        .insert(item, Instant::now());
+                    self.group_loot_votes_sent.remove(&item);
+                }
                 if let Some(id) = updated_entity
                     && let Some(entity) = self.state.authoritative.entities.0.get(&id)
                     && entity.kind == wow_state::entities::EntityKind::Unit
@@ -1693,6 +1738,9 @@ impl LaneEngine {
             return false;
         }
         if self.pending_dismount.is_some() {
+            return true;
+        }
+        if self.tick_group_loot_rolls().await {
             return true;
         }
         if let MissionIntent::Battleground { battleground } = self.state.mission.intent.clone() {
@@ -2274,8 +2322,7 @@ impl LaneEngine {
                             .propose_command(GameplayCommand::BattlegroundStatus, false)
                             .await;
                     }
-                    self.waiting("battleground match is active; objective and combat observations are not yet available".into());
-                    return true;
+                    return self.tick_battleground_combat().await;
                 }
                 Status::WaitLeave => {
                     let Some(type_id) = queue.battleground_type_id else {
@@ -2303,6 +2350,18 @@ impl LaneEngine {
                 Status::None => {}
                 Status::Unknown(_) => unreachable!(),
             }
+        }
+
+        if self
+            .state
+            .authoritative
+            .position
+            .player
+            .is_some_and(|position| {
+                wow_policy::battleground::is_wotlk_battleground_map(position.map)
+            })
+        {
+            return self.tick_battleground_combat().await;
         }
 
         if self.battleground_status_requested_at.is_none()
@@ -2347,6 +2406,192 @@ impl LaneEngine {
         self.battleground_queue_retry_after = None;
         self.battleground_port_retry_after = None;
         self.battleground_exit_retry_after = None;
+    }
+
+    fn fresh_group_loot_rolls(&self, now: Instant) -> Vec<(EntityId, u32)> {
+        self.state
+            .authoritative
+            .group
+            .loot_rolls
+            .iter()
+            .filter_map(|request| {
+                let observed_at = self.group_loot_roll_observed_at.get(&request.item)?;
+                (request.countdown_ms > 0
+                    && now.saturating_duration_since(*observed_at)
+                        < Duration::from_millis(u64::from(request.countdown_ms)))
+                .then_some((request.item, request.item_slot))
+            })
+            .collect()
+    }
+
+    async fn tick_group_loot_rolls(&mut self) -> bool {
+        use wow_policy::economy::loot::{
+            GroupLootMethod, GroupLootPolicy, LootEligibility, LootRollChoices, LootRollRequest,
+            LootRollVote,
+        };
+        use wow_state::group::GroupLootMethod as ObservedMethod;
+
+        if !matches!(
+            self.state.mission.intent,
+            MissionIntent::Party { .. } | MissionIntent::Raid { .. }
+        ) || !self
+            .state
+            .mission
+            .permissions
+            .contains(PermissionSet::GROUP)
+        {
+            return false;
+        }
+        let Some(method) = self
+            .state
+            .authoritative
+            .group
+            .loot_method
+            .map(|method| match method {
+                ObservedMethod::FreeForAll => GroupLootMethod::FreeForAll,
+                ObservedMethod::RoundRobin => GroupLootMethod::RoundRobin,
+                ObservedMethod::MasterLoot => GroupLootMethod::MasterLoot,
+                ObservedMethod::GroupLoot => GroupLootMethod::GroupLoot,
+                ObservedMethod::NeedBeforeGreed => GroupLootMethod::NeedBeforeGreed,
+                ObservedMethod::Unknown(_) => GroupLootMethod::Unknown,
+            })
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        let requests = self.state.authoritative.group.loot_rolls.clone();
+        for request in &requests {
+            if self.group_loot_votes_sent.contains(&request.item) {
+                continue;
+            }
+            let Some(observed_at) = self.group_loot_roll_observed_at.get(&request.item).copied()
+            else {
+                continue;
+            };
+            let elapsed = now.saturating_duration_since(observed_at).as_millis() as u64;
+            if elapsed >= u64::from(request.countdown_ms) || request.countdown_ms == 0 {
+                continue;
+            }
+            let policy_request = LootRollRequest {
+                item: request.item,
+                item_id: request.item_id,
+                expires_at_ms: u64::from(request.countdown_ms),
+                choices: LootRollChoices {
+                    pass: request.allows(0),
+                    need: request.allows(1),
+                    greed: request.allows(2),
+                    disenchant: request.allows(3),
+                },
+            };
+            let quality = self
+                .state
+                .authoritative
+                .inventory
+                .item_metadata
+                .get(&request.item_id)
+                .map(|metadata| metadata.quality);
+            let loot_tuning = &self.runtime_tuning.group.loot;
+            let loot_policy = GroupLootPolicy {
+                need_usable_upgrades: loot_tuning.need_usable_upgrades,
+                greed_non_upgrades: loot_tuning.greed_non_upgrades,
+                disenchant_non_upgrades: loot_tuning.disenchant_non_upgrades,
+                max_need_quality: loot_tuning.max_need_quality(),
+            };
+            let usable_upgrade = wow_policy::gear::usable_equipment_upgrade(
+                &Snapshot::from_state(&self.state.authoritative),
+                request.item_id,
+            );
+            let Some(vote) = wow_policy::economy::loot::group_loot_vote(
+                method,
+                Some(&policy_request),
+                elapsed,
+                LootEligibility::Eligible,
+                usable_upgrade,
+                quality,
+                loot_policy,
+            ) else {
+                continue;
+            };
+            let choice = match vote {
+                LootRollVote::Pass => LootRollChoice::Pass,
+                LootRollVote::Need => LootRollChoice::Need,
+                LootRollVote::Greed => LootRollChoice::Greed,
+                LootRollVote::Disenchant => LootRollChoice::Disenchant,
+            };
+            let command = GameplayCommand::LootRollVote {
+                item: request.item,
+                item_slot: request.item_slot,
+                choice,
+            };
+            self.last_dispatch = DispatchOutcome::Rejected;
+            if !self.propose_command(command, false).await {
+                return false;
+            }
+            if self.last_dispatch == DispatchOutcome::Sent {
+                self.group_loot_votes_sent.insert(request.item);
+                tracing::info!(lane=?self.state.lane, item_id=request.item_id, item_slot=request.item_slot, ?choice, "submitted a conservative vote for a fresh server loot roll");
+                return true;
+            }
+        }
+        false
+    }
+
+    fn battleground_pvp_authorized(&self) -> bool {
+        matches!(
+            &self.state.mission.intent,
+            MissionIntent::Battleground { .. }
+        ) && self
+            .state
+            .mission
+            .permissions
+            .contains(PermissionSet::COMBAT)
+    }
+
+    async fn tick_battleground_combat(&mut self) -> bool {
+        let snapshot = Snapshot::from_state(&self.state.authoritative);
+        if !self.battleground_pvp_authorized()
+            || self.player_life_status() != PlayerLifeStatus::Alive
+        {
+            self.waiting(
+                "battleground combat is waiting for mission authority and a living player".into(),
+            );
+            return true;
+        }
+        let Some(target) =
+            wow_policy::battleground::combat::select_hostile_player_target(&snapshot)
+        else {
+            self.waiting("battleground match is active; waiting for an observed hostile player on this battleground map".into());
+            return true;
+        };
+        let selected = match wow_policy::combat::selector::select_action(&snapshot, target) {
+            Ok(selected) => selected,
+            Err(reason) => {
+                self.waiting(format!(
+                    "battleground combat against {target} deferred: {reason}"
+                ));
+                return true;
+            }
+        };
+        let pending = self.combat_pending(target, selected.cycle);
+        self.last_dispatch = DispatchOutcome::Rejected;
+        if !self.propose_command(selected.command, false).await {
+            return false;
+        }
+        match self.last_dispatch {
+            DispatchOutcome::Sent => self.pending_quest_action = Some(pending),
+            DispatchOutcome::DeferredMovement => {
+                if let Some(movement) = self.pending_movement.as_mut() {
+                    movement.resume_pending = Some(pending);
+                }
+            }
+            DispatchOutcome::DeferredDismount => {
+                if let Some(dismount) = self.pending_dismount.as_mut() {
+                    dismount.quest_action = Some(pending);
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     async fn tick_goal(&mut self, text: &str) -> bool {
@@ -7045,6 +7290,8 @@ impl LaneEngine {
             self.state.mission.permissions,
             &self.runtime_tuning.maintenance.bank_keep_item_ids,
             self.runtime_tuning.maintenance.auto_professions_enabled,
+            self.battleground_pvp_authorized(),
+            &self.fresh_group_loot_rolls(Instant::now()),
             action,
         ) {
             ValidationOutcome::Sendable(action) => {
@@ -7136,6 +7383,8 @@ impl LaneEngine {
             self.state.mission.permissions,
             &self.runtime_tuning.maintenance.bank_keep_item_ids,
             self.runtime_tuning.maintenance.auto_professions_enabled,
+            self.battleground_pvp_authorized(),
+            &self.fresh_group_loot_rolls(Instant::now()),
             face,
         ) {
             ValidationOutcome::Sendable(face) => {
@@ -10592,6 +10841,267 @@ mod tests {
             panic!("expected random queue request")
         };
         assert_eq!(action.command(), &GameplayCommand::BattlegroundJoinRandom);
+    }
+
+    #[tokio::test]
+    async fn active_battleground_mission_dispatches_only_to_observed_hostile_players() {
+        use wow_state::{battleground::BattlegroundQueueStatus, entities::EntityKind};
+
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.capabilities.class_id = Some(1);
+        authoritative.capabilities.specialization_tree = Some(0);
+        authoritative.position.player = Some(WorldPosition {
+            map: 489,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        });
+        authoritative.entities.0.insert(
+            EntityId(1),
+            wow_state::entities::EntityState {
+                id: EntityId(1),
+                kind: EntityKind::Player,
+                health: Some((100, 100)),
+                power_type: Some(1),
+                power: Some((20, 100)),
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            EntityId(2),
+            wow_state::entities::EntityState {
+                id: EntityId(2),
+                kind: EntityKind::Player,
+                hostile: true,
+                health: Some((100, 100)),
+                position: Some(WorldPosition {
+                    map: 489,
+                    point: Vec3::new(4.0, 0.0, 0.0),
+                    orientation: 0.0,
+                }),
+                ..Default::default()
+            },
+        );
+        authoritative.battleground.queues.insert(
+            0,
+            wow_state::battleground::BattlegroundQueueState {
+                queue_slot: 0,
+                battleground_type_id: Some(2),
+                status: BattlegroundQueueStatus::InProgress,
+                map_id: Some(489),
+                invite_timeout_ms: None,
+                elapsed_time_ms: Some(10_000),
+                auto_leave_time_ms: None,
+                team_alliance: Some(true),
+            },
+        );
+        let mission = Mission {
+            id: MissionId(4),
+            intent: MissionIntent::Battleground { battleground: None },
+            permissions: PermissionSet::GROUP | PermissionSet::COMBAT,
+        };
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+        engine.battleground_status_retry_after = Some(Instant::now() + Duration::from_secs(20));
+
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = proxy.try_recv().unwrap_or_else(|error| {
+            panic!(
+                "expected a combat action; reason={:?}, dispatch={:?}, error={error:?}",
+                engine.last_wait_reason, engine.last_dispatch
+            )
+        }) else {
+            panic!("expected battleground combat action")
+        };
+        assert!(matches!(
+            action.command(),
+            GameplayCommand::Attack(EntityId(2))
+                | GameplayCommand::Cast {
+                    target: Some(EntityId(2)),
+                    ..
+                }
+        ));
+    }
+
+    #[tokio::test]
+    async fn group_mission_passes_a_fresh_allowed_loot_roll_once() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.group.loot_method = Some(wow_state::group::GroupLootMethod::NeedBeforeGreed);
+        let mission = Mission {
+            id: MissionId(5),
+            intent: MissionIntent::Party {
+                role: wow_domain::GroupRole::Auto,
+            },
+            permissions: PermissionSet::GROUP | PermissionSet::COMBAT | PermissionSet::LOOT,
+        };
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+        let request = wow_state::group::GroupLootRollRequest {
+            item: EntityId(700),
+            map_id: 571,
+            item_slot: 2,
+            item_id: 1234,
+            item_count: 1,
+            countdown_ms: 30_000,
+            vote_mask: 0b1001,
+        };
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::GroupLootRollStarted(request),
+            ))
+            .await;
+
+        let WorkerToProxy::Action(query) = proxy.try_recv().expect("expected item metadata query")
+        else {
+            panic!("expected a metadata query")
+        };
+        assert_eq!(query.command(), &GameplayCommand::QueryItem { item: 1234 });
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::ItemTemplate {
+                    item: 1234,
+                    metadata: wow_state::inventory::ItemTemplateMetadata {
+                        quality: 2,
+                        ..Default::default()
+                    },
+                },
+            ))
+            .await;
+
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = proxy.try_recv().expect("expected pass vote") else {
+            panic!("expected a loot roll vote")
+        };
+        assert_eq!(
+            action.command(),
+            &GameplayCommand::LootRollVote {
+                item: EntityId(700),
+                item_slot: 2,
+                choice: LootRollChoice::Pass,
+            }
+        );
+        assert!(engine.tick_mission().await);
+        assert!(
+            proxy.try_recv().is_err(),
+            "the same live roll is voted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_mission_does_not_vote_after_the_observed_roll_expires() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.group.loot_method = Some(wow_state::group::GroupLootMethod::NeedBeforeGreed);
+        authoritative
+            .group
+            .loot_rolls
+            .push(wow_state::group::GroupLootRollRequest {
+                item: EntityId(701),
+                map_id: 571,
+                item_slot: 2,
+                item_id: 1235,
+                item_count: 1,
+                countdown_ms: 100,
+                vote_mask: 0b1001,
+            });
+        let mission = Mission {
+            id: MissionId(5),
+            intent: MissionIntent::Party {
+                role: wow_domain::GroupRole::Auto,
+            },
+            permissions: PermissionSet::GROUP | PermissionSet::COMBAT | PermissionSet::LOOT,
+        };
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+        engine
+            .group_loot_roll_observed_at
+            .insert(EntityId(701), Instant::now() - Duration::from_millis(101));
+
+        assert!(engine.tick_mission().await);
+        assert!(proxy.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn configured_group_loot_needs_only_a_proven_usable_upgrade() {
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(1);
+        authoritative.capabilities.class_id = Some(1);
+        authoritative.capabilities.specialization_tree = Some(0);
+        authoritative.group.loot_method = Some(wow_state::group::GroupLootMethod::NeedBeforeGreed);
+        authoritative.inventory.equipment_authoritative = true;
+        authoritative.inventory.equipment_slots_authoritative = true;
+        authoritative.inventory.equipped_items.insert(0, 100);
+        authoritative.inventory.item_metadata.insert(
+            100,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 4,
+                subclass: 2,
+                inventory_type: 1,
+                allowable_class: u32::MAX,
+                item_level: 1,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        authoritative.inventory.item_metadata.insert(
+            1234,
+            wow_state::inventory::ItemTemplateMetadata {
+                item_class: 4,
+                subclass: 2,
+                quality: 2,
+                inventory_type: 1,
+                allowable_class: u32::MAX,
+                item_level: 80,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            EntityId(1),
+            wow_state::entities::EntityState {
+                id: EntityId(1),
+                kind: wow_state::entities::EntityKind::Player,
+                level: Some(60),
+                ..Default::default()
+            },
+        );
+        let mission = Mission {
+            id: MissionId(5),
+            intent: MissionIntent::Party {
+                role: wow_domain::GroupRole::Auto,
+            },
+            permissions: PermissionSet::GROUP | PermissionSet::COMBAT | PermissionSet::LOOT,
+        };
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+        engine.runtime_tuning.group.loot.need_usable_upgrades = true;
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::GroupLootRollStarted(wow_state::group::GroupLootRollRequest {
+                    item: EntityId(702),
+                    map_id: 571,
+                    item_slot: 2,
+                    item_id: 1234,
+                    item_count: 1,
+                    countdown_ms: 30_000,
+                    vote_mask: 0b0011,
+                }),
+            ))
+            .await;
+
+        assert!(engine.tick_mission().await);
+        let WorkerToProxy::Action(action) = proxy.try_recv().expect("expected need vote") else {
+            panic!("expected a loot roll vote")
+        };
+        assert_eq!(
+            action.command(),
+            &GameplayCommand::LootRollVote {
+                item: EntityId(702),
+                item_slot: 2,
+                choice: LootRollChoice::Need,
+            }
+        );
     }
 
     #[tokio::test]

@@ -799,6 +799,23 @@ pub(super) fn encode_gameplay_command(
             },
             None,
         ))),
+        GameplayCommand::LootRollVote {
+            item,
+            item_slot,
+            choice,
+        } => {
+            let mut body = Vec::with_capacity(13);
+            body.extend_from_slice(&item.0.to_le_bytes());
+            body.extend_from_slice(&item_slot.to_le_bytes());
+            body.push(choice.wire_value());
+            Ok(Some((
+                ClientFrame {
+                    opcode: 0x02A0,
+                    body,
+                },
+                None,
+            )))
+        }
         GameplayCommand::AcceptQuest { quest, giver } => Ok(Some((
             ClientFrame {
                 opcode: CMSG_QUESTGIVER_ACCEPT_QUEST,
@@ -1634,6 +1651,30 @@ mod movement_clock_tests {
         .unwrap();
         assert_eq!(leave.opcode, 0x02E1);
         assert_eq!(leave.body, [0, 0, 32, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn group_loot_vote_uses_the_verified_wotlk_packet_layout() {
+        let mut clock = MovementClock::default();
+        let item = EntityId(0x1122_3344_5566_7788);
+        let (packet, _) = encode_gameplay_command(
+            GameplayCommand::LootRollVote {
+                item,
+                item_slot: 7,
+                choice: wow_domain::LootRollChoice::Disenchant,
+            },
+            Some(EntityId(1)),
+            None,
+            0,
+            &mut clock,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(packet.opcode, 0x02A0);
+        assert_eq!(packet.body.len(), 13);
+        assert_eq!(&packet.body[..8], &item.0.to_le_bytes());
+        assert_eq!(&packet.body[8..12], &7_u32.to_le_bytes());
+        assert_eq!(packet.body[12], 3);
     }
 
     #[test]

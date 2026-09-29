@@ -9,6 +9,25 @@ pub const MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER: u64 = 1_000;
 pub const MAX_MAINTENANCE_VENDOR_BUY_LOTS: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LootRollChoice {
+    Pass,
+    Need,
+    Greed,
+    Disenchant,
+}
+
+impl LootRollChoice {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Pass => 0,
+            Self::Need => 1,
+            Self::Greed => 2,
+            Self::Disenchant => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PlanOrigin {
     Deterministic,
     SystemPolicy,
@@ -79,6 +98,12 @@ pub enum GameplayCommand {
         enabled: bool,
     },
     Loot(EntityId),
+    /// Submit a vote for a currently observed group loot roll.
+    LootRollVote {
+        item: EntityId,
+        item_slot: u32,
+        choice: LootRollChoice,
+    },
     Gather(EntityId),
     Fish,
     UseItem {

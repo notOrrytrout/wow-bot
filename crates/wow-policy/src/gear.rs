@@ -1,4 +1,5 @@
-use wow_state::inventory::ItemTemplateMetadata;
+use wow_domain::EntityId;
+use wow_state::{Snapshot, inventory::ItemTemplateMetadata};
 
 pub fn score_improves_by_fraction(
     new_score: f32,
@@ -111,6 +112,85 @@ pub fn item_score_with_spec(
         score += dps * weapon_weight(class, spec_tree, metadata.inventory_type);
     }
     score
+}
+
+/// Compare a usable item with its best observed equipment slot.
+/// Missing equipment, class, level, or item-template facts stay unknown.
+pub fn equipment_score_comparison(snapshot: &Snapshot, item_id: u32) -> Option<(f32, f32)> {
+    let inventory = &snapshot.state.inventory;
+    if !inventory.equipment_authoritative || !inventory.equipment_slots_authoritative {
+        return None;
+    }
+    let metadata = inventory.item_metadata.get(&item_id)?;
+    let slots = destination_slots(metadata);
+    if slots.is_empty() {
+        return None;
+    }
+    let class = snapshot.state.capabilities.class_id?;
+    let player = snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|id| snapshot.state.entities.0.get(&id))?;
+    let level = player.level?;
+    if !player_can_use(metadata, class, level.min(255) as u8) {
+        return None;
+    }
+    let new_score = item_score_with_spec(
+        metadata,
+        class,
+        snapshot.state.capabilities.specialization_tree,
+    );
+    let mut current_scores = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let mut current_score = if let Some(equipped_id) = inventory.equipped_items.get(slot) {
+            let equipped = inventory.item_metadata.get(equipped_id)?;
+            item_score_with_spec(
+                equipped,
+                class,
+                snapshot.state.capabilities.specialization_tree,
+            )
+        } else {
+            0.0
+        };
+        if metadata.inventory_type == 17
+            && *slot == 15
+            && let Some(offhand_id) = inventory.equipped_items.get(&16)
+        {
+            let offhand = inventory.item_metadata.get(offhand_id)?;
+            current_score += item_score_with_spec(
+                offhand,
+                class,
+                snapshot.state.capabilities.specialization_tree,
+            );
+        }
+        current_scores.push(current_score);
+    }
+    let current_score = current_scores.into_iter().min_by(f32::total_cmp)?;
+    Some((current_score, new_score))
+}
+
+/// Return whether an observed item is a usable equipment upgrade.
+/// Missing equipment, class, level, or item-template facts stay unknown.
+pub fn usable_equipment_upgrade(snapshot: &Snapshot, item_id: u32) -> Option<bool> {
+    let metadata = snapshot.state.inventory.item_metadata.get(&item_id)?;
+    if destination_slots(metadata).is_empty() {
+        return Some(false);
+    }
+    let class = snapshot.state.capabilities.class_id?;
+    let player = snapshot
+        .state
+        .session
+        .character_guid
+        .map(EntityId)
+        .and_then(|id| snapshot.state.entities.0.get(&id))?;
+    let level = player.level?;
+    if !player_can_use(metadata, class, level.min(255) as u8) {
+        return Some(false);
+    }
+    let (current, new) = equipment_score_comparison(snapshot, item_id)?;
+    Some(score_improves_by_fraction(new, current, 0.01))
 }
 
 fn armor_weight(class: u8, spec_tree: Option<u8>, inventory_type: u32) -> f32 {
@@ -336,6 +416,11 @@ fn spec_stat_weight(class: u8, spec_tree: Option<u8>, stat: i32) -> Option<f32> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wow_domain::EntityId;
+    use wow_state::{
+        AuthoritativeState, Snapshot,
+        entities::{EntityKind, EntityState},
+    };
 
     fn item(inventory_type: u32, item_level: u32, stat: (i32, i32)) -> ItemTemplateMetadata {
         ItemTemplateMetadata {
@@ -366,6 +451,47 @@ mod tests {
         assert!(!score_improves_by_fraction(0.05, 0.0, 0.05));
         assert!(score_improves_by_fraction(0.051, 0.0, 0.05));
         assert!(score_improves_by_fraction(10.01, 10.0, -1.0));
+    }
+
+    #[test]
+    fn loot_upgrade_evidence_requires_authoritative_equipment_and_known_templates() {
+        let mut state = AuthoritativeState::default();
+        state.session.character_guid = Some(1);
+        state.capabilities.class_id = Some(1);
+        state.capabilities.specialization_tree = Some(0);
+        state.inventory.equipment_authoritative = true;
+        state.inventory.equipment_slots_authoritative = true;
+        state.inventory.equipped_items.insert(0, 100);
+        state
+            .inventory
+            .item_metadata
+            .insert(100, item(1, 10, (4, 2)));
+        state
+            .inventory
+            .item_metadata
+            .insert(200, item(1, 80, (4, 20)));
+        state.entities.0.insert(
+            EntityId(1),
+            EntityState {
+                id: EntityId(1),
+                kind: EntityKind::Player,
+                level: Some(60),
+                ..EntityState::default()
+            },
+        );
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(usable_equipment_upgrade(&snapshot, 200), Some(true));
+
+        state.inventory.item_metadata.remove(&100);
+        assert_eq!(
+            usable_equipment_upgrade(&Snapshot::from_state(&state), 200),
+            None
+        );
+        state.inventory.equipment_slots_authoritative = false;
+        assert_eq!(
+            usable_equipment_upgrade(&Snapshot::from_state(&state), 200),
+            None
+        );
     }
 
     #[test]

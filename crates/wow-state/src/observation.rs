@@ -239,6 +239,16 @@ pub enum ProtocolObservation {
     GroupLootMethod(Option<crate::group::GroupLootMethod>),
     GroupLootRollStarted(crate::group::GroupLootRollRequest),
     BattlegroundQueue(crate::battleground::BattlegroundQueueState),
+    BattlegroundWorldStatesInitialized {
+        map_id: u32,
+        zone_id: u32,
+        area_id: u32,
+        states: Vec<(u32, i32)>,
+    },
+    BattlegroundWorldStateUpdated {
+        variable: u32,
+        value: i32,
+    },
     Desync {
         reason: String,
     },

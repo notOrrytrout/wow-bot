@@ -9,4 +9,5 @@
 - [x] Check for an existing queue before joining and use bounded queue, status, port, and exit retries.
 - [x] Accept invitations only with authoritative queue type plus known alive, out-of-combat, on-foot player state.
 - [x] Clean up queued or active battleground state when the mission changes.
-- [x] Defer active match operation until objective and combat context are projected.
+- [x] Run proactive player combat only on supported battleground maps with battleground mission authority.
+- [x] Defer objective actions until authoritative objective state is projected.

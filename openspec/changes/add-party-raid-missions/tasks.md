@@ -54,8 +54,10 @@
 ## 7. Group Loot and Roll Safety
 
 - [x] 7.1a Project server group-loot method and `SMSG_LOOT_START_ROLL` requests into typed authoritative group state; preserve unknown method values and per-request allowed vote masks, and clear requests when the server reports that the group ended.
-- [ ] 7.1 Add server-observed group loot method and live roll-request state to the loot decision path; verify no roll is emitted without a matching active request and eligibility.
-- [ ] 7.2 Implement configurable pass, greed, disenchant, and need decisions using usable-upgrade evidence and operator limits; verify master-loot and need-before-greed fixtures cannot be bypassed.
+- [x] 7.1 Add server-observed group loot method and live roll-request state to the loot decision path; use the request vote mask as server eligibility evidence and verify no roll is emitted without a matching active request.
+- [x] 7.1b Add a typed loot-roll vote command with final method, request freshness, slot, and allowed-choice validation; encode the verified WotLK client packet.
+- [x] 7.1c Vote pass once for fresh supported group rolls when the server allows pass; verify stale requests and duplicate ticks emit no vote.
+- [x] 7.2 Implement opt-in greed, disenchant, and need decisions with authoritative equipment-upgrade evidence, bounded quality, and default-pass behavior; verify unknown item or equipment facts do not authorize non-pass votes.
 - [x] 7.2a Add a shared pure roll-vote policy primitive that requires a caller-supplied active request and explicit eligibility, permits only Group Loot or Need Before Greed, requires known usable-upgrade evidence for need and known non-upgrade evidence for greed or disenchant, and defaults to pass; verify absent requests, unknown eligibility, master loot, disallowed choices, and conservative defaults.
 - [ ] 7.3 Keep direct corpse and object looting behind existing ownership and lootability validation in group missions; verify party pet kills remain lootable only when the server authorizes this player or group.
 
