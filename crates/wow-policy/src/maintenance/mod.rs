@@ -114,6 +114,12 @@ pub enum MaintenanceDecision {
         slot: u32,
         lots: u32,
     },
+    RecoveryVendorBuy {
+        vendor: EntityId,
+        item: u32,
+        slot: u32,
+        lots: u32,
+    },
     TrainerList {
         trainer: EntityId,
     },
@@ -265,6 +271,10 @@ pub fn decide_next_with_nearby_services(
     }
     if class_id == 9
         && let Some(decision) = warlock_stones(snapshot, player, retry_after, now)
+    {
+        return decision;
+    }
+    if let Some(decision) = recovery_supply_restock(snapshot, retry_after, now, nearby_sell_vendor)
     {
         return decision;
     }
@@ -500,23 +510,11 @@ fn mage_food_and_drink(snapshot: &Snapshot) -> Option<(u32, u32)> {
         .filter(|instance| instance.backpack_slot >= 23 && instance.count > 0)
     {
         let item = inventory.item_metadata.get(&instance.item)?;
-        if item.item_class != 0 || item.subclass != 5 || item.use_spell_id == 0 {
-            continue;
-        }
-        let name = item.name.to_ascii_lowercase();
-        let is_drink = name.contains("water")
-            || name.contains("drink")
-            || name.contains("refreshment")
-            || name.contains("strudel");
-        let is_food = name.contains("food")
-            || name.contains("bread")
-            || name.contains("biscuit")
-            || name.contains("strudel")
-            || name.contains("refreshment");
-        if is_food {
+        let kinds = recovery_kinds(item);
+        if kinds.food {
             food = food.saturating_add(instance.count);
         }
-        if is_drink {
+        if kinds.drink {
             drink = drink.saturating_add(instance.count);
         }
     }
@@ -938,6 +936,220 @@ fn poison_count(snapshot: &Snapshot, family: &str) -> u32 {
             .then_some(instance.count)
         })
         .fold(0_u32, u32::saturating_add)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoverySupplyKind {
+    Food,
+    Drink,
+    Bandage,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RecoveryKinds {
+    food: bool,
+    drink: bool,
+    bandage: bool,
+}
+
+fn recovery_kinds(metadata: &wow_state::inventory::ItemTemplateMetadata) -> RecoveryKinds {
+    if metadata.item_class != 0 || metadata.use_spell_id == 0 {
+        return RecoveryKinds::default();
+    }
+    match metadata.subclass {
+        7 => RecoveryKinds {
+            bandage: true,
+            ..Default::default()
+        },
+        5 => {
+            let name = metadata.name.to_ascii_lowercase();
+            let is_drink = name.contains("water")
+                || name.contains("drink")
+                || name.contains("refreshment")
+                || name.contains("strudel");
+            let is_food = name.contains("food")
+                || name.contains("bread")
+                || name.contains("biscuit")
+                || name.contains("jerky")
+                || name.contains("meat")
+                || name.contains("fish")
+                || name.contains("cheese")
+                || name.contains("strudel")
+                || name.contains("refreshment");
+            RecoveryKinds {
+                food: is_food,
+                drink: is_drink,
+                bandage: false,
+            }
+        }
+        _ => RecoveryKinds::default(),
+    }
+}
+
+/// Check shared metadata eligibility for an automatically purchased recovery supply.
+pub fn recovery_supply_item_is_eligible(
+    metadata: &wow_state::inventory::ItemTemplateMetadata,
+    class_id: u8,
+    level: u32,
+) -> bool {
+    let class_allowed = metadata.allowable_class == 0
+        || metadata.allowable_class == u32::MAX
+        || ((1..=32).contains(&class_id) && metadata.allowable_class & (1 << (class_id - 1)) != 0);
+    let kinds = recovery_kinds(metadata);
+    (kinds.food || kinds.drink || kinds.bandage)
+        && metadata.required_level <= level
+        && class_allowed
+}
+
+fn matches_recovery_kind(kind: RecoverySupplyKind, kinds: RecoveryKinds) -> bool {
+    match kind {
+        RecoverySupplyKind::Food => kinds.food,
+        RecoverySupplyKind::Drink => kinds.drink,
+        RecoverySupplyKind::Bandage => kinds.bandage,
+    }
+}
+
+fn recovery_supply_restock(
+    snapshot: &Snapshot,
+    retry_after: &BTreeMap<(u32, EntityId), Instant>,
+    now: Instant,
+    nearby_vendor: Option<EntityId>,
+) -> Option<MaintenanceDecision> {
+    const TARGET_COUNT: u32 = 10;
+    if snapshot.state.capabilities.class_id == Some(8) {
+        return None;
+    }
+    let player = EntityId(snapshot.state.session.character_guid?);
+    let inventory = &snapshot.state.inventory;
+
+    // Unknown backpack templates can hide existing recovery items. Wait until
+    // the inventory facts are complete before treating a category as low.
+    if inventory.instances.values().any(|instance| {
+        instance.count > 0
+            && instance.backpack_slot >= 23
+            && !inventory.item_metadata.contains_key(&instance.item)
+    }) {
+        return None;
+    }
+    let mut counts = [0_u32; 3];
+    for instance in inventory
+        .instances
+        .values()
+        .filter(|instance| instance.count > 0 && instance.backpack_slot >= 23)
+    {
+        if let Some(metadata) = inventory.item_metadata.get(&instance.item) {
+            let kinds = recovery_kinds(metadata);
+            for (index, matches) in [kinds.food, kinds.drink, kinds.bandage]
+                .into_iter()
+                .enumerate()
+            {
+                if matches {
+                    counts[index] = counts[index].saturating_add(instance.count);
+                }
+            }
+        }
+    }
+    let low_kinds: Vec<_> = [
+        RecoverySupplyKind::Food,
+        RecoverySupplyKind::Drink,
+        RecoverySupplyKind::Bandage,
+    ]
+    .into_iter()
+    .enumerate()
+    .filter_map(|(index, kind)| (counts[index] < TARGET_COUNT).then_some((kind, counts[index])))
+    .collect();
+    if low_kinds.is_empty() {
+        return None;
+    }
+    let vendor = nearby_vendor?;
+    let offer_list = inventory
+        .vendor_inventory
+        .as_ref()
+        .filter(|offers| offers.vendor == vendor);
+    if inventory.vendor != Some(vendor) || offer_list.is_none() {
+        if retry_after
+            .get(&(0, vendor))
+            .is_some_and(|deadline| *deadline > now)
+        {
+            return None;
+        }
+        return Some(MaintenanceDecision::VendorList { vendor });
+    }
+    let offer_list = offer_list?;
+    let bandage_evidence = inventory.instances.values().any(|instance| {
+        instance.count > 0
+            && instance.backpack_slot >= 23
+            && inventory
+                .item_metadata
+                .get(&instance.item)
+                .is_some_and(|metadata| recovery_kinds(metadata).bandage)
+    }) || offer_list.offers.iter().any(|offer| {
+        inventory
+            .item_metadata
+            .get(&offer.item)
+            .is_some_and(|metadata| recovery_kinds(metadata).bandage)
+    });
+    if let Some(offer) = offer_list.offers.iter().find(|offer| {
+        offer.extended_cost == 0
+            && offer.buy_count > 0
+            && !inventory.item_metadata.contains_key(&offer.item)
+            && !retry_after
+                .get(&(offer.item, EntityId(0)))
+                .is_some_and(|deadline| *deadline > now)
+    }) {
+        return Some(MaintenanceDecision::QueryItem { item: offer.item });
+    }
+    let spendable = inventory
+        .money
+        .saturating_sub(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER);
+    let level = snapshot
+        .state
+        .entities
+        .0
+        .get(&player)
+        .and_then(|entity| entity.level)
+        .unwrap_or(0);
+    let class = snapshot.state.capabilities.class_id.unwrap_or_default();
+    if retry_after
+        .get(&(u32::MAX, vendor))
+        .is_some_and(|deadline| *deadline > now)
+    {
+        return None;
+    }
+    for (kind, _) in low_kinds {
+        if kind == RecoverySupplyKind::Bandage && !bandage_evidence {
+            continue;
+        }
+        let candidate = offer_list
+            .offers
+            .iter()
+            .filter(|offer| offer.extended_cost == 0 && offer.buy_count > 0)
+            .filter(|offer| offer.stock.is_none_or(|stock| stock >= offer.buy_count))
+            .filter(|offer| u64::from(offer.price_copper) <= spendable)
+            .filter_map(|offer| {
+                let metadata = inventory.item_metadata.get(&offer.item)?;
+                (matches_recovery_kind(kind, recovery_kinds(metadata))
+                    && recovery_supply_item_is_eligible(metadata, class, level))
+                .then_some((
+                    metadata.required_level,
+                    metadata.item_level,
+                    offer.item,
+                    offer,
+                ))
+            })
+            .max_by_key(|(required_level, item_level, item, _)| {
+                (*required_level, *item_level, *item)
+            });
+        if let Some((_, _, item, offer)) = candidate {
+            return Some(MaintenanceDecision::RecoveryVendorBuy {
+                vendor,
+                item,
+                slot: offer.slot,
+                lots: wow_domain::MAX_MAINTENANCE_VENDOR_BUY_LOTS,
+            });
+        }
+    }
+    None
 }
 
 /// Apply the old pet defaults after SMSG_PET_SPELLS confirms a control bar.
@@ -1439,6 +1651,230 @@ mod tests {
                 broken_items: 1,
             }
         ));
+    }
+
+    fn recovery_vendor_state() -> (AuthoritativeState, EntityId) {
+        let vendor = EntityId(55);
+        let mut state = AuthoritativeState::default();
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.capabilities.class_id = Some(1);
+        state.inventory.money = 5_000;
+        state.inventory.vendor = Some(vendor);
+        state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
+            vendor,
+            offers: vec![wow_state::inventory::VendorOffer {
+                slot: 2,
+                item: 117,
+                stock: Some(10),
+                price_copper: 100,
+                buy_count: 5,
+                extended_cost: 0,
+            }],
+        });
+        state.inventory.item_metadata.insert(
+            117,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Tough Jerky".into(),
+                item_class: 0,
+                subclass: 5,
+                use_spell_id: 1,
+                allowable_class: 0,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            EntityId(7),
+            wow_state::entities::EntityState {
+                level: Some(10),
+                ..Default::default()
+            },
+        );
+        (state, vendor)
+    }
+
+    #[test]
+    fn recovery_restock_buys_one_affordable_lot_from_observed_nearby_offer() {
+        let (state, vendor) = recovery_vendor_state();
+        let decision = recovery_supply_restock(
+            &Snapshot::from_state(&state),
+            &BTreeMap::new(),
+            Instant::now(),
+            Some(vendor),
+        );
+        assert_eq!(
+            decision,
+            Some(MaintenanceDecision::RecoveryVendorBuy {
+                vendor,
+                item: 117,
+                slot: 2,
+                lots: 1,
+            })
+        );
+
+        let mut state = state;
+        state.inventory.money = 1_099;
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None,
+            "purchase must preserve the 1,000-copper reserve"
+        );
+    }
+
+    #[test]
+    fn recovery_restock_rejects_unsafe_or_incomplete_vendor_evidence() {
+        let (mut state, vendor) = recovery_vendor_state();
+        let snapshot = Snapshot::from_state(&state);
+        assert_eq!(
+            recovery_supply_restock(&snapshot, &BTreeMap::new(), Instant::now(), None),
+            None,
+            "no vendor means no travel or purchase"
+        );
+
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].stock = Some(4);
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None,
+            "partial stock cannot satisfy one lot"
+        );
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].stock = Some(10);
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].extended_cost = 1;
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None,
+            "extended currency offers are rejected"
+        );
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].extended_cost = 0;
+
+        state.inventory.instances.insert(
+            EntityId(91),
+            wow_state::inventory::InventoryItemInstance {
+                item: 999,
+                guid: EntityId(91),
+                backpack_slot: 23,
+                count: 1,
+            },
+        );
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            None,
+            "unknown backpack metadata blocks purchases"
+        );
+    }
+
+    #[test]
+    fn refreshment_counts_as_both_food_and_drink_for_shared_maintenance() {
+        let mut state = AuthoritativeState::default();
+        state.inventory.instances.insert(
+            EntityId(81),
+            wow_state::inventory::InventoryItemInstance {
+                item: 456,
+                guid: EntityId(81),
+                backpack_slot: 23,
+                count: 4,
+            },
+        );
+        state.inventory.item_metadata.insert(
+            456,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Conjured Refreshment".into(),
+                item_class: 0,
+                subclass: 5,
+                use_spell_id: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mage_food_and_drink(&Snapshot::from_state(&state)),
+            Some((4, 4))
+        );
+    }
+
+    #[test]
+    fn bandage_offer_establishes_a_restock_need_when_backpack_is_complete() {
+        let (mut state, vendor) = recovery_vendor_state();
+        state
+            .inventory
+            .vendor_inventory
+            .as_mut()
+            .unwrap()
+            .offers
+            .push(wow_state::inventory::VendorOffer {
+                slot: 3,
+                item: 118,
+                stock: Some(10),
+                price_copper: 100,
+                buy_count: 1,
+                extended_cost: 0,
+            });
+        state.inventory.item_metadata.insert(
+            118,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Linen Bandage".into(),
+                item_class: 0,
+                subclass: 7,
+                use_spell_id: 1,
+                allowable_class: 0,
+                required_level: 1,
+                ..Default::default()
+            },
+        );
+        for (item, name, spell) in [(201, "Conjured Food", 1), (202, "Conjured Water", 2)] {
+            state.inventory.instances.insert(
+                EntityId(item as u64),
+                wow_state::inventory::InventoryItemInstance {
+                    item,
+                    guid: EntityId(item as u64),
+                    backpack_slot: 23,
+                    count: 10,
+                },
+            );
+            state.inventory.item_metadata.insert(
+                item,
+                wow_state::inventory::ItemTemplateMetadata {
+                    name: name.into(),
+                    item_class: 0,
+                    subclass: 5,
+                    use_spell_id: spell,
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            recovery_supply_restock(
+                &Snapshot::from_state(&state),
+                &BTreeMap::new(),
+                Instant::now(),
+                Some(vendor),
+            ),
+            Some(MaintenanceDecision::RecoveryVendorBuy {
+                vendor,
+                item: 118,
+                slot: 3,
+                lots: 1,
+            })
+        );
     }
 
     #[test]

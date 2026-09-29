@@ -134,6 +134,7 @@ A bot loot action SHALL only be considered successfully completed from a loot tr
 
 ### Requirement: Vendor offers are authoritative and purchases are bounded
 The system SHALL derive vendor offers from the server's current inventory response. A purchase SHALL match the observed vendor, slot, item, stock, lot size, and price. Automatic Rogue poison restocking SHALL use only a nearby cataloged seller, buy one lot per attempt, require authoritative item metadata and class/level eligibility, and preserve the configured maintenance money reserve.
+Food, drink, and bandage restocking SHALL be opportunistic: the system SHALL buy only from an already nearby trusted vendor, use authoritative backpack and item-template data, buy at most one server-defined lot, and preserve at least 1,000 copper. It SHALL wait for an authoritative inventory count change before another recovery-supply purchase, with a bounded timeout if inventory does not update. Unknown item metadata, unsupported recovery-item classification, insufficient stock, extended currency costs, and class- or level-ineligible items SHALL prevent purchase. Recovery supplies SHALL NOT cause vendor travel.
 
 #### Scenario: Rogue poison stock is below the reserve target
 - **WHEN** the Rogue is near an observed cataloged seller and poison stock is below its target
@@ -148,3 +149,16 @@ The system SHALL derive vendor offers from the server's current inventory respon
 #### Scenario: Purchase requests more than one maintenance lot
 - **WHEN** an automatic maintenance purchase requests more than one server-defined lot
 - **THEN** final validation rejects the purchase even if the vendor reports enough stock and the player has enough money
+
+#### Scenario: Low recovery supplies beside a trusted vendor
+- **GIVEN** authoritative backpack item templates show fewer than ten food, drink, or known bandage items
+- **AND** a trusted seller is already within interaction range
+- **WHEN** its current offer data contains a matching fixed-price item with sufficient stock and eligible class and level metadata
+- **THEN** maintenance buys at most one server-defined lot
+- **AND** it preserves at least 1,000 copper
+- **AND** it waits for the purchased item count to change in authoritative inventory, or for a bounded timeout, before another recovery-supply purchase
+- **AND** it does not travel to find a vendor
+
+#### Scenario: Recovery offer evidence is unsafe or incomplete
+- **WHEN** backpack metadata is unknown, an offer has an extended cost, stock cannot cover one lot, item metadata is unknown, or the item is not eligible recovery food, drink, or a bandage
+- **THEN** maintenance does not buy the offer

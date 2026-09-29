@@ -240,6 +240,7 @@ const MOVEMENT_STEP_INTERVAL: Duration = Duration::from_millis(100);
 const MOVEMENT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const MOVEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const QUEST_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
+const RECOVERY_VENDOR_BUY_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 const MOVEMENT_STEP_EARLY_TOLERANCE: Duration = Duration::from_millis(10);
 const BASE_RUN_SPEED_YARDS_PER_SECOND: f32 = 7.0;
 const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
@@ -248,6 +249,15 @@ const CLASS_TRAINER_MEMORY_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const CLASS_TRAINER_TRAVEL_RETRY: Duration = Duration::from_secs(5 * 60);
 const CLASS_TRAINER_MONEY_RESERVE_COPPER: u64 = 1_000;
 const QUEST_OFFER_PRIORITY_RADIUS_YARDS: f32 = 40.0;
+
+fn recovery_vendor_buy_pending_done(
+    baseline_count: u32,
+    current_count: u32,
+    deadline: Instant,
+    now: Instant,
+) -> bool {
+    current_count != baseline_count || deadline <= now
+}
 
 #[derive(Clone, Debug)]
 enum PendingQuestAction {
@@ -361,6 +371,7 @@ pub struct LaneEngine {
     behind_retry_after: BTreeMap<(u32, EntityId), Instant>,
     behind_retry_cast_allowed: BTreeSet<(u32, EntityId)>,
     maintenance_retry_after: BTreeMap<(u32, EntityId), Instant>,
+    recovery_vendor_buy_pending: Option<(u32, u32, Instant)>,
     repair_pending: Option<(wow_state::inventory::EquipmentCondition, Instant)>,
     repair_retry_after: Option<Instant>,
     remembered_class_trainers: BTreeMap<u32, (WorldPosition, Instant)>,
@@ -439,6 +450,7 @@ impl LaneEngine {
             behind_retry_after: BTreeMap::new(),
             behind_retry_cast_allowed: BTreeSet::new(),
             maintenance_retry_after: BTreeMap::new(),
+            recovery_vendor_buy_pending: None,
             repair_pending: None,
             repair_retry_after: None,
             remembered_class_trainers: BTreeMap::new(),
@@ -2090,6 +2102,19 @@ impl LaneEngine {
     async fn tick_maintenance(&mut self) -> Option<bool> {
         self.last_maintenance_tick = Some(Instant::now());
         let now = Instant::now();
+        if let Some((item, baseline_count, deadline)) = self.recovery_vendor_buy_pending {
+            let current_count = self
+                .state
+                .authoritative
+                .inventory
+                .items
+                .get(&item)
+                .copied()
+                .unwrap_or_default();
+            if recovery_vendor_buy_pending_done(baseline_count, current_count, deadline, now) {
+                self.recovery_vendor_buy_pending = None;
+            }
+        }
         self.maintenance_retry_after
             .retain(|_, deadline| *deadline > now);
         let snapshot = Snapshot::from_state(&self.state.authoritative);
@@ -2286,6 +2311,45 @@ impl LaneEngine {
                     Some(format!("poison_vendor_buy:{item}:{slot}:{}", vendor.0));
                 self.maintenance_retry_after
                     .insert((u32::MAX, vendor), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(
+                        GameplayCommand::VendorBuy {
+                            vendor,
+                            item,
+                            slot,
+                            count: lots,
+                        },
+                        false,
+                    )
+                    .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::RecoveryVendorBuy {
+                vendor,
+                item,
+                slot,
+                lots,
+            } => {
+                if self.recovery_vendor_buy_pending.is_some() {
+                    return None;
+                }
+                self.last_maintenance_status =
+                    Some(format!("recovery_vendor_buy:{item}:{slot}:{}", vendor.0));
+                self.recovery_vendor_buy_pending = Some((
+                    item,
+                    self.state
+                        .authoritative
+                        .inventory
+                        .items
+                        .get(&item)
+                        .copied()
+                        .unwrap_or_default(),
+                    now + RECOVERY_VENDOR_BUY_PENDING_TIMEOUT,
+                ));
+                self.maintenance_retry_after.insert(
+                    (u32::MAX, vendor),
+                    now + RECOVERY_VENDOR_BUY_PENDING_TIMEOUT,
+                );
                 Some(
                     self.propose_command(
                         GameplayCommand::VendorBuy {
@@ -5628,6 +5692,7 @@ impl LaneEngine {
         self.behind_retry_after.clear();
         self.behind_retry_cast_allowed.clear();
         self.maintenance_retry_after.clear();
+        self.recovery_vendor_buy_pending = None;
         self.repair_pending = None;
         self.repair_retry_after = None;
         self.remembered_class_trainers.clear();
@@ -5888,6 +5953,15 @@ fn is_quest_search_work(movement: &PendingMovement) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_vendor_purchase_wait_is_bounded_and_tracks_inventory_changes() {
+        let now = Instant::now();
+        let deadline = now + RECOVERY_VENDOR_BUY_PENDING_TIMEOUT;
+        assert!(!recovery_vendor_buy_pending_done(4, 4, deadline, now));
+        assert!(recovery_vendor_buy_pending_done(4, 5, deadline, now));
+        assert!(recovery_vendor_buy_pending_done(4, 4, deadline, deadline));
+    }
     use crate::activity::ActivityArbiter;
 
     #[test]

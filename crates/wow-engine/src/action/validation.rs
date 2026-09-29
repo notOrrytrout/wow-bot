@@ -592,43 +592,68 @@ fn validate_economy_command(
                         .saturating_add(MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
                         <= snapshot.state.inventory.money
             });
-            let poison = snapshot
-                .state
-                .inventory
-                .item_metadata
-                .get(item)
-                .is_some_and(|metadata| {
-                    metadata.item_class == 0
-                        && metadata.subclass == 6
-                        && {
-                            let name = metadata.name.to_ascii_lowercase();
-                            name.contains("instant poison") || name.contains("deadly poison")
-                        }
-                        && metadata.required_level
-                            <= snapshot
-                                .state
-                                .session
-                                .character_guid
-                                .map(EntityId)
-                                .and_then(|player| snapshot.state.entities.0.get(&player))
-                                .and_then(|player| player.level)
-                                .unwrap_or(0)
-                        && (metadata.allowable_class == 0
-                            || metadata.allowable_class == u32::MAX
-                            || metadata.allowable_class & (1 << (4 - 1)) != 0)
-                });
+            let metadata = snapshot.state.inventory.item_metadata.get(item);
+            let poison = metadata.is_some_and(|metadata| {
+                metadata.item_class == 0
+                    && metadata.subclass == 6
+                    && {
+                        let name = metadata.name.to_ascii_lowercase();
+                        name.contains("instant poison") || name.contains("deadly poison")
+                    }
+                    && metadata.required_level
+                        <= snapshot
+                            .state
+                            .session
+                            .character_guid
+                            .map(EntityId)
+                            .and_then(|player| snapshot.state.entities.0.get(&player))
+                            .and_then(|player| player.level)
+                            .unwrap_or(0)
+                    && (metadata.allowable_class == 0
+                        || metadata.allowable_class == u32::MAX
+                        || metadata.allowable_class & (1 << (4 - 1)) != 0)
+            });
+            let recovery_supply = metadata.is_some_and(|metadata| {
+                snapshot
+                    .state
+                    .capabilities
+                    .class_id
+                    .zip(
+                        snapshot
+                            .state
+                            .session
+                            .character_guid
+                            .map(EntityId)
+                            .and_then(|player| snapshot.state.entities.0.get(&player))
+                            .and_then(|player| player.level),
+                    )
+                    .is_some_and(|(class, level)| {
+                        wow_policy::maintenance::recovery_supply_item_is_eligible(
+                            metadata, class, level,
+                        )
+                    })
+            });
             let trusted_seller = snapshot.state.entities.0.get(vendor).is_some_and(|entity| {
+                let nearby = snapshot
+                    .state
+                    .position
+                    .player
+                    .zip(entity.position)
+                    .is_some_and(|(player, seller)| {
+                        player.map == seller.map && player.point.distance(seller.point) <= 5.0
+                    });
                 entity.kind == wow_state::entities::EntityKind::Unit
                     && entity.interactable
+                    && nearby
                     && wow_infra::world_knowledge::embedded_azerothcore_catalog()
                         .world()
                         .vendor_services
                         .iter()
                         .any(|service| service.entry_id == entity.entry && service.can_sell)
             });
-            if snapshot.state.capabilities.class_id != Some(4)
-                || !valid
-                || !poison
+            if !valid
+                || (!poison && !recovery_supply)
+                || (poison && snapshot.state.capabilities.class_id != Some(4))
                 || !trusted_seller
             {
                 return Err(reject(
@@ -1248,10 +1273,16 @@ mod tests {
     #[test]
     fn vendor_buy_requires_matching_safe_offer_and_preserves_money_reserve() {
         let vendor = EntityId(55);
+        let player_position = WorldPosition {
+            map: 1,
+            point: Vec3::new(0.0, 0.0, 0.0),
+            orientation: 0.0,
+        };
         let mut state = AuthoritativeState::default();
         state.session.in_world = true;
         state.session.character_guid = Some(7);
         state.capabilities.class_id = Some(4);
+        state.position.player = Some(player_position);
         state.inventory.vendor = Some(vendor);
         state.inventory.money = 1_120;
         state.inventory.vendor_inventory = Some(wow_state::inventory::VendorInventory {
@@ -1298,6 +1329,7 @@ mod tests {
                 entry: seller_entry,
                 kind: wow_state::entities::EntityKind::Unit,
                 interactable: true,
+                position: Some(player_position),
                 ..Default::default()
             },
         );
@@ -1321,6 +1353,34 @@ mod tests {
         assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
         state.inventory.money = 2_000;
         state.inventory.vendor_inventory.as_mut().unwrap().offers[0].stock = Some(4);
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
+
+        state.inventory.vendor_inventory.as_mut().unwrap().offers[0].stock = Some(5);
+        state.capabilities.class_id = Some(1);
+        state.inventory.item_metadata.insert(
+            6947,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Linen Bandage".into(),
+                item_class: 0,
+                subclass: 7,
+                allowable_class: 0,
+                required_level: 1,
+                use_spell_id: 102,
+                ..Default::default()
+            },
+        );
+        assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_ok());
+
+        state.inventory.item_metadata.insert(
+            6947,
+            wow_state::inventory::ItemTemplateMetadata {
+                name: "Unrelated Consumable".into(),
+                item_class: 0,
+                subclass: 0,
+                use_spell_id: 102,
+                ..Default::default()
+            },
+        );
         assert!(validate_economy_command(&Snapshot::from_state(&state), &command).is_err());
     }
 
