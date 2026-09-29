@@ -61,11 +61,9 @@ The proxy also sends in-game system notices for `.bot on`, `.bot off`, and missi
 
 This smoke path validates quest discovery/open/accept. Objective target selection and travel require additional authoritative object/objective projection; when that evidence is not available the lane must emit a `mission scheduler waiting` reason instead of silently idling.
 
-## Audit-focused live checks
+## World-entry authority check
 
-After `cargo check --workspace --all-targets` and `cargo test --workspace`, verify a configured login produces an `authoritative world-entry observation received` message before a non-idle mission begins acting.
-
-For `.bot quest`, run near a quest giver and confirm the log progresses through server-derived observations rather than only repeating opcode `0x417`. If the scheduler waits, the reason must identify the missing authoritative state. Check active journal, objectives, navigation, completion, and turn-in before claiming an end-to-end quest result.
+After login, verify that `authoritative world-entry observation received` appears before a non-idle mission begins acting.
 
 
 ## Quest lifecycle live test
