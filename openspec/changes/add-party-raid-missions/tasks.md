@@ -8,48 +8,48 @@
 
 ## 2. Group Observation Model
 
-- [x] 2.1 Extend group state with an explicit known group type and authoritative raid metadata while preserving unknown values; verify raw party and raid group-list fixtures retain leader, subgroup, role, and group-type data.
-- [x] 2.2 Add observed owner or summon relationships for player pets and guardians without counting them as group members; verify fixtures associate a Hunter pet with its owner and reject an unrelated creature as a pet.
-- [x] 2.3 Parse and retain raid target icon assignments and clear them on authoritative removal or world reset; verify mark fixtures cover skull, X, reassignment, removal, and unknown state.
-- [x] 2.4 Add the available attacker, victim, cast, threat-target, loot-method, roll-request, and hostile-area observations with explicit known or unknown state; verify each parser with protocol or trusted event fixtures and do not synthesize unavailable fields.
-- [x] 2.5 Add trusted map classification for outdoor, dungeon, raid, battleground, arena, and unknown maps and bind it to observed map transitions; verify representative map fixtures and unknown IDs.
+- [ ] 2.1 Extend group state with an explicit known group type and authoritative raid metadata while preserving unknown values; verify raw party and raid group-list fixtures retain leader, subgroup, role, and group-type data.
+- [ ] 2.2 Add observed owner or summon relationships for player pets and guardians without counting them as group members; verify fixtures associate a Hunter pet with its owner and reject an unrelated creature as a pet.
+- [ ] 2.3 Parse and retain raid target icon assignments and clear them on authoritative removal or world reset; verify mark fixtures cover skull, X, reassignment, removal, and unknown state.
+- [ ] 2.4 Add the available attacker, victim, cast, threat-target, loot-method, roll-request, and hostile-area observations with explicit known or unknown state; verify each parser with protocol or trusted event fixtures and do not synthesize unavailable fields.
+- [ ] 2.5 Add trusted map classification for outdoor, dungeon, raid, battleground, arena, and unknown maps and bind it to observed map transitions; verify representative map fixtures and unknown IDs.
 
 ## 3. Shared Group Context and Encounter Model
 
-- [x] 3.1 Add a pure derived `GroupContext` with group type, effective role, leader, tanks, healers, members, pets, marks, crowd control, dead members, threat relationships, formation, encounter members, and instance state; verify complete and partial-snapshot tests preserve unknown data.
-- [x] 3.2 Resolve Auto role from authoritative assignment first and supported class, specialization, and equipment evidence second; verify unsupported explicit roles are reported and Auto never resolves to an unsupported role.
-- [x] 3.3 Build encounter membership from attacks on the player, group members, and owned pets, plus group attacks, assist targets, and marks; verify the Hunter pet case is admitted while an unrelated nearby hostile is excluded.
-- [x] 3.4 Add authoritative encounter removal and bounded stale expiry for death, evade, reset, despawn, and lost observations; verify stale targets do not survive a reset or cause a chase after the deadline.
-- [x] 3.5 Centralize breakable crowd-control detection and expose protected targets in GroupContext; verify polymorph, sap, repentance, hex, shackle, and freezing-trap fixtures are excluded from ordinary target selection.
+- [ ] 3.1 Add a pure derived `GroupContext` with group type, effective role, leader, tanks, healers, members, pets, marks, crowd control, dead members, threat relationships, formation, encounter members, and instance state; verify complete and partial-snapshot tests preserve unknown data.
+- [ ] 3.2 Resolve Auto role from authoritative assignment first and supported class, specialization, and equipment evidence second; verify unsupported explicit roles are reported and Auto never resolves to an unsupported role.
+- [ ] 3.3 Build encounter membership from attacks on the player, group members, and owned pets, plus group attacks, assist targets, and marks; verify the Hunter pet case is admitted while an unrelated nearby hostile is excluded.
+- [ ] 3.4 Add authoritative encounter removal and bounded stale expiry for death, evade, reset, despawn, and lost observations; verify stale targets do not survive a reset or cause a chase after the deadline.
+- [ ] 3.5 Centralize breakable crowd-control detection and expose protected targets in GroupContext; verify polymorph, sap, repentance, hex, shackle, and freezing-trap fixtures are excluded from ordinary target selection.
 
 ## 4. Group Runtime and State Machine
 
-- [x] 4.1 Add the group runtime state, transition timestamps, encounter memory, pull time, recovery deadline, formation intent, interrupt assignment, and mission-revision reset behavior; verify a mission replacement clears all stale group runtime data.
-- [x] 4.2 Implement pure Party lifecycle transitions for Forming, Following, WaitingForPull, Engaging, ExecutingRole, Recovering, Regrouping, Wiped, and Resurrecting; verify every legal transition and important rejected transition with table-driven tests.
-- [x] 4.3 Extend the lifecycle for Raid Preparing, BossEncounter, PhaseTransition, and Resetting; verify boss engage, phase evidence, wipe, reset, and regroup transition tests.
-- [x] 4.4 Expose current group state, configured role, resolved role, instance class, leader or anchor, encounter count, recovery hold, and formation intent in status and diagnostics; verify sanitized output contains no invented observations.
+- [ ] 4.1 Add the group runtime state, transition timestamps, encounter memory, pull time, recovery deadline, formation intent, interrupt assignment, and mission-revision reset behavior; verify a mission replacement clears all stale group runtime data.
+- [ ] 4.2 Implement pure Party lifecycle transitions for Forming, Following, WaitingForPull, Engaging, ExecutingRole, Recovering, Regrouping, Wiped, and Resurrecting; verify every legal transition and important rejected transition with table-driven tests.
+- [ ] 4.3 Extend the lifecycle for Raid Preparing, BossEncounter, PhaseTransition, and Resetting; verify boss engage, phase evidence, wipe, reset, and regroup transition tests.
+- [ ] 4.4 Expose current group state, configured role, resolved role, instance class, leader or anchor, encounter count, recovery hold, and formation intent in status and diagnostics; verify sanitized output contains no invented observations.
 - [x] 4.5 Replace the old always-on party helper with the shared mission service for Party and Raid while preserving safe invite handling outside those missions; verify ordinary solo missions do not start voluntary group following or group pulls.
 
 ## 5. Party Movement, Pull, and Recovery Policy
 
-- [x] 5.1 Add configurable role follow start, stop, combat range, spacing, and group leash values with safe defaults and validation; verify invalid or inverted envelopes fail configuration loading clearly.
-- [x] 5.2 Select leader, assigned tank, or encounter centroid as a state-specific group anchor and emit one prioritized movement intent per tick; verify safety and death movement preempt formation movement.
-- [x] 5.3 Implement leader following, map-transition regrouping, separation detection, wait-for-lagging-member behavior, and role spacing with full three-dimensional routed destinations; verify tests cover melee, ranged, healer, and missing-leader cases.
+- [ ] 5.1 Add configurable role follow start, stop, combat range, spacing, and group leash values with safe defaults and validation; verify invalid or inverted envelopes fail configuration loading clearly.
+- [ ] 5.2 Select leader, assigned tank, or encounter centroid as a state-specific group anchor and emit one prioritized movement intent per tick; verify safety and death movement preempt formation movement.
+- [ ] 5.3 Implement leader following, map-transition regrouping, separation detection, wait-for-lagging-member behavior, and role spacing with full three-dimensional routed destinations; verify tests cover melee, ranged, healer, and missing-leader cases.
 - [x] 5.4 Enforce non-tank pull discipline and the configurable threat-establishment delay; verify the observed group target does not cause a pull before engagement and an admitted encounter target becomes attackable after the delay.
 - [x] 5.4a Add typed role-aware pull authorization for the currently observed group encounter target; tanks may initiate it and other roles wait for observed combat against an online group member. Verify unknown combat state, unrelated targets, and group-engaged targets.
-- [x] 5.5 Implement assist-target priority, healer and critical-member protection, crowd-control avoidance, and group-leash chase cancellation; verify deterministic target-selection tests cover all priority tiers and safe fallback behavior.
-- [x] 5.6 Implement post-combat health and healer-mana recovery holds, nearby resurrection behavior, and recovery release conditions; verify no new voluntary pull or travel starts while recovery is active.
-- [x] 5.7 Integrate group wipe detection with existing release, corpse navigation, instance-return, map-transition, regroup, and encounter-reset behavior; verify outdoor death, dungeon entrance return, partial wipe, full wipe, and recovered-group tests.
+- [ ] 5.5 Implement assist-target priority, healer and critical-member protection, crowd-control avoidance, and group-leash chase cancellation; verify deterministic target-selection tests cover all priority tiers and safe fallback behavior.
+- [ ] 5.6 Implement post-combat health and healer-mana recovery holds, nearby resurrection behavior, and recovery release conditions; verify no new voluntary pull or travel starts while recovery is active.
+- [ ] 5.7 Integrate group wipe detection with existing release, corpse navigation, instance-return, map-transition, regroup, and encounter-reset behavior; verify outdoor death, dungeon entrance return, partial wipe, full wipe, and recovered-group tests.
 
 ## 6. Role and Raid Tactics
 
-- [x] 6.1 Feed effective role, target authorization, threat hold, movement envelope, and recovery intent into existing combat policy without selecting spells in the group layer; verify existing class rotation tests continue to pass with group constraints.
-- [x] 6.2 Add main-tank, off-tank, assist, and raid-mark priority selection from observed assignments; verify explicit assist overrides skull, skull precedes X by default, and missing observations disable only that tactic.
-- [x] 6.3 Add threat-sensitive damage authorization and existing threat-reduction ability integration; verify damage pauses or reduces threat when it becomes the hostile target before tank control.
-- [x] 6.4 Add observed interrupt assignments and authorize existing class interrupts only for the assigned cast, range, and readiness; verify unassigned, unknown, late, and successful interrupt cases.
-- [x] 6.5 Add Stack and Spread formation intents using reachable candidate points, known member positions, role spacing, hostile-envelope rejection, and the group leash; verify route rejection and no-safe-point behavior return to a safe wait state.
-- [x] 6.6 Add hostile-area escape for effects with known ownership, location, envelope, and lifetime; verify observable hazards preempt formation and unknown or expired hazards do not move the bot.
-- [x] 6.7 Add observed boss preparation, engagement, phase transition, and reset policy without generic boss-script guesses; verify unknown boss mechanics leave the bot in its safe role and formation policy.
+- [ ] 6.1 Feed effective role, target authorization, threat hold, movement envelope, and recovery intent into existing combat policy without selecting spells in the group layer; verify existing class rotation tests continue to pass with group constraints.
+- [ ] 6.2 Add main-tank, off-tank, assist, and raid-mark priority selection from observed assignments; verify explicit assist overrides skull, skull precedes X by default, and missing observations disable only that tactic.
+- [ ] 6.3 Add threat-sensitive damage authorization and existing threat-reduction ability integration; verify damage pauses or reduces threat when it becomes the hostile target before tank control.
+- [ ] 6.4 Add observed interrupt assignments and authorize existing class interrupts only for the assigned cast, range, and readiness; verify unassigned, unknown, late, and successful interrupt cases.
+- [ ] 6.5 Add Stack and Spread formation intents using reachable candidate points, known member positions, role spacing, hostile-envelope rejection, and the group leash; verify route rejection and no-safe-point behavior return to a safe wait state.
+- [ ] 6.6 Add hostile-area escape for effects with known ownership, location, envelope, and lifetime; verify observable hazards preempt formation and unknown or expired hazards do not move the bot.
+- [ ] 6.7 Add observed boss preparation, engagement, phase transition, and reset policy without generic boss-script guesses; verify unknown boss mechanics leave the bot in its safe role and formation policy.
 
 ## 7. Group Loot and Roll Safety
 
