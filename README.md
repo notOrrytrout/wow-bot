@@ -106,11 +106,4 @@ cargo run -p wow-infra --example generate-config-example
 
 ## Development checks
 
-```sh
-cargo check --workspace --all-targets
-cargo test --workspace
-cargo clippy --workspace --all-targets
-tools/check-binrw-future-compat.sh
-```
-
-A successful build does not prove that all gameplay features work. Use the live checks in [Testing](docs/TESTING.md) and review the limits in [Project details](docs/PROJECT_DETAILS.md).
+Use the full local and live verification checklist in [Testing](docs/TESTING.md). A successful build does not prove that all gameplay features work; see [Project details](docs/PROJECT_DETAILS.md) for known limits.
