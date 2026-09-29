@@ -233,28 +233,6 @@ fn validate_group_loot_command(
     Ok(())
 }
 
-fn has_unique_nearby_trusted_mailbox(snapshot: &Snapshot, mailbox: EntityId) -> bool {
-    let Some(player) = snapshot
-        .state
-        .control
-        .active_position(snapshot.state.position.player)
-    else {
-        return false;
-    };
-    let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
-    let mut matches = snapshot.state.entities.0.values().filter(|entity| {
-        entity.kind == wow_state::entities::EntityKind::GameObject
-            && entity.interactable
-            && catalog
-                .gameobject_name(entity.entry)
-                .is_some_and(|name| name.to_ascii_lowercase().contains("mailbox"))
-            && entity.position.is_some_and(|position| {
-                position.map == player.map && position.point.distance(player.point) <= 5.0
-            })
-    });
-    matches.next().is_some_and(|entity| entity.id == mailbox) && matches.next().is_none()
-}
-
 fn validate_spatial_command(
     snapshot: &Snapshot,
     command: &GameplayCommand,
@@ -1049,7 +1027,7 @@ fn validate_economy_command(
             }
         }
         GameplayCommand::MailboxList { mailbox } => {
-            if !has_unique_nearby_trusted_mailbox(snapshot, *mailbox) {
+            if crate::trusted::unique_nearby_mailbox(snapshot) != Some(*mailbox) {
                 return Err(reject(
                     "mailbox_not_available",
                     "mailbox is not a trusted observed object in interaction range",
@@ -1068,7 +1046,7 @@ fn validate_economy_command(
             {
                 return Err(reject("stale_mail", "mailbox contents changed", true));
             }
-            if !has_unique_nearby_trusted_mailbox(snapshot, *mailbox) {
+            if crate::trusted::unique_nearby_mailbox(snapshot) != Some(*mailbox) {
                 return Err(reject(
                     "mailbox_not_available",
                     "mailbox is not a trusted observed object in interaction range",
@@ -1949,6 +1927,18 @@ mod tests {
         );
         assert!(matches!(
             validate_command(&ambiguous, &action),
+            Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
+                if code == "mailbox_not_available"
+        ));
+
+        let wrong_mailbox = GameplayCommand::MailTake {
+            mailbox_generation: 8,
+            mailbox: EntityId(100),
+            mail_id: 77,
+            target: MailTakeTarget::Money,
+        };
+        assert!(matches!(
+            validate_command(&mailbox_snapshot(Some(0), 1), &wrong_mailbox),
             Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
                 if code == "mailbox_not_available"
         ));

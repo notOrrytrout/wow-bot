@@ -82,26 +82,6 @@ fn repair_detour_should_continue(
         && wow_policy::maintenance::equipment_needs_repair(condition)
 }
 
-fn trusted_mailbox(snapshot: &Snapshot) -> Option<EntityId> {
-    let position = snapshot
-        .state
-        .control
-        .active_position(snapshot.state.position.player)?;
-    let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
-    let mut matches = snapshot.state.entities.0.values().filter(|entity| {
-        entity.kind == wow_state::entities::EntityKind::GameObject
-            && entity.interactable
-            && catalog
-                .gameobject_name(entity.entry)
-                .is_some_and(|name| name.to_ascii_lowercase().contains("mailbox"))
-            && entity.position.is_some_and(|target| {
-                target.map == position.map && target.point.distance(position.point) <= 5.0
-            })
-    });
-    let mailbox = matches.next()?.id;
-    matches.next().is_none().then_some(mailbox)
-}
-
 fn nearby_sell_vendor(snapshot: &Snapshot) -> Option<EntityId> {
     let position = snapshot
         .state
@@ -3269,7 +3249,7 @@ impl LaneEngine {
         if self.mail_retry_after.is_some_and(|deadline| deadline > now) {
             return None;
         }
-        let mailbox = trusted_mailbox(snapshot)?;
+        let mailbox = crate::trusted::unique_nearby_mailbox(snapshot)?;
         if let Some((requested_mailbox, request_generation, deadline)) = self.mailbox_list_pending {
             if !waiting_for_mail_observation(request_generation, generation, deadline, now) {
                 if generation == request_generation {
