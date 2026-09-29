@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use wow_domain::EntityId;
 use wow_state::{Snapshot, entities::EntityKind};
 
@@ -6,6 +6,14 @@ pub const BANK_BAG_PRESSURE_FREE_SLOTS: u16 = 2;
 pub const BANK_INTERACTION_RANGE_YARDS: f32 = 5.0;
 pub const BACKPACK_SLOT_RANGE: std::ops::RangeInclusive<u8> = 23..=38;
 const NPC_FLAG_BANKER: u32 = 0x0000_0008;
+
+pub fn is_banker_flags(flags: u32) -> bool {
+    flags & NPC_FLAG_BANKER != 0
+}
+
+pub fn protected_item_id_set(item_ids: &[u32]) -> BTreeSet<u32> {
+    item_ids.iter().copied().collect()
+}
 
 pub fn bank_work_allowed(snapshot: &Snapshot) -> bool {
     let Some(player) = snapshot.state.session.character_guid.map(EntityId) else {
@@ -57,9 +65,7 @@ pub fn trusted_nearby_bankers(snapshot: &Snapshot) -> Vec<EntityId> {
         .filter(|entity| {
             entity.kind == EntityKind::Unit
                 && entity.interactable
-                && entity
-                    .npc_flags
-                    .is_some_and(|flags| flags & NPC_FLAG_BANKER != 0)
+                && entity.npc_flags.is_some_and(is_banker_flags)
                 && entity.position.is_some_and(|position| {
                     position.map == player.map
                         && position.point.distance(player.point) <= BANK_INTERACTION_RANGE_YARDS
@@ -69,6 +75,24 @@ pub fn trusted_nearby_bankers(snapshot: &Snapshot) -> Vec<EntityId> {
         .collect::<Vec<_>>();
     bankers.sort_unstable();
     bankers
+}
+
+pub fn remembered_banker_destination(
+    snapshot: &Snapshot,
+    remembered: &BTreeMap<u32, (wow_domain::WorldPosition, std::time::Instant)>,
+    now: std::time::Instant,
+    max_age: std::time::Duration,
+    max_distance: f32,
+) -> Option<wow_domain::WorldPosition> {
+    let position = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player)?;
+    remembered
+        .get(&position.map)
+        .filter(|(_, observed_at)| now.saturating_duration_since(*observed_at) <= max_age)
+        .map(|(banker, _)| *banker)
+        .filter(|banker| banker.point.distance(position.point) <= max_distance)
 }
 
 /// Choose backpack trade goods for one validated deposit action.
@@ -307,5 +331,67 @@ mod tests {
         let candidates =
             profession_material_deposit_candidates(&snapshot, banker, &BTreeSet::new());
         assert!(candidates.iter().all(|candidate| candidate.item != 17_056));
+    }
+
+    #[test]
+    fn remembered_banker_location_requires_current_map_recent_observation_and_short_range() {
+        let now = std::time::Instant::now();
+        let mut state = AuthoritativeState::default();
+        state.position.player = Some(WorldPosition {
+            map: 4,
+            point: wow_domain::Vec3::new(10.0, 10.0, 0.0),
+            orientation: 0.0,
+        });
+        let snapshot = Snapshot::from_state(&state);
+        let position = WorldPosition {
+            map: 4,
+            point: wow_domain::Vec3::new(39.0, 10.0, 0.0),
+            orientation: 0.0,
+        };
+        let memory = BTreeMap::from([(4, (position, now))]);
+        assert_eq!(
+            remembered_banker_destination(
+                &snapshot,
+                &memory,
+                now,
+                std::time::Duration::from_secs(30 * 60),
+                30.0,
+            ),
+            Some(position)
+        );
+        assert_eq!(
+            remembered_banker_destination(
+                &snapshot,
+                &BTreeMap::from([(3, (position, now))]),
+                now,
+                std::time::Duration::from_secs(30 * 60),
+                30.0,
+            ),
+            None
+        );
+        assert_eq!(
+            remembered_banker_destination(
+                &snapshot,
+                &memory,
+                now + std::time::Duration::from_secs(30 * 60 + 1),
+                std::time::Duration::from_secs(30 * 60),
+                30.0,
+            ),
+            None
+        );
+        let far = WorldPosition {
+            point: wow_domain::Vec3::new(41.0, 10.0, 0.0),
+            ..position
+        };
+        assert_eq!(
+            remembered_banker_destination(
+                &snapshot,
+                &BTreeMap::from([(4, (far, now))]),
+                now,
+                std::time::Duration::from_secs(30 * 60),
+                30.0,
+            ),
+            None
+        );
     }
 }

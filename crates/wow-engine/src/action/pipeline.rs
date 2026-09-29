@@ -7,6 +7,7 @@ pub fn finalize(
     current: ValidityStamp,
     stage: ActivationStage,
     permissions: PermissionSet,
+    bank_keep_item_ids: &[u32],
     action: ProposedAction,
 ) -> ValidationOutcome {
     ActionValidator::validate(
@@ -15,6 +16,7 @@ pub fn finalize(
             current,
             stage,
             permissions,
+            bank_keep_item_ids: bank_keep_item_ids.to_vec(),
         },
         action,
     )

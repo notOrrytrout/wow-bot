@@ -225,6 +225,7 @@ enum MovementPurpose {
     SurvivalApproach,
     RepairVendor,
     ClassTrainer,
+    Banker,
 }
 
 const TURN_IN_SEARCH_RANGE: f32 = 5.0;
@@ -257,6 +258,9 @@ const ROUTE_PLAN_DEADLINE: Duration = wow_navigation::ROUTE_PLANNING_DEADLINE;
 const CLASS_TRAINER_DETOUR_RADIUS_YARDS: f32 = 30.0;
 const CLASS_TRAINER_MEMORY_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const CLASS_TRAINER_TRAVEL_RETRY: Duration = Duration::from_secs(5 * 60);
+const BANKER_DETOUR_RADIUS_YARDS: f32 = 30.0;
+const BANKER_MEMORY_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+const BANKER_TRAVEL_RETRY: Duration = Duration::from_secs(5 * 60);
 const CLASS_TRAINER_MONEY_RESERVE_COPPER: u64 = 1_000;
 const MAILBOX_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAILBOX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -441,6 +445,7 @@ pub struct LaneEngine {
     repair_pending: Option<(wow_state::inventory::EquipmentCondition, Instant)>,
     repair_retry_after: Option<Instant>,
     remembered_class_trainers: BTreeMap<u32, (WorldPosition, Instant)>,
+    remembered_bankers: BTreeMap<u32, (WorldPosition, Instant)>,
     class_training_character: Option<u64>,
     last_player_level: Option<u32>,
     class_training_due: bool,
@@ -452,6 +457,7 @@ pub struct LaneEngine {
     bank_open_pending: Option<(EntityId, Instant)>,
     bank_deposit_pending: Option<(EntityId, EntityId, u32, Instant)>,
     bank_retry_after: Option<Instant>,
+    bank_travel_retry_after: Option<Instant>,
     last_maintenance_tick: Option<Instant>,
     last_maintenance_status: Option<String>,
     post_combat_loot: Option<(EntityId, Instant, Option<wow_state::entities::EntityState>)>,
@@ -530,6 +536,7 @@ impl LaneEngine {
             repair_pending: None,
             repair_retry_after: None,
             remembered_class_trainers: BTreeMap::new(),
+            remembered_bankers: BTreeMap::new(),
             class_training_character: None,
             last_player_level: None,
             class_training_due: false,
@@ -541,6 +548,7 @@ impl LaneEngine {
             bank_open_pending: None,
             bank_deposit_pending: None,
             bank_retry_after: None,
+            bank_travel_retry_after: None,
             last_maintenance_tick: None,
             last_maintenance_status: None,
             post_combat_loot: None,
@@ -1030,6 +1038,10 @@ impl LaneEngine {
                     ProtocolObservation::SpellKnown { spell } => Some(*spell),
                     _ => None,
                 };
+                if matches!(o, ProtocolObservation::EnteredWorld { .. }) {
+                    self.remembered_bankers.clear();
+                    self.bank_travel_retry_after = None;
+                }
                 let previous_level = self
                     .state
                     .authoritative
@@ -1050,6 +1062,18 @@ impl LaneEngine {
                     self.remembered_class_trainers
                         .insert(position.map, (position, Instant::now()));
                 }
+                if let Some(id) = updated_entity
+                    && let Some(entity) = self.state.authoritative.entities.0.get(&id)
+                    && entity.kind == wow_state::entities::EntityKind::Unit
+                    && entity.interactable
+                    && entity
+                        .npc_flags
+                        .is_some_and(wow_policy::economy::bank::is_banker_flags)
+                    && let Some(position) = entity.position
+                {
+                    self.remembered_bankers
+                        .insert(position.map, (position, Instant::now()));
+                }
                 let character = self.state.authoritative.session.character_guid;
                 if character != self.class_training_character {
                     let character_changed = self.class_training_character.is_some();
@@ -1059,6 +1083,8 @@ impl LaneEngine {
                     self.class_trainer_travel_retry_after = None;
                     if character_changed {
                         self.remembered_class_trainers.clear();
+                        self.remembered_bankers.clear();
+                        self.bank_travel_retry_after = None;
                     }
                 }
                 if let Some(level) = character
@@ -1402,6 +1428,16 @@ impl LaneEngine {
                 "class trainer detour is no longer safe or needed",
             )
             .await;
+        }
+        if self
+            .pending_movement
+            .as_ref()
+            .is_some_and(|movement| movement.purpose == MovementPurpose::Banker)
+            && (!self.bank_travel_allowed(&snapshot)
+                || !wow_policy::economy::bank::trusted_nearby_bankers(&snapshot).is_empty())
+        {
+            self.stop_active_movement_for_handoff("banker detour is no longer safe or needed")
+                .await;
         }
         if self.pending_movement.is_some() {
             return true;
@@ -2304,7 +2340,9 @@ impl LaneEngine {
         let Some(candidate) = wow_policy::economy::bank::profession_material_deposit_candidates(
             snapshot,
             banker,
-            &BTreeSet::new(),
+            &wow_policy::economy::bank::protected_item_id_set(
+                &self.runtime_tuning.maintenance.bank_keep_item_ids,
+            ),
         )
         .into_iter()
         .next() else {
@@ -2355,6 +2393,122 @@ impl LaneEngine {
         Some(sent)
     }
 
+    fn bank_travel_allowed(&self, snapshot: &Snapshot) -> bool {
+        if !self.runtime_tuning.maintenance.auto_bank_deposit_enabled
+            || !snapshot.state.session.in_world
+            || !snapshot.state.inventory.instances_authoritative
+            || snapshot.state.inventory.free_slots
+                > wow_policy::economy::bank::BANK_BAG_PRESSURE_FREE_SLOTS
+            || self.state.authoritative.group.lifecycle != wow_state::group::GroupLifecycle::Solo
+            || matches!(
+                self.state.mission.intent,
+                MissionIntent::Party { .. } | MissionIntent::Raid { .. }
+            )
+            || !self
+                .state
+                .mission
+                .permissions
+                .contains(PermissionSet::MAINTENANCE | PermissionSet::MOVE)
+            || wow_policy::combat::engagement::survival_attacker(snapshot).is_some()
+            || self.state.authoritative.control.mover.is_some()
+            || self.state.authoritative.transport.attached == Some(true)
+        {
+            return false;
+        }
+        let Some(player) = snapshot
+            .state
+            .session
+            .character_guid
+            .map(EntityId)
+            .and_then(|player| snapshot.state.entities.0.get(&player))
+        else {
+            return false;
+        };
+        if !player.health.is_some_and(|(current, _)| current > 0)
+            || player.in_combat() == Some(true)
+            || snapshot.state.active_casts.contains_key(&player.id)
+            || snapshot
+                .state
+                .auras
+                .has_any(player.id, &[wow_state::life::GHOST_AURA_SPELL_ID])
+        {
+            return false;
+        }
+        let Some(position) = snapshot
+            .state
+            .control
+            .active_position(snapshot.state.position.player)
+        else {
+            return false;
+        };
+        let keep_item_ids = wow_policy::economy::bank::protected_item_id_set(
+            &self.runtime_tuning.maintenance.bank_keep_item_ids,
+        );
+        !wow_policy::maintenance::nearby_quest_offer(snapshot, position)
+            && !wow_policy::economy::bank::profession_material_deposit_candidates(
+                snapshot,
+                EntityId(0),
+                &keep_item_ids,
+            )
+            .is_empty()
+    }
+
+    fn tick_bank_travel(&mut self, snapshot: &Snapshot) -> Option<bool> {
+        let now = Instant::now();
+        if !self.bank_travel_allowed(snapshot)
+            || !wow_policy::economy::bank::trusted_nearby_bankers(snapshot).is_empty()
+            || self
+                .bank_travel_retry_after
+                .is_some_and(|deadline| deadline > now)
+        {
+            return None;
+        }
+        let Some(destination) = wow_policy::economy::bank::remembered_banker_destination(
+            snapshot,
+            &self.remembered_bankers,
+            now,
+            BANKER_MEMORY_MAX_AGE,
+            BANKER_DETOUR_RADIUS_YARDS,
+        ) else {
+            return None;
+        };
+        let Some(position) = snapshot
+            .state
+            .control
+            .active_position(snapshot.state.position.player)
+        else {
+            return None;
+        };
+        if destination.point.distance(position.point)
+            <= wow_policy::economy::bank::BANK_INTERACTION_RANGE_YARDS
+        {
+            self.bank_travel_retry_after = Some(now + BANKER_TRAVEL_RETRY);
+            return None;
+        }
+        self.bank_travel_retry_after = Some(now + BANKER_TRAVEL_RETRY);
+        let work = self.set_work(QuestWorkKey::TravelToObjective {
+            quest: 0,
+            objective: 0,
+            destination,
+        });
+        self.queue_world_movement(
+            destination,
+            wow_policy::economy::bank::BANK_INTERACTION_RANGE_YARDS,
+            None,
+            None,
+            PlanOrigin::SystemPolicy,
+            work,
+            MovementPurpose::Banker,
+        );
+        tracing::info!(
+            lane=?self.state.lane,
+            map=destination.map,
+            distance_yards=position.point.distance(destination.point),
+            "bag pressure selected a recent same-map banker location for a short service detour"
+        );
+        Some(true)
+    }
+
     async fn tick_maintenance(&mut self) -> Option<bool> {
         self.last_maintenance_tick = Some(Instant::now());
         let now = Instant::now();
@@ -2375,6 +2529,9 @@ impl LaneEngine {
             .retain(|_, deadline| *deadline > now);
         let snapshot = Snapshot::from_state(&self.state.authoritative);
         if let Some(result) = self.tick_bank_deposit(&snapshot, now).await {
+            return Some(result);
+        }
+        if let Some(result) = self.tick_bank_travel(&snapshot) {
             return Some(result);
         }
         let nearby_sell_vendor = nearby_sell_vendor(&snapshot);
@@ -5984,6 +6141,7 @@ impl LaneEngine {
             self.state.stamp(),
             self.state.activation,
             self.state.mission.permissions,
+            &self.runtime_tuning.maintenance.bank_keep_item_ids,
             action,
         ) {
             ValidationOutcome::Sendable(action) => {
@@ -6073,6 +6231,7 @@ impl LaneEngine {
             self.state.stamp(),
             self.state.activation,
             self.state.mission.permissions,
+            &self.runtime_tuning.maintenance.bank_keep_item_ids,
             face,
         ) {
             ValidationOutcome::Sendable(face) => {
@@ -6152,6 +6311,11 @@ impl LaneEngine {
         self.repair_pending = None;
         self.repair_retry_after = None;
         self.remembered_class_trainers.clear();
+        self.remembered_bankers.clear();
+        self.bank_travel_retry_after = None;
+        self.bank_open_pending = None;
+        self.bank_deposit_pending = None;
+        self.bank_retry_after = None;
         self.class_training_character = None;
         self.last_player_level = None;
         self.class_training_due = false;
@@ -6741,6 +6905,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bank_travel_queues_a_bounded_remembered_location_without_authorizing_bank_actions() {
+        use wow_state::inventory::{InventoryItemInstance, ItemTemplateMetadata};
+
+        let position = WorldPosition {
+            map: 4,
+            point: Vec3::new(10.0, 10.0, 5.0),
+            orientation: 0.0,
+        };
+        let player = EntityId(1);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(position);
+        authoritative.inventory.instances_authoritative = true;
+        authoritative.inventory.free_slots = 2;
+        authoritative.inventory.instances.insert(
+            EntityId(90),
+            InventoryItemInstance {
+                item: 2589,
+                guid: EntityId(90),
+                backpack_slot: 23,
+                count: 4,
+            },
+        );
+        authoritative.inventory.item_metadata.insert(
+            2589,
+            ItemTemplateMetadata {
+                item_class: 7,
+                ..Default::default()
+            },
+        );
+        authoritative.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                id: player,
+                kind: wow_state::entities::EntityKind::Player,
+                health: Some((100, 100)),
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        let mission = Mission::quest(MissionId(88));
+        let intent = mission.intent.clone();
+        let (mut engine, mut proxy) = test_engine(mission, authoritative);
+        engine.state.mission.permissions = PermissionSet::MAINTENANCE | PermissionSet::MOVE;
+        let destination = WorldPosition {
+            point: Vec3::new(20.0, 10.0, 5.0),
+            ..position
+        };
+        engine
+            .remembered_bankers
+            .insert(4, (destination, Instant::now()));
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+
+        assert!(
+            engine
+                .tick_bank_deposit(&snapshot, Instant::now())
+                .await
+                .is_none()
+        );
+        assert_eq!(engine.tick_bank_travel(&snapshot), Some(true));
+        assert_eq!(engine.state.mission.intent, intent);
+        assert!(engine.pending_movement.as_ref().is_some_and(|movement| {
+            movement.purpose == MovementPurpose::Banker && movement.destination == destination
+        }));
+        assert!(proxy.try_recv().is_err());
+
+        engine.state.authoritative.inventory.free_slots = 3;
+        engine.tick_mission().await;
+        assert!(engine.pending_movement.is_none());
+        let WorkerToProxy::Action(stop) = proxy.try_recv().expect("detour stop action") else {
+            panic!("expected action");
+        };
+        assert_eq!(stop.command(), &GameplayCommand::StopMovement);
+        assert_eq!(engine.state.mission.intent, intent);
+    }
+
+    #[tokio::test]
     async fn authoritative_player_level_initialization_and_increase_mark_training_due() {
         let player = EntityId(1);
         let mut authoritative = wow_state::AuthoritativeState::default();
@@ -6817,6 +7059,50 @@ mod tests {
         assert_eq!(engine.last_player_level, None);
         assert!(!engine.class_training_due);
         assert!(engine.remembered_class_trainers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn banker_memory_uses_observed_service_position_and_resets_on_world_entry() {
+        let player = EntityId(1);
+        let position = WorldPosition {
+            map: 4,
+            point: Vec3::new(20.0, 30.0, 2.0),
+            orientation: 0.0,
+        };
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(position);
+        let (mut engine, _) = test_engine(Mission::idle(), authoritative);
+        let banker = EntityId(44);
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::EntityUpsert {
+                    entity: wow_state::entities::EntityState {
+                        id: banker,
+                        kind: wow_state::entities::EntityKind::Unit,
+                        interactable: true,
+                        npc_flags: Some(0x8),
+                        position: Some(position),
+                        ..Default::default()
+                    },
+                },
+            ))
+            .await;
+        assert_eq!(
+            engine.remembered_bankers.get(&4).map(|(p, _)| *p),
+            Some(position)
+        );
+
+        engine
+            .handle(LaneMessage::Observation(
+                ProtocolObservation::EnteredWorld {
+                    character_guid: player.0,
+                    position: Some(position),
+                },
+            ))
+            .await;
+        assert!(engine.remembered_bankers.is_empty());
     }
 
     #[tokio::test]

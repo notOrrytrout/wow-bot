@@ -7,6 +7,7 @@ pub struct ValidationContext {
     pub current: ValidityStamp,
     pub stage: ActivationStage,
     pub permissions: PermissionSet,
+    pub bank_keep_item_ids: Vec<u32>,
 }
 
 pub struct ActionValidator;
@@ -75,7 +76,40 @@ impl ActionValidator {
         if let Err(outcome) = validate_command(snapshot, &action.command) {
             return outcome;
         }
+        if let Err(outcome) =
+            validate_bank_keep_item_ids(snapshot, &action.command, &context.bank_keep_item_ids)
+        {
+            return outcome;
+        }
         send(action)
+    }
+}
+
+fn validate_bank_keep_item_ids(
+    snapshot: &Snapshot,
+    command: &GameplayCommand,
+    keep_item_ids: &[u32],
+) -> Result<(), ValidationOutcome> {
+    let keep = wow_policy::economy::bank::protected_item_id_set(keep_item_ids);
+    match command {
+        GameplayCommand::BankActivate { banker }
+            if wow_policy::economy::bank::profession_material_deposit_candidates(
+                snapshot, *banker, &keep,
+            )
+            .is_empty() =>
+        {
+            Err(reject(
+                "unsafe_bank_item",
+                "no safe backpack profession material remains after configured keep IDs",
+                true,
+            ))
+        }
+        GameplayCommand::BankDeposit { item, .. } if keep.contains(item) => Err(reject(
+            "protected_bank_item",
+            "configured keep IDs cannot be deposited",
+            true,
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1340,6 +1374,7 @@ mod tests {
             ValidationContext {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
+                bank_keep_item_ids: Vec::new(),
                 permissions: PermissionSet::ALL,
             },
             action,
@@ -1366,6 +1401,7 @@ mod tests {
             ValidationContext {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
+                bank_keep_item_ids: Vec::new(),
                 permissions: PermissionSet::ALL,
             },
             action,
@@ -1488,6 +1524,16 @@ mod tests {
 
         let (open, _, _) = bank_snapshot(true, 2);
         assert!(validate_command(&open, &open_action).is_ok());
+        assert!(matches!(
+            validate_bank_keep_item_ids(&open, &open_action, &[2589]),
+            Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
+                if code == "protected_bank_item"
+        ));
+        assert!(matches!(
+            validate_bank_keep_item_ids(&closed, &GameplayCommand::BankActivate { banker }, &[2589]),
+            Err(ValidationOutcome::Rejected(ActionFailure { code, .. }))
+                if code == "unsafe_bank_item"
+        ));
         let (wrong_banker, _, _) = bank_snapshot(true, 2);
         let stale = GameplayCommand::BankDeposit {
             banker: EntityId(45),
@@ -1523,6 +1569,38 @@ mod tests {
     }
 
     #[test]
+    fn configured_bank_keep_ids_are_rechecked_by_final_action_validation() {
+        let (open, banker, item_guid) = bank_snapshot(true, 2);
+        let action = ProposedAction {
+            id: ActionId(11),
+            task: TaskId(12),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: base_stamp(),
+            command: GameplayCommand::BankDeposit {
+                banker,
+                item: 2589,
+                item_guid,
+                backpack_slot: 23,
+            },
+        };
+        let result = ActionValidator::validate(
+            &open,
+            ValidationContext {
+                current: base_stamp(),
+                stage: ActivationStage::Maintain,
+                permissions: PermissionSet::MAINTENANCE,
+                bank_keep_item_ids: vec![2589],
+            },
+            action,
+        );
+        assert!(matches!(
+            result,
+            ValidationOutcome::Rejected(ActionFailure { code, .. })
+                if code == "protected_bank_item"
+        ));
+    }
+
+    #[test]
     fn mail_take_requires_the_asset_transfer_permission() {
         let snapshot = mailbox_snapshot(Some(0), 1);
         let action = ProposedAction {
@@ -1542,6 +1620,7 @@ mod tests {
             ValidationContext {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
+                bank_keep_item_ids: Vec::new(),
                 permissions: PermissionSet::ECONOMY,
             },
             action.clone(),
@@ -1556,6 +1635,7 @@ mod tests {
             ValidationContext {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
+                bank_keep_item_ids: Vec::new(),
                 permissions: PermissionSet::ECONOMY | PermissionSet::ASSET_TRANSFER,
             },
             action,
@@ -1680,6 +1760,7 @@ mod tests {
             ValidationContext {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
+                bank_keep_item_ids: Vec::new(),
                 permissions: PermissionSet::MAINTENANCE,
             },
             action,
@@ -1714,6 +1795,7 @@ mod tests {
                 ValidationContext {
                     current: base_stamp(),
                     stage: ActivationStage::Act,
+                    bank_keep_item_ids: Vec::new(),
                     permissions: PermissionSet::ALL,
                 },
                 ProposedAction {
@@ -1984,6 +2066,7 @@ mod tests {
             ValidationContext {
                 current: stamp,
                 stage: ActivationStage::Act,
+                bank_keep_item_ids: Vec::new(),
                 permissions: PermissionSet::empty(),
             },
             action,
@@ -2051,6 +2134,7 @@ mod tests {
             ValidationContext {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
+                bank_keep_item_ids: Vec::new(),
                 permissions: PermissionSet::ALL,
             },
             action,

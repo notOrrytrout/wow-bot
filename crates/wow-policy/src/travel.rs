@@ -264,6 +264,7 @@ mod tests {
                 auto_mount_enabled: true,
                 mount_min_travel_yards: 80,
                 auto_bank_deposit_enabled: true,
+                bank_keep_item_ids: Vec::new(),
             },
             ..RuntimeTuning::default()
         };
