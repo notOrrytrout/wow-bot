@@ -50,6 +50,12 @@ pub fn equipment_needs_repair(condition: wow_state::inventory::EquipmentConditio
                 .is_some_and(|percent| percent < REPAIR_DURABILITY_THRESHOLD_PERCENT))
 }
 
+/// AzerothCore WotLK uses bit 0x10 for trainer service and bit 0x40 to mark a
+/// profession trainer. Both bits must be present (0x50); 0x40 alone is not a trainer.
+pub fn is_profession_trainer_flags(flags: u32) -> bool {
+    flags & 0x50 == 0x50
+}
+
 fn catalog() -> &'static Catalog {
     CATALOG.get_or_init(|| {
         serde_json::from_str(include_str!("../../data/buff-families.json"))
@@ -2158,6 +2164,14 @@ fn party_member_nearby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profession_trainer_flag_requires_both_trainer_and_profession_bits() {
+        assert!(is_profession_trainer_flags(0x50));
+        assert!(!is_profession_trainer_flags(0x40));
+        assert!(!is_profession_trainer_flags(0x10));
+        assert!(!is_profession_trainer_flags(0x30));
+    }
 
     #[test]
     fn repair_requires_observed_broken_or_yellow_equipment() {

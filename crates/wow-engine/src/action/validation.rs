@@ -8,6 +8,7 @@ pub struct ValidationContext {
     pub stage: ActivationStage,
     pub permissions: PermissionSet,
     pub bank_keep_item_ids: Vec<u32>,
+    pub auto_professions_enabled: bool,
 }
 
 pub struct ActionValidator;
@@ -71,6 +72,22 @@ impl ActionValidator {
         }
         if let Some(facing) = spatial::facing_requirement(snapshot, &action.command) {
             return ValidationOutcome::NeedsFacing(facing);
+        }
+
+        if !context.auto_professions_enabled
+            && matches!(
+                action.command,
+                GameplayCommand::TrainerBuy { trainer, .. }
+                    if wow_policy::gathering::professions::is_nearby_profession_trainer(
+                        snapshot, trainer
+                    )
+            )
+        {
+            return reject(
+                "profession_training_disabled",
+                "automatic profession training is disabled",
+                false,
+            );
         }
 
         if let Err(outcome) = validate_command(snapshot, &action.command) {
@@ -587,7 +604,11 @@ fn validate_economy_command(
             ));
         }
         GameplayCommand::TrainerList { trainer } => {
-            if !is_nearby_class_trainer(snapshot, *trainer) {
+            if !is_nearby_class_trainer(snapshot, *trainer)
+                && !wow_policy::gathering::professions::is_nearby_profession_trainer(
+                    snapshot, *trainer,
+                )
+            {
                 return Err(reject(
                     "trainer_not_available",
                     "class trainer is not currently observed and in interaction range",
@@ -615,9 +636,15 @@ fn validate_economy_command(
                         && u32::from(snapshot.state.professions.skill(offer.required_skill_line))
                             >= offer.required_skill_rank)
             });
+            let class_trainer = snapshot.state.trainer.trainer_type == Some(0)
+                && is_nearby_class_trainer(snapshot, *trainer);
+            let profession_trainer = snapshot.state.trainer.trainer_type == Some(2)
+                && wow_policy::gathering::professions::is_nearby_profession_trainer(
+                    snapshot, *trainer,
+                )
+                && wow_policy::gathering::professions::training_state_safe(snapshot);
             let valid = snapshot.state.trainer.trainer == Some(*trainer)
-                && snapshot.state.trainer.trainer_type == Some(0)
-                && is_nearby_class_trainer(snapshot, *trainer)
+                && (class_trainer || profession_trainer)
                 && offer.is_some_and(|offer| {
                     offer.usable == 0
                         && player_level.is_some_and(|level| offer.required_level as u32 <= level)
@@ -626,7 +653,16 @@ fn validate_economy_command(
                             .saturating_add(wow_domain::MAINTENANCE_PURCHASE_MONEY_RESERVE_COPPER)
                             <= snapshot.state.inventory.money
                 })
-                && required_skill_is_known;
+                && required_skill_is_known
+                && (class_trainer
+                    || offer.is_some_and(|offer| {
+                        wow_policy::gathering::professions::offer_skill(
+                            snapshot,
+                            *trainer,
+                            offer.spell,
+                        )
+                        .is_some()
+                    }));
             if !valid {
                 return Err(reject(
                     "invalid_trainer_offer",
@@ -1375,6 +1411,7 @@ mod tests {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
+                auto_professions_enabled: true,
                 permissions: PermissionSet::ALL,
             },
             action,
@@ -1402,6 +1439,7 @@ mod tests {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
+                auto_professions_enabled: true,
                 permissions: PermissionSet::ALL,
             },
             action,
@@ -1590,6 +1628,7 @@ mod tests {
                 stage: ActivationStage::Maintain,
                 permissions: PermissionSet::MAINTENANCE,
                 bank_keep_item_ids: vec![2589],
+                auto_professions_enabled: true,
             },
             action,
         );
@@ -1621,6 +1660,7 @@ mod tests {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
+                auto_professions_enabled: true,
                 permissions: PermissionSet::ECONOMY,
             },
             action.clone(),
@@ -1636,6 +1676,7 @@ mod tests {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
+                auto_professions_enabled: true,
                 permissions: PermissionSet::ECONOMY | PermissionSet::ASSET_TRANSFER,
             },
             action,
@@ -1652,6 +1693,7 @@ mod tests {
             orientation: 0.0,
         };
         let mut state = AuthoritativeState::default();
+        state.revision = base_stamp().state;
         state.session.in_world = true;
         state.session.character_guid = Some(7);
         state.position.player = Some(player_position);
@@ -1661,6 +1703,7 @@ mod tests {
             EntityState {
                 id: EntityId(7),
                 level: Some(20),
+                health: Some((100, 100)),
                 position: Some(player_position),
                 ..Default::default()
             },
@@ -1705,6 +1748,102 @@ mod tests {
             point: Vec3::new(6.0, 0.0, 0.0),
             ..player_position
         });
+        assert!(validate_command(&Snapshot::from_state(&state), &command).is_err());
+    }
+
+    #[test]
+    fn profession_purchase_requires_catalog_mapped_spell_and_profession_flags() {
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let (service, mapping) = catalog
+            .world()
+            .trainer_services
+            .iter()
+            .find_map(|service| {
+                service
+                    .spell_skills
+                    .iter()
+                    .find(|mapping| mapping.skill == 185)
+                    .map(|mapping| (service, mapping))
+            })
+            .expect("cooking trainer spell mapping");
+        let trainer = EntityId(22);
+        let player_position = WorldPosition {
+            map: 0,
+            point: Vec3::default(),
+            orientation: 0.0,
+        };
+        let mut state = AuthoritativeState::default();
+        state.revision = base_stamp().state;
+        state.session.in_world = true;
+        state.session.character_guid = Some(7);
+        state.position.player = Some(player_position);
+        state.professions.known = true;
+        state.inventory.money = 2_000;
+        state.entities.0.insert(
+            EntityId(7),
+            EntityState {
+                id: EntityId(7),
+                level: Some(20),
+                health: Some((100, 100)),
+                position: Some(player_position),
+                ..Default::default()
+            },
+        );
+        state.entities.0.insert(
+            trainer,
+            EntityState {
+                id: trainer,
+                entry: service.entry_id,
+                kind: EntityKind::Unit,
+                npc_flags: Some(0x50),
+                interactable: true,
+                position: Some(player_position),
+                ..Default::default()
+            },
+        );
+        state.trainer = wow_state::trainer::TrainerState {
+            trainer: Some(trainer),
+            trainer_type: Some(2),
+            offers: vec![wow_state::trainer::TrainerSpellOffer {
+                spell: mapping.spell,
+                usable: 0,
+                cost_copper: 500,
+                required_level: 1,
+                ..Default::default()
+            }],
+        };
+        let command = GameplayCommand::TrainerBuy {
+            trainer,
+            spell: mapping.spell,
+        };
+        assert!(validate_command(&Snapshot::from_state(&state), &command).is_ok());
+        let action = ProposedAction {
+            id: ActionId(31),
+            task: TaskId(32),
+            origin: PlanOrigin::SystemPolicy,
+            stamp: base_stamp(),
+            command: command.clone(),
+        };
+        let disabled = ActionValidator::validate(
+            &Snapshot::from_state(&state),
+            ValidationContext {
+                current: base_stamp(),
+                stage: ActivationStage::Maintain,
+                permissions: PermissionSet::MAINTENANCE,
+                bank_keep_item_ids: Vec::new(),
+                auto_professions_enabled: false,
+            },
+            action,
+        );
+        assert!(matches!(
+            disabled,
+            ValidationOutcome::Rejected(ActionFailure { code, .. })
+                if code == "profession_training_disabled"
+        ));
+        state.trainer.offers[0].spell = u32::MAX;
+        assert!(validate_command(&Snapshot::from_state(&state), &command).is_err());
+        state.trainer.offers[0].spell = mapping.spell;
+        state.entities.0.get_mut(&trainer).unwrap().npc_flags = Some(0x40);
         assert!(validate_command(&Snapshot::from_state(&state), &command).is_err());
     }
 
@@ -1761,6 +1900,7 @@ mod tests {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
+                auto_professions_enabled: true,
                 permissions: PermissionSet::MAINTENANCE,
             },
             action,
@@ -1796,6 +1936,7 @@ mod tests {
                     current: base_stamp(),
                     stage: ActivationStage::Act,
                     bank_keep_item_ids: Vec::new(),
+                    auto_professions_enabled: true,
                     permissions: PermissionSet::ALL,
                 },
                 ProposedAction {
@@ -2067,6 +2208,7 @@ mod tests {
                 current: stamp,
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
+                auto_professions_enabled: true,
                 permissions: PermissionSet::empty(),
             },
             action,
@@ -2135,6 +2277,7 @@ mod tests {
                 current: base_stamp(),
                 stage: ActivationStage::Act,
                 bank_keep_item_ids: Vec::new(),
+                auto_professions_enabled: true,
                 permissions: PermissionSet::ALL,
             },
             action,

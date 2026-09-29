@@ -72,6 +72,8 @@ pub struct MaintenanceTuning {
     pub mount_min_travel_yards: u32,
     /// Deposit safe profession materials when backpack space is critically low.
     pub auto_bank_deposit_enabled: bool,
+    /// Bootstrap selected profession skills when a safe matching trainer is nearby.
+    pub auto_professions_enabled: bool,
     /// Item IDs that automatic bank deposits must keep in the backpack.
     pub bank_keep_item_ids: Vec<u32>,
 }
@@ -100,6 +102,7 @@ impl Default for MaintenanceTuning {
             auto_mount_enabled: false,
             mount_min_travel_yards: 80,
             auto_bank_deposit_enabled: true,
+            auto_professions_enabled: true,
             bank_keep_item_ids: Vec::new(),
         }
     }
@@ -148,6 +151,7 @@ mod tests {
         assert!(!config.runtime_tuning.maintenance.auto_mount_enabled);
         assert_eq!(config.runtime_tuning.maintenance.mount_min_travel_yards, 80);
         assert!(config.runtime_tuning.maintenance.auto_bank_deposit_enabled);
+        assert!(config.runtime_tuning.maintenance.auto_professions_enabled);
         assert!(
             config
                 .runtime_tuning

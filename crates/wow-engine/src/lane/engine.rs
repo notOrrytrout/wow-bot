@@ -172,6 +172,46 @@ fn nearby_class_trainer(snapshot: &Snapshot) -> Option<EntityId> {
         .map(|(entity, _)| entity.id)
 }
 
+fn nearby_profession_trainer(snapshot: &Snapshot) -> Option<EntityId> {
+    nearby_profession_trainers(snapshot).into_iter().next()
+}
+
+fn nearby_profession_trainers(snapshot: &Snapshot) -> Vec<EntityId> {
+    let mut trainers = snapshot
+        .state
+        .entities
+        .0
+        .values()
+        .filter(|entity| {
+            let id = entity.id;
+            wow_policy::gathering::professions::is_nearby_profession_trainer(snapshot, id)
+        })
+        .map(|entity| entity.id)
+        .collect::<Vec<_>>();
+    let position = snapshot
+        .state
+        .control
+        .active_position(snapshot.state.position.player);
+    trainers.sort_by(|left, right| {
+        let distance = |id: &EntityId| {
+            position
+                .and_then(|player| {
+                    snapshot
+                        .state
+                        .entities
+                        .0
+                        .get(id)?
+                        .position
+                        .map(|target| (player, target))
+                })
+                .map(|(player, target)| player.point.distance(target.point))
+                .unwrap_or(f32::INFINITY)
+        };
+        distance(left).total_cmp(&distance(right))
+    });
+    trainers
+}
+
 fn remembered_class_trainer_destination(
     snapshot: &Snapshot,
     remembered: &BTreeMap<u32, (WorldPosition, Instant)>,
@@ -225,6 +265,7 @@ enum MovementPurpose {
     SurvivalApproach,
     RepairVendor,
     ClassTrainer,
+    ProfessionTrainer,
     Banker,
 }
 
@@ -262,6 +303,8 @@ const BANKER_DETOUR_RADIUS_YARDS: f32 = 30.0;
 const BANKER_MEMORY_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 const BANKER_TRAVEL_RETRY: Duration = Duration::from_secs(5 * 60);
 const CLASS_TRAINER_MONEY_RESERVE_COPPER: u64 = 1_000;
+const PROFESSION_TRAINER_DETOUR_RADIUS_YARDS: f32 = 30.0;
+const PROFESSION_TRAINER_TRAVEL_RETRY: Duration = Duration::from_secs(5 * 60);
 const MAILBOX_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAILBOX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
@@ -450,6 +493,7 @@ pub struct LaneEngine {
     last_player_level: Option<u32>,
     class_training_due: bool,
     class_trainer_travel_retry_after: Option<Instant>,
+    profession_trainer_travel_retry_after: Option<Instant>,
     mailbox_list_pending: Option<(EntityId, u64, Instant)>,
     mailbox_source: Option<EntityId>,
     mail_action_pending: Option<(u64, Instant)>,
@@ -541,6 +585,7 @@ impl LaneEngine {
             last_player_level: None,
             class_training_due: false,
             class_trainer_travel_retry_after: None,
+            profession_trainer_travel_retry_after: None,
             mailbox_list_pending: None,
             mailbox_source: None,
             mail_action_pending: None,
@@ -1432,6 +1477,18 @@ impl LaneEngine {
         if self
             .pending_movement
             .as_ref()
+            .is_some_and(|movement| movement.purpose == MovementPurpose::ProfessionTrainer)
+            && (!self.profession_trainer_travel_allowed(&snapshot)
+                || nearby_profession_trainer(&snapshot).is_some())
+        {
+            self.stop_active_movement_for_handoff(
+                "profession trainer detour is no longer safe or needed",
+            )
+            .await;
+        }
+        if self
+            .pending_movement
+            .as_ref()
             .is_some_and(|movement| movement.purpose == MovementPurpose::Banker)
             && (!self.bank_travel_allowed(&snapshot)
                 || !wow_policy::economy::bank::trusted_nearby_bankers(&snapshot).is_empty())
@@ -1458,6 +1515,9 @@ impl LaneEngine {
                 return result;
             }
             if let Some(result) = self.tick_class_trainer_travel(&snapshot) {
+                return result;
+            }
+            if let Some(result) = self.tick_profession_trainer_travel(&snapshot) {
                 return result;
             }
         }
@@ -2159,6 +2219,115 @@ impl LaneEngine {
         !player_in_combat && !wow_policy::maintenance::nearby_quest_offer(snapshot, position)
     }
 
+    fn profession_trainer_travel_allowed(&self, snapshot: &Snapshot) -> bool {
+        self.profession_training_service_allowed(snapshot)
+            && wow_policy::gathering::professions::actionable_missing_skills(snapshot)
+                .is_some_and(|skills| !skills.is_empty())
+    }
+
+    fn profession_training_service_allowed(&self, snapshot: &Snapshot) -> bool {
+        if !self.runtime_tuning.maintenance.auto_professions_enabled
+            || !wow_policy::gathering::professions::bootstrap_due(snapshot)
+            || matches!(
+                self.state.mission.intent,
+                MissionIntent::Party { .. } | MissionIntent::Raid { .. }
+            )
+            || !self
+                .state
+                .mission
+                .permissions
+                .contains(PermissionSet::MAINTENANCE | PermissionSet::MOVE)
+            || snapshot.state.inventory.money <= CLASS_TRAINER_MONEY_RESERVE_COPPER
+            || !wow_policy::gathering::professions::training_state_safe(snapshot)
+        {
+            return false;
+        }
+        true
+    }
+
+    async fn tick_profession_training(
+        &mut self,
+        snapshot: &Snapshot,
+        now: Instant,
+    ) -> Option<bool> {
+        if !self.profession_training_service_allowed(snapshot) {
+            return None;
+        }
+        match wow_policy::gathering::professions::nearby_training_decision(
+            snapshot,
+            &self.maintenance_retry_after,
+            now,
+        )? {
+            wow_policy::maintenance::MaintenanceDecision::TrainerList { trainer } => {
+                self.last_maintenance_status =
+                    Some(format!("profession_trainer_list:{}", trainer.0));
+                self.maintenance_retry_after
+                    .insert((0, trainer), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(GameplayCommand::TrainerList { trainer }, false)
+                        .await,
+                )
+            }
+            wow_policy::maintenance::MaintenanceDecision::TrainerBuy { trainer, spell } => {
+                self.last_maintenance_status =
+                    Some(format!("profession_trainer_buy:{spell}:{}", trainer.0));
+                self.maintenance_retry_after
+                    .insert((spell, trainer), now + Duration::from_secs(10));
+                self.maintenance_retry_after
+                    .insert((u32::MAX, trainer), now + Duration::from_secs(10));
+                Some(
+                    self.propose_command(GameplayCommand::TrainerBuy { trainer, spell }, false)
+                        .await,
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn tick_profession_trainer_travel(&mut self, snapshot: &Snapshot) -> Option<bool> {
+        if !self.profession_trainer_travel_allowed(snapshot)
+            || nearby_profession_trainer(snapshot).is_some()
+            || snapshot.state.control.mover.is_some()
+            || snapshot.state.position.moving
+            || self
+                .profession_trainer_travel_retry_after
+                .is_some_and(|deadline| deadline > Instant::now())
+        {
+            return None;
+        }
+        let position = snapshot
+            .state
+            .control
+            .active_position(snapshot.state.position.player)?;
+        let (_, destination) = wow_policy::gathering::professions::trainer_destination(
+            snapshot,
+            wow_infra::world_knowledge::embedded_azerothcore_catalog(),
+        )?;
+        if destination.map != position.map
+            || destination.point.distance(position.point) > PROFESSION_TRAINER_DETOUR_RADIUS_YARDS
+            || destination.point.distance(position.point) <= 5.0
+        {
+            return None;
+        }
+        self.profession_trainer_travel_retry_after =
+            Some(Instant::now() + PROFESSION_TRAINER_TRAVEL_RETRY);
+        let work = self.set_work(QuestWorkKey::TravelToObjective {
+            quest: 0,
+            objective: 0,
+            destination,
+        });
+        self.queue_world_movement(
+            destination,
+            5.0,
+            None,
+            None,
+            PlanOrigin::SystemPolicy,
+            work,
+            MovementPurpose::ProfessionTrainer,
+        );
+        Some(true)
+    }
+
     fn tick_class_trainer_travel(&mut self, snapshot: &Snapshot) -> Option<bool> {
         if !self.class_trainer_travel_allowed(snapshot)
             || nearby_class_trainer(snapshot).is_some()
@@ -2532,6 +2701,9 @@ impl LaneEngine {
             return Some(result);
         }
         if let Some(result) = self.tick_bank_travel(&snapshot) {
+            return Some(result);
+        }
+        if let Some(result) = self.tick_profession_training(&snapshot, now).await {
             return Some(result);
         }
         let nearby_sell_vendor = nearby_sell_vendor(&snapshot);
@@ -6142,6 +6314,7 @@ impl LaneEngine {
             self.state.activation,
             self.state.mission.permissions,
             &self.runtime_tuning.maintenance.bank_keep_item_ids,
+            self.runtime_tuning.maintenance.auto_professions_enabled,
             action,
         ) {
             ValidationOutcome::Sendable(action) => {
@@ -6232,6 +6405,7 @@ impl LaneEngine {
             self.state.activation,
             self.state.mission.permissions,
             &self.runtime_tuning.maintenance.bank_keep_item_ids,
+            self.runtime_tuning.maintenance.auto_professions_enabled,
             face,
         ) {
             ValidationOutcome::Sendable(face) => {
@@ -6902,6 +7076,68 @@ mod tests {
         assert!(engine.pending_movement.as_ref().is_some_and(|movement| {
             movement.purpose == MovementPurpose::ClassTrainer && movement.destination == destination
         }));
+    }
+
+    #[test]
+    fn profession_trainer_travel_uses_a_nearby_catalog_hint_and_preserves_mission() {
+        let catalog = wow_infra::world_knowledge::embedded_azerothcore_catalog();
+        let service = catalog
+            .world()
+            .trainer_services
+            .iter()
+            .find(|service| {
+                service
+                    .skills
+                    .contains(&wow_policy::gathering::professions::COOKING)
+                    && !service.spawns.is_empty()
+            })
+            .expect("cooking trainer service");
+        let spawn = &service.spawns[0];
+        let destination = WorldPosition {
+            map: spawn.map_id,
+            point: Vec3::new(spawn.x, spawn.y, spawn.z),
+            orientation: 0.0,
+        };
+        let position = WorldPosition {
+            point: Vec3::new(
+                destination.point.x + 10.0,
+                destination.point.y,
+                destination.point.z,
+            ),
+            ..destination
+        };
+        let player = EntityId(1);
+        let mut authoritative = wow_state::AuthoritativeState::default();
+        authoritative.session.in_world = true;
+        authoritative.session.character_guid = Some(player.0);
+        authoritative.position.player = Some(position);
+        authoritative.inventory.money = CLASS_TRAINER_MONEY_RESERVE_COPPER + 1;
+        authoritative.professions.known = true;
+        authoritative.entities.0.insert(
+            player,
+            wow_state::entities::EntityState {
+                id: player,
+                kind: wow_state::entities::EntityKind::Player,
+                level: Some(10),
+                health: Some((100, 100)),
+                position: Some(position),
+                ..Default::default()
+            },
+        );
+        let mission = Mission::quest(MissionId(89));
+        let intent = mission.intent.clone();
+        let (mut engine, _) = test_engine(mission, authoritative);
+        let snapshot = Snapshot::from_state(&engine.state.authoritative);
+
+        assert!(engine.profession_trainer_travel_allowed(&snapshot));
+        assert_eq!(engine.tick_profession_trainer_travel(&snapshot), Some(true));
+        assert_eq!(engine.state.mission.intent, intent);
+        assert!(engine.pending_movement.as_ref().is_some_and(|movement| {
+            movement.purpose == MovementPurpose::ProfessionTrainer
+                && movement.destination == destination
+        }));
+        engine.runtime_tuning.maintenance.auto_professions_enabled = false;
+        assert!(!engine.profession_trainer_travel_allowed(&snapshot));
     }
 
     #[tokio::test]

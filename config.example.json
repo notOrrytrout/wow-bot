@@ -19,7 +19,10 @@
       },
       "maintenance": {
         "auto_mount_enabled": false,
-        "mount_min_travel_yards": 80
+        "mount_min_travel_yards": 80,
+        "auto_bank_deposit_enabled": true,
+        "auto_professions_enabled": true,
+        "bank_keep_item_ids": []
       }
     }
   },

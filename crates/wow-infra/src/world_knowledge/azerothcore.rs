@@ -278,7 +278,17 @@ pub struct TrainerService {
     pub trainer_id: u32,
     pub name: Option<String>,
     pub skills: Vec<u32>,
+    /// Profession spells this trainer teaches and the skill line they advance.
+    /// Static mappings only identify eligible offers; live trainer lists remain authoritative.
+    #[serde(default)]
+    pub spell_skills: Vec<TrainerSpellSkill>,
     pub spawns: Vec<KnowledgeSpawn>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TrainerSpellSkill {
+    pub spell: u32,
+    pub skill: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -473,6 +483,16 @@ impl AzerothCoreCatalog {
             map,
             from,
         )
+    }
+    pub fn profession_skill_for_trainer_spell(&self, entry: u32, spell: u32) -> Option<u32> {
+        self.world
+            .trainer_services
+            .iter()
+            .find(|trainer| trainer.entry_id == entry)?
+            .spell_skills
+            .iter()
+            .find(|mapping| mapping.spell == spell)
+            .map(|mapping| mapping.skill)
     }
     pub fn nearest_gather_node(
         &self,
@@ -720,6 +740,26 @@ mod tests {
         assert_eq!(
             nearest_spawn_candidate(candidates, 1, Vec3::default()),
             Some((30, Vec3::new(3.0, 0.0, 0.0)))
+        );
+    }
+
+    #[test]
+    fn embedded_catalog_retains_exact_profession_trainer_spell_mappings() {
+        let catalog = embedded_azerothcore_catalog();
+        let trainer = catalog
+            .world()
+            .trainer_services
+            .iter()
+            .find(|trainer| !trainer.spell_skills.is_empty())
+            .expect("generated profession trainer spell mapping");
+        let mapping = &trainer.spell_skills[0];
+        assert_eq!(
+            catalog.profession_skill_for_trainer_spell(trainer.entry_id, mapping.spell),
+            Some(mapping.skill)
+        );
+        assert_eq!(
+            catalog.profession_skill_for_trainer_spell(trainer.entry_id, u32::MAX),
+            None
         );
     }
 }

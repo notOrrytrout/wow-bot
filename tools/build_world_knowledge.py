@@ -377,12 +377,14 @@ def main() -> None:
     trainer_spell_path = sql / "trainer_spell.sql"
     tsi = indexes(trainer_spell_path, ["TrainerId", "SpellId"])
     trainer_skills: dict[int, set[int]] = defaultdict(set)
+    trainer_spells: dict[int, set[tuple[int, int]]] = defaultdict(set)
     for row in rows(trainer_spell_path):
         trainer_id = as_int(row[tsi["TrainerId"]])
         spell_id = as_int(row[tsi["SpellId"]])
         skill = trainer_spell_skill.get(spell_id)
         if trainer_types.get(trainer_id) == 2 and skill in PROFESSION_SKILLS:
             trainer_skills[trainer_id].add(skill)
+            trainer_spells[trainer_id].add((spell_id, skill))
             profession_trainer_ids.add(trainer_id)
 
     creature_default_trainer_path = sql / "creature_default_trainer.sql"
@@ -829,6 +831,10 @@ def main() -> None:
             "trainer_id": trainer_by_creature[entry],
             "name": creature_names.get(entry) or None,
             "skills": sorted(trainer_skills[trainer_by_creature[entry]]),
+            "spell_skills": [
+                {"spell": spell, "skill": skill}
+                for spell, skill in sorted(trainer_spells[trainer_by_creature[entry]])
+            ],
             "spawns": sorted(spawns_by_entry[entry], key=lambda value: (value["map_id"], value["x"], value["y"], value["z"])),
         }
         for entry in sorted(profession_trainer_entries)
